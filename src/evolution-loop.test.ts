@@ -81,6 +81,37 @@ async function makeProject(): Promise<{
   return { homeDir, projectRoot, rootDir };
 }
 
+async function runProjectGit(args: {
+  projectRoot: string;
+  argv: string[];
+  date?: string;
+}): Promise<void> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !name.startsWith("GIT_")) {
+      env[name] = value;
+    }
+  }
+  if (args.date) {
+    env.GIT_AUTHOR_DATE = args.date;
+    env.GIT_COMMITTER_DATE = args.date;
+  }
+  const proc = Bun.spawn({
+    cmd: [Bun.which("git") ?? "/usr/bin/git", ...args.argv],
+    cwd: args.projectRoot,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(stderr);
+  }
+}
+
 afterEach(async () => {
   for (const root of temporaryRoots.splice(0)) {
     await rm(root, { recursive: true, force: true });
@@ -522,6 +553,91 @@ describe("evolution loop", () => {
       "resolved"
     );
     expect(quiet.delta.notifiable).toHaveLength(0);
+  });
+
+  it("alerts once for a stale cursor while keeping complete coverage", async () => {
+    const project = await makeProject();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runProjectGit({ projectRoot: project.projectRoot, argv });
+    }
+    await mkdir(join(project.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(project.projectRoot, "docs", "review.md"),
+      "Capability review cursor baseline.\n"
+    );
+    await runProjectGit({ projectRoot: project.projectRoot, argv: ["add", "docs"] });
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: cursor baseline"],
+      date: "2026-07-23T18:12:45-04:00",
+    });
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+            freshnessThresholdHours: 168,
+          },
+        ],
+      })}\n`
+    );
+    await enableEvolutionLoop({ ...project });
+    await runEvolutionLoop({
+      ...project,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-23T18:15:00-04:00",
+      now: () => new Date("2026-07-23T18:15:00-04:00"),
+    });
+
+    await Bun.write(join(project.projectRoot, "outside.txt"), "new activity\n");
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["add", "outside.txt"],
+    });
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: newer activity"],
+      date: "2026-07-23T18:28:50-04:00",
+    });
+    const stale = await runEvolutionLoop({
+      ...project,
+      until: "2026-07-27T23:04:10Z",
+      now: () => new Date("2026-07-27T23:04:10Z"),
+    });
+    const freshnessItem = stale.queue.find(
+      (item) => item.id === "freshness:git"
+    );
+    expect(stale.coverageComplete).toBe(true);
+    expect(stale.status).toBe("complete");
+    expect(stale.freshness.state).toBe("stale");
+    expect(freshnessItem).toMatchObject({
+      kind: "coverage",
+      state: "blocked",
+      sourceIds: ["git"],
+    });
+    expect(stale.delta.notifiable).toContain("freshness:git");
+
+    const quiet = await runEvolutionLoop({
+      ...project,
+      until: "2026-07-28T00:04:10Z",
+      now: () => new Date("2026-07-28T00:04:10Z"),
+    });
+    expect(quiet.coverageComplete).toBe(true);
+    expect(quiet.freshness.state).toBe("stale");
+    expect(quiet.delta.notifiable).not.toContain("freshness:git");
+    expect(quiet.delta.unchangedSuppressed).toBeGreaterThan(0);
+    const artifact = await readFile(quiet.artifactPath, "utf8");
+    expect(artifact).toContain("Freshness: stale");
+    expect(artifact).toContain("newer_repository_activity");
   });
 
   it("does not report an existing signal-family writeback as a new mutation", async () => {
@@ -1988,6 +2104,52 @@ describe("evolution loop", () => {
     );
     expect(closedItem?.state).toBe("resolved");
     expect(closedItem?.requestedExternalAction).toBeUndefined();
+  });
+
+  it("rejects an obsolete duplicate proposal without applying its target edit", async () => {
+    const project = await makeProject();
+    const targetPath = join(project.rootDir, "instructions", "REVIEW.md");
+    await mkdir(dirname(targetPath), { recursive: true });
+    await Bun.write(
+      targetPath,
+      "# Review\n\nThe requested bounded review rule already exists.\n"
+    );
+    const writeback = await addWriteback({
+      ...project,
+      kind: "bad_default",
+      summary: "Add the bounded review rule that already exists.",
+      suggestedDestination: "@project/instructions/REVIEW.md",
+      evidence: [{ type: "test", ref: "duplicate-existing-rule" }],
+    });
+    const [proposal] = await proposeEvolution({
+      ...project,
+      writebackIds: [writeback.id],
+    });
+    await draftProposal(proposal!.id, project);
+    const targetBefore = await readFile(targetPath, "utf8");
+
+    const rejected = await rejectProposal(proposal!.id, {
+      ...project,
+      reason:
+        "Rejected as duplicate/obsolete after exact proposal and target readback.",
+    });
+    await enableEvolutionLoop({ ...project });
+    const report = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01",
+      until: "2026-01-03",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+
+    expect(rejected.status).toBe("rejected");
+    expect(await readFile(targetPath, "utf8")).toBe(targetBefore);
+    expect(
+      report.queue.find((item) => item.proposalId === proposal!.id)
+    ).toMatchObject({
+      state: "resolved",
+      approvalRequired: false,
+    });
+    expect(report.mutations.every((mutation) => !mutation.applied)).toBe(true);
   });
 
   it("covers signal, proposal, explicit apply, regression reopen, and verified improvement end to end", async () => {
