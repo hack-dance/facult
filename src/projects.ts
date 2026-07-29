@@ -69,6 +69,7 @@ const DISCOVERY_IGNORES = new Set([
 ]);
 const PROJECT_SOURCES = new Set(["git", "guidance", "writebacks"]);
 const PROJECT_CADENCES = new Set(["on-demand", "weekly", "daily"]);
+const PATH_SEPARATOR_RUN_RE = /[\\/]+/;
 const MIGRATING_RUNTIME_LOCK_PATHS = new Set([
   "ai/project/evolution/loop/state.json.lock",
   "ai/project/evolution/loop/state.json.lock.takeover",
@@ -2289,7 +2290,11 @@ async function migrateLegacyProjectState(args: {
           `Owned project migration lock changed during merge: ${sourcePath}`
         );
       }
-      if (ignoredIdentity && sourceMetadata.isFile()) {
+      if (
+        ignoredIdentity &&
+        (sourceMetadata.isFile() ||
+          (sourceMetadata.isDirectory() && !sourceMetadata.isSymbolicLink()))
+      ) {
         continue;
       }
       const containsIgnoredEntry = [...ignoredEntries.keys()].some(
@@ -2539,11 +2544,25 @@ async function migrateLegacyProjectState(args: {
               `Legacy project state path changed before compensation: ${entry.source}`
             );
           }
-          await assertGuardedSourceRemainder(entry);
-          if (
-            (await inspectProjectStateTree(entry.destination)).sha256 !==
-            entry.sourceTreeSha256
-          ) {
+          const sourceTree = await inspectProjectStateTree(
+            entry.source,
+            ignoredEntriesFor(entry.source)
+          );
+          await removeUnreviewedEmptyStateDirectories(
+            entry.destination,
+            entry.sourceEntries
+          );
+          const destinationTree = await inspectProjectStateTree(
+            entry.destination
+          );
+          assertDisjointProjectStateTrees({
+            allowRebuildableOverlaps: false,
+            source: destinationTree,
+            sourcePath: entry.destination,
+            destination: sourceTree,
+            destinationPath: entry.source,
+          });
+          if (destinationTree.sha256 !== entry.sourceTreeSha256) {
             throw new Error(
               `Migrated project state destination changed before compensation: ${entry.destination}`
             );
@@ -2557,12 +2576,13 @@ async function migrateLegacyProjectState(args: {
           );
           await removeEmptyStateTree(entry.destination);
           if (
-            (
+            !treeContainsReviewedEntries(
               await inspectProjectStateTree(
                 entry.source,
                 ignoredEntriesFor(entry.source)
-              )
-            ).sha256 !== entry.sourceTreeSha256
+              ),
+              entry.sourceEntries
+            )
           ) {
             throw new Error(
               `Legacy project state changed during compensation: ${entry.source}`
@@ -4631,6 +4651,11 @@ async function acquireLegacyProjectRuntimeMigrationLocks(args: {
   migration?: ProjectStateMigrationPlanEntry;
 }): Promise<LegacyProjectRuntimeMigrationLocks> {
   type LeaseEntry = {
+    createdDirectories: Array<{
+      dev: number;
+      ino: number;
+      relativePath: string;
+    }>;
     currentRoot: string;
     locks: Array<{
       dev: number;
@@ -4682,6 +4707,48 @@ async function acquireLegacyProjectRuntimeMigrationLocks(args: {
         failures.push(error);
       }
     }
+    for (const directory of [...entry.createdDirectories].sort(
+      (left, right) =>
+        right.relativePath.split("/").length -
+          left.relativePath.split("/").length ||
+        right.relativePath.localeCompare(left.relativePath)
+    )) {
+      const pathValue = join(entry.currentRoot, directory.relativePath);
+      try {
+        const metadata = await lstatIfExists(pathValue);
+        if (
+          !metadata ||
+          metadata.isSymbolicLink() ||
+          !metadata.isDirectory() ||
+          metadata.dev !== directory.dev ||
+          metadata.ino !== directory.ino
+        ) {
+          throw new Error(
+            `Legacy project runtime migration lock directory changed: ${pathValue}`
+          );
+        }
+        await rmdir(pathValue);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (entry.currentRoot === source && entry.createdDirectories.length > 0) {
+      try {
+        await rmdir(source);
+      } catch (error) {
+        if (
+          !(
+            error instanceof Error &&
+            "code" in error &&
+            ["ENOENT", "ENOTEMPTY"].includes(
+              String((error as NodeJS.ErrnoException).code)
+            )
+          )
+        ) {
+          failures.push(error);
+        }
+      }
+    }
     entry.released = true;
     if (failures.length > 0) {
       throw new AggregateError(
@@ -4713,23 +4780,50 @@ async function acquireLegacyProjectRuntimeMigrationLocks(args: {
     };
   }
   const lease: LeaseEntry = {
+    createdDirectories: [],
     currentRoot: migration.source,
     locks: [],
     released: false,
   };
   entries.set(migration.source, lease);
   try {
+    const ignoredEntries = new Map<string, { dev: number; ino: number }>();
+    const ensureLockParent = async (pathValue: string): Promise<void> => {
+      const parentPath = dirname(pathValue);
+      const parentRelative = relative(migration.source, parentPath);
+      let currentPath = migration.source;
+      let currentRelative = "";
+      for (const segment of parentRelative
+        .split(PATH_SEPARATOR_RUN_RE)
+        .filter(Boolean)) {
+        currentPath = join(currentPath, segment);
+        currentRelative = currentRelative
+          ? `${currentRelative}/${segment}`
+          : segment;
+        let metadata = await lstatIfExists(currentPath);
+        if (!metadata) {
+          await mkdir(currentPath, { mode: 0o700 });
+          metadata = await lstat(currentPath);
+          ignoredEntries.set(currentRelative, {
+            dev: metadata.dev,
+            ino: metadata.ino,
+          });
+          lease.createdDirectories.push({
+            dev: metadata.dev,
+            ino: metadata.ino,
+            relativePath: currentRelative,
+          });
+        }
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          throw new Error(
+            `Refusing unsafe legacy project runtime lock directory: ${currentPath}`
+          );
+        }
+      }
+    };
     for (const relativePath of LEGACY_RUNTIME_PRIMARY_LOCK_PATHS) {
       const pathValue = join(migration.source, relativePath);
-      const parent = await lstatIfExists(dirname(pathValue));
-      if (!parent) {
-        continue;
-      }
-      if (parent.isSymbolicLink() || !parent.isDirectory()) {
-        throw new Error(
-          `Refusing unsafe legacy project runtime lock directory: ${dirname(pathValue)}`
-        );
-      }
+      await ensureLockParent(pathValue);
       let handle: FileHandle;
       try {
         handle = await open(pathValue, "wx");
@@ -4761,16 +4855,12 @@ async function acquireLegacyProjectRuntimeMigrationLocks(args: {
         ino: metadata.ino,
         relativePath,
       });
+      ignoredEntries.set(relativePath, {
+        dev: metadata.dev,
+        ino: metadata.ino,
+      });
     }
-    ignoredEntriesBySource.set(
-      migration.source,
-      new Map(
-        lease.locks.map((lock) => [
-          lock.relativePath,
-          { dev: lock.dev, ino: lock.ino },
-        ])
-      )
-    );
+    ignoredEntriesBySource.set(migration.source, ignoredEntries);
   } catch (error) {
     await release();
     throw error;

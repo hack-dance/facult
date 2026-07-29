@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   type FileHandle,
+  link,
   lstat,
   mkdir,
   open,
   readFile,
   rename,
   rm,
+  unlink,
   utimes,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -263,9 +265,65 @@ async function lockOwnerIsLive(path: string): Promise<boolean> {
   );
 }
 
+interface FileIdentity {
+  dev: number;
+  ino: number;
+  mtimeMs: number;
+}
+
+function sameFileIdentity(
+  left: FileIdentity | null,
+  right: FileIdentity | null
+): boolean {
+  return Boolean(
+    left &&
+      right &&
+      left.dev === right.dev &&
+      left.ino === right.ino &&
+      left.mtimeMs === right.mtimeMs
+  );
+}
+
+async function restoreMovedFileIfUnclaimed(args: {
+  currentPath: string;
+  movedPath: string;
+}): Promise<void> {
+  try {
+    await link(args.movedPath, args.currentPath);
+    await unlink(args.movedPath);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "EEXIST"
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function moveFileIfIdentityMatches(args: {
+  currentPath: string;
+  expected: FileIdentity;
+  movedPath: string;
+}): Promise<boolean> {
+  await rename(args.currentPath, args.movedPath);
+  const moved = await lstat(args.movedPath).catch(() => null);
+  if (sameFileIdentity(args.expected, moved)) {
+    return true;
+  }
+  await restoreMovedFileIfUnclaimed({
+    currentPath: args.currentPath,
+    movedPath: args.movedPath,
+  });
+  return false;
+}
+
 async function acquireRecoveryClaim(args: {
   lockPath: string;
   onStaleClaimInspected?: () => void | Promise<void>;
+  onStaleClaimRevalidated?: () => void | Promise<void>;
   ownerToken: string;
   takeoverPath: string;
 }): Promise<FileHandle> {
@@ -308,11 +366,23 @@ async function acquireRecoveryClaim(args: {
       `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
     );
   }
+  await args.onStaleClaimRevalidated?.();
+  const stalePath = `${args.takeoverPath}.stale-${Date.now()}-${args.ownerToken}`;
   try {
-    await rename(
-      args.takeoverPath,
-      `${args.takeoverPath}.stale-${Date.now()}-${args.ownerToken}`
-    );
+    if (
+      !(
+        info &&
+        (await moveFileIfIdentityMatches({
+          currentPath: args.takeoverPath,
+          expected: info,
+          movedPath: stalePath,
+        }))
+      )
+    ) {
+      throw new Error(
+        `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
+      );
+    }
     return await open(args.takeoverPath, "wx");
   } catch (error) {
     if (
@@ -334,7 +404,8 @@ async function withStateLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
   onLockAcquired?: () => void | Promise<void>,
-  onStaleClaimInspected?: () => void | Promise<void>
+  onStaleClaimInspected?: () => void | Promise<void>,
+  onStaleClaimRevalidated?: () => void | Promise<void>
 ): Promise<T> {
   await mkdir(dirname(lockPath), { recursive: true });
   const ownerToken = randomUUID();
@@ -352,6 +423,7 @@ async function withStateLock<T>(
     const takeover = await acquireRecoveryClaim({
       lockPath,
       onStaleClaimInspected,
+      onStaleClaimRevalidated,
       ownerToken,
       takeoverPath,
     });
@@ -403,7 +475,20 @@ async function withStateLock<T>(
           `Reconciliation lock ownership changed during recovery for ${lockPath}`
         );
       }
-      await rename(lockPath, `${lockPath}.stale-${Date.now()}-${ownerToken}`);
+      if (
+        !(
+          info &&
+          (await moveFileIfIdentityMatches({
+            currentPath: lockPath,
+            expected: info,
+            movedPath: `${lockPath}.stale-${Date.now()}-${ownerToken}`,
+          }))
+        )
+      ) {
+        throw new Error(
+          `Reconciliation lock ownership changed during recovery for ${lockPath}`
+        );
+      }
       handle = await open(lockPath, "wx");
     } finally {
       await takeover.close();
@@ -1139,28 +1224,50 @@ function latestLinkedWorkStatuses(args: {
   observations: LinkedWorkStatusObservation[];
 }): Map<string, LinkedWorkStatusObservation> {
   const latest = new Map(Object.entries(args.state.linkedWorkStatuses ?? {}));
+  const observationsByIssue = new Map<string, LinkedWorkStatusObservation[]>();
+  for (const observation of args.observations) {
+    const observations = observationsByIssue.get(observation.issueRef) ?? [];
+    observations.push(observation);
+    observationsByIssue.set(observation.issueRef, observations);
+  }
+  for (const [issueRef, observations] of observationsByIssue) {
+    const merged = mergeLinkedWorkStatusObservations({
+      observations,
+      prior: latest.get(issueRef),
+    });
+    if (merged) {
+      latest.set(issueRef, merged);
+    }
+  }
+  return latest;
+}
+
+function mergeLinkedWorkStatusObservations(args: {
+  observations: LinkedWorkStatusObservation[];
+  prior?: LinkedWorkStatusObservation;
+}): LinkedWorkStatusObservation | undefined {
+  let latest = args.prior;
   const observations = [...args.observations].sort((left, right) =>
     `${left.observedAt}\n${left.sourceRecordId}`.localeCompare(
       `${right.observedAt}\n${right.sourceRecordId}`
     )
   );
   for (const observation of observations) {
-    const prior = latest.get(observation.issueRef);
-    if (prior?.ordering === "unknown") {
+    if (latest?.ordering === "unknown") {
       if (
-        observation.sourceId === prior.sourceId &&
-        observation.sourceRecordId === prior.sourceRecordId
+        observation.sourceId === latest.sourceId &&
+        observation.sourceRecordId === latest.sourceRecordId
       ) {
-        latest.set(observation.issueRef, observation);
+        latest = observation;
       }
       continue;
     }
     const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
-    const priorKey = prior
-      ? `${prior.observedAt}\n${prior.sourceRecordId}`
+    const priorKey = latest
+      ? `${latest.observedAt}\n${latest.sourceRecordId}`
       : undefined;
     if (!(priorKey && priorKey > observationKey)) {
-      latest.set(observation.issueRef, observation);
+      latest = observation;
     }
   }
   return latest;
@@ -1432,14 +1539,23 @@ function updateState(args: {
   next.resolutionProofs = resolutionProofState;
   const linkedWorkStatusState = next.linkedWorkStatuses ?? {};
   next.linkedWorkStatuses = linkedWorkStatusState;
+  const linkedWorkObservationsByIssue = new Map<
+    string,
+    LinkedWorkStatusObservation[]
+  >();
   for (const observation of args.review.linkedWorkStatuses ?? []) {
-    const prior = linkedWorkStatusState[observation.issueRef];
-    const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
-    const priorKey = prior
-      ? `${prior.observedAt}\n${prior.sourceRecordId}`
-      : undefined;
-    if (!(priorKey && priorKey > observationKey)) {
-      linkedWorkStatusState[observation.issueRef] = observation;
+    const observations =
+      linkedWorkObservationsByIssue.get(observation.issueRef) ?? [];
+    observations.push(observation);
+    linkedWorkObservationsByIssue.set(observation.issueRef, observations);
+  }
+  for (const [issueRef, observations] of linkedWorkObservationsByIssue) {
+    const merged = mergeLinkedWorkStatusObservations({
+      observations,
+      prior: linkedWorkStatusState[issueRef],
+    });
+    if (merged) {
+      linkedWorkStatusState[issueRef] = merged;
     }
   }
   for (const proof of args.review.resolutionProofs) {
@@ -1554,6 +1670,8 @@ export async function reconcileSources(args: {
   onLockAcquired?: () => void | Promise<void>;
   /** @internal Adversarial test hook; production callers must not set this. */
   onStaleClaimInspected?: () => void | Promise<void>;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  onStaleClaimRevalidated?: () => void | Promise<void>;
 }): Promise<ReconciliationReview> {
   const { config } = await loadReconciliationConfig(args);
   const enabledSources = config.sources.filter(
@@ -1837,7 +1955,8 @@ export async function reconcileSources(args: {
         facultAiReconciliationLockPath(args.homeDir, args.rootDir),
         execute,
         args.onLockAcquired,
-        args.onStaleClaimInspected
+        args.onStaleClaimInspected,
+        args.onStaleClaimRevalidated
       );
 }
 

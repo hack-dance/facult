@@ -3028,6 +3028,83 @@ describe("project enrollment lifecycle", () => {
     ).toEqual([]);
   });
 
+  it("creates both legacy runtime lock barriers when their directories are absent", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const legacyJournal = join(legacyState, "journal", "events.jsonl");
+    const legacyEvolutionLock = join(
+      legacyState,
+      "ai/project/evolution/loop/state.json.lock"
+    );
+    const legacyReconciliationLock = join(
+      legacyState,
+      "ai/project/reconciliation/state.json.lock"
+    );
+    await mkdir(dirname(legacyJournal), { recursive: true });
+    await writeFile(legacyJournal, "legacy journal\n", "utf8");
+    expect(await pathEntryExists(dirname(legacyEvolutionLock))).toBe(false);
+    expect(await pathEntryExists(dirname(legacyReconciliationLock))).toBe(
+      false
+    );
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const blockedLocks = new Set<string>();
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      afterGeneratedWrites: async () => {
+        for (const pathValue of [
+          legacyEvolutionLock,
+          legacyReconciliationLock,
+        ]) {
+          try {
+            const competitor = await open(pathValue, "wx");
+            await competitor.close();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              (error as NodeJS.ErrnoException).code === "EEXIST"
+            ) {
+              blockedLocks.add(pathValue);
+            }
+          }
+        }
+      },
+    });
+
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    expect(blockedLocks).toEqual(
+      new Set([legacyEvolutionLock, legacyReconciliationLock])
+    );
+    expect(await pathEntryExists(legacyState)).toBe(false);
+    expect(await Bun.file(legacyJournal).exists()).toBe(false);
+    expect(
+      await Bun.file(join(selectedState, "journal", "events.jsonl")).text()
+    ).toBe("legacy journal\n");
+    expect(await Bun.file(legacyEvolutionLock).exists()).toBe(false);
+    expect(await Bun.file(legacyReconciliationLock).exists()).toBe(false);
+    expect(
+      (
+        await planProjectEnrollment({
+          projectRoot: repo,
+          homeDir: home,
+        })
+      ).stateMigrations
+    ).toEqual([]);
+  });
+
   it("compensates a legacy source reappearance after quarantine", async () => {
     const { root, home } = await makeFixture();
     const repo = join(root, "repo");

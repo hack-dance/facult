@@ -1666,6 +1666,18 @@ describe("source reconciliation", () => {
       )
     );
     expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+
+    await Bun.write(exportPath, JSON.stringify(evidenceExport([])));
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+    const reopenedState = JSON.parse(await readFile(statePath, "utf8")) as {
+      linkedWorkStatuses?: Record<
+        string,
+        { ordering?: string; terminal?: boolean }
+      >;
+    };
+    expect(reopenedState.linkedWorkStatuses?.["HACK-1202"]).toMatchObject({
+      terminal: false,
+    });
   });
 
   it("resolves linked-work families from bounded terminal status readback", async () => {
@@ -2443,6 +2455,65 @@ describe("source reconciliation", () => {
         since: "2026-07-03",
         until: "2026-07-10",
         onStaleClaimInspected,
+      });
+    const results = await Promise.allSettled([attempt(), attempt()]);
+
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected")
+    ).toHaveLength(1);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
+  });
+
+  it("serializes contenders after both revalidate the abandoned takeover identity", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    let revalidated = 0;
+    let releaseRevalidations: (() => void) | undefined;
+    const bothRevalidated = new Promise<void>((resolve) => {
+      releaseRevalidations = resolve;
+    });
+    const onStaleClaimRevalidated = async (): Promise<void> => {
+      revalidated += 1;
+      if (revalidated === 2) {
+        releaseRevalidations?.();
+      }
+      await bothRevalidated;
+    };
+    const attempt = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+        onStaleClaimRevalidated,
       });
     const results = await Promise.allSettled([attempt(), attempt()]);
 
