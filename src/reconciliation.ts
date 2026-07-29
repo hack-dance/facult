@@ -19,7 +19,10 @@ import {
   facultAiReconciliationStatePath,
   projectRootFromAiRoot,
 } from "./paths";
-import { processStartIdentity } from "./process-identity";
+import {
+  processStartIdentity,
+  processStartIdentityMatches,
+} from "./process-identity";
 import {
   gitDefaultBranchContainment,
   reconciliationAdapterFor,
@@ -261,7 +264,10 @@ async function lockOwnerIsLive(path: string): Promise<boolean> {
       : undefined;
   return (
     !(recordedProcessStartedAt && observedProcessStartedAt) ||
-    recordedProcessStartedAt === observedProcessStartedAt
+    processStartIdentityMatches(
+      recordedProcessStartedAt,
+      observedProcessStartedAt
+    )
   );
 }
 

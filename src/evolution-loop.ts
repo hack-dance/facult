@@ -35,7 +35,10 @@ import {
   projectRootFromAiRoot,
   withFacultRootScope,
 } from "./paths";
-import { processStartIdentity } from "./process-identity";
+import {
+  processStartIdentity,
+  processStartIdentityMatches,
+} from "./process-identity";
 import { reconcileSources, reconciliationStatus } from "./reconciliation";
 import { DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS } from "./reconciliation-config";
 import type {
@@ -1592,7 +1595,10 @@ async function withLoopLock<T>(args: {
             : undefined;
         if (
           !(recordedProcessStartedAt && observedProcessStartedAt) ||
-          recordedProcessStartedAt === observedProcessStartedAt
+          processStartIdentityMatches(
+            recordedProcessStartedAt,
+            observedProcessStartedAt
+          )
         ) {
           throw new Error(
             `A live evolution loop owner still holds ${args.path}. If process identity is unavailable and the lease is known to be abandoned, inspect the owner record and remove this one lock file explicitly.`
