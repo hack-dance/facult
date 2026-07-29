@@ -16,7 +16,7 @@ const tools = [
   {
     name: "fclt_setup",
     description:
-      "Bootstrap or repair the complete fclt writeback/evolution loop and return readiness JSON.",
+      "Bootstrap or repair the global fclt loop and optionally return an exact no-write project enrollment plan.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1046,7 +1046,7 @@ function commandForTool(name, args = {}) {
       return [
         "setup",
         "--json",
-        ...(args.scope === "global" ? ["--global-only"] : []),
+        ...(args.scope === "global_and_project" ? ["--include-project"] : []),
         ...(apply ? [] : ["--dry-run"]),
         ...(args.installCodexPlugin === false ? ["--no-codex-plugin"] : []),
       ];

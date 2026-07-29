@@ -1191,10 +1191,11 @@ function renderedTargetNodeName(
 
 async function readManagedState(
   homeDir: string,
-  rootDir: string
+  rootDir: string,
+  machineStateDir?: string
 ): Promise<ManagedStateLite | null> {
   const statePath = join(
-    facultMachineStateDir(homeDir, rootDir),
+    machineStateDir ?? facultMachineStateDir(homeDir, rootDir),
     "managed.json"
   );
   try {
@@ -1575,6 +1576,8 @@ interface BuildIndexOptions {
   rootDir?: string;
   /** Override home directory for generated state placement (useful for tests). */
   homeDir?: string;
+  /** Use an enrollment-validated machine state destination. */
+  machineStateDir?: string;
 }
 
 interface BuildIndexResult {
@@ -1592,8 +1595,12 @@ async function buildIndexInternal(
   const homeDir = opts?.homeDir ?? process.env.HOME ?? "";
   const rootDir =
     opts?.rootDir ?? (homeDir ? facultRootDir(homeDir) : facultRootDir());
-  const outputPath = facultAiIndexPath(homeDir, rootDir);
-  const graphPath = facultAiGraphPath(homeDir, rootDir);
+  const outputPath = opts?.machineStateDir
+    ? join(opts.machineStateDir, "ai", "index.json")
+    : facultAiIndexPath(homeDir, rootDir);
+  const graphPath = opts?.machineStateDir
+    ? join(opts.machineStateDir, "ai", "graph.json")
+    : facultAiGraphPath(homeDir, rootDir);
   const projectRoot = projectRootFromAiRoot(rootDir, homeDir);
   const projectSlug = projectSlugFromAiRoot(rootDir, homeDir);
   const currentScope: IndexedSource = projectRoot
@@ -1609,7 +1616,11 @@ async function buildIndexInternal(
         scope: "global",
         rootDir,
       };
-  const managedState = await readManagedState(homeDir, rootDir);
+  const managedState = await readManagedState(
+    homeDir,
+    rootDir,
+    opts?.machineStateDir
+  );
 
   let previousIndex: Record<string, unknown> | null = null;
   if (!force) {

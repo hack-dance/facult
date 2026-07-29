@@ -2,14 +2,17 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { refreshAiReviewArtifacts } from "./ai";
 import { resolveCliContextRoot } from "./cli-context";
-import { buildDoctorReport, type DoctorReport } from "./doctor";
+import { buildDoctorReport, type DoctorReport, shellQuote } from "./doctor";
 import { type SetupCodexPluginResult, setupCodexPlugin } from "./manage";
-import { facultAiReconciliationConfigPath } from "./paths";
+import {
+  facultAiReconciliationConfigPath,
+  pathsPhysicallyEquivalent,
+} from "./paths";
+import { type ProjectEnrollmentPlan, planProjectEnrollment } from "./projects";
 import { initializeReconciliationConfig } from "./reconciliation-config";
 import {
   findGitRootFromPath,
   scaffoldBuiltinOperatingModelPack,
-  scaffoldBuiltinProjectAiPack,
 } from "./remote";
 
 export interface BootstrapOptions {
@@ -30,6 +33,7 @@ export interface BootstrapResult {
   homeDir: string;
   globalRoot: string;
   projectRoot: string | null;
+  projectEnrollmentPlan: ProjectEnrollmentPlan | null;
   changedPaths: string[];
   skippedPaths: string[];
   codexPlugin: SetupCodexPluginResult | null;
@@ -89,15 +93,28 @@ export async function bootstrapFclt(
     scope: "global",
   });
   const detectedProject = findGitRootFromPath(cwd);
-  const includeProject = opts.includeProject ?? detectedProject !== null;
+  const includeProject = opts.includeProject ?? false;
+  if (includeProject && !detectedProject) {
+    throw new Error(
+      `Project setup was requested outside a Git checkout: ${cwd}`
+    );
+  }
   const projectCandidateRoot = resolve(detectedProject ?? cwd, ".ai");
   const projectTargetsGlobalRoot =
-    (detectedProject !== null && resolve(detectedProject) === globalRoot) ||
-    projectCandidateRoot === globalRoot;
+    (detectedProject !== null &&
+      pathsPhysicallyEquivalent(detectedProject, globalRoot)) ||
+    pathsPhysicallyEquivalent(projectCandidateRoot, globalRoot);
   const projectRoot =
     includeProject && !projectTargetsGlobalRoot ? projectCandidateRoot : null;
   const changedPaths: string[] = [];
   const skippedPaths: string[] = [];
+  const projectEnrollmentPlan =
+    projectRoot && detectedProject
+      ? await planProjectEnrollment({
+          projectRoot: detectedProject,
+          homeDir,
+        })
+      : null;
 
   const globalInstall = await scaffoldBuiltinOperatingModelPack({
     rootDir: globalRoot,
@@ -124,32 +141,6 @@ export async function bootstrapFclt(
     await refreshAiReviewArtifacts({ homeDir, rootDir: globalRoot });
   }
 
-  if (projectRoot) {
-    const projectInstall = await scaffoldBuiltinProjectAiPack({
-      cwd: detectedProject ?? cwd,
-      rootDir: projectRoot,
-      homeDir,
-      dryRun: opts.dryRun,
-      update: true,
-    });
-    changedPaths.push(...projectInstall.changedPaths);
-    skippedPaths.push(...(projectInstall.skippedPaths ?? []));
-    const projectReconciliation = await initializeReconciliationForSetup({
-      homeDir,
-      rootDir: projectRoot,
-      scope: "project",
-      dryRun: opts.dryRun,
-    });
-    if (projectReconciliation?.created) {
-      changedPaths.push(projectReconciliation.path);
-    } else if (!projectReconciliation) {
-      skippedPaths.push(facultAiReconciliationConfigPath(homeDir, projectRoot));
-    }
-    if (!opts.dryRun) {
-      await refreshAiReviewArtifacts({ homeDir, rootDir: projectRoot });
-    }
-  }
-
   const codexBin =
     opts.codexBin === undefined ? Bun.which("codex") : opts.codexBin;
   const installCodexPlugin =
@@ -169,7 +160,7 @@ export async function bootstrapFclt(
 
   const [globalReadiness, projectReadiness] = await Promise.all([
     buildDoctorReport({ cwd, homeDir, rootArg: globalRoot, scope: "global" }),
-    projectRoot
+    projectRoot && (await Bun.file(projectRoot).exists())
       ? buildDoctorReport({
           cwd,
           homeDir,
@@ -194,6 +185,16 @@ export async function bootstrapFclt(
   const repairActions = [
     ...reportRepairs(globalReadiness, "global"),
     ...(projectReadiness ? reportRepairs(projectReadiness, "project") : []),
+    ...(projectEnrollmentPlan
+      ? [
+          {
+            scope: "project" as const,
+            command: `fclt project init --project-root ${shellQuote(projectEnrollmentPlan.projectRoot)} --apply --plan-sha ${projectEnrollmentPlan.planSha256}`,
+            reason:
+              "Review the project enrollment plan before applying its minimal canonical layer.",
+          },
+        ]
+      : []),
     ...(pluginFailed
       ? [
           {
@@ -227,6 +228,7 @@ export async function bootstrapFclt(
     homeDir,
     globalRoot,
     projectRoot,
+    projectEnrollmentPlan,
     changedPaths: uniqueSorted(changedPaths),
     skippedPaths: uniqueSorted(skippedPaths),
     codexPlugin,
@@ -242,17 +244,17 @@ function printHelp(): void {
   console.log(`fclt setup — bootstrap a healthy writeback/evolution loop
 
 Usage:
-  fclt setup [--json] [--dry-run] [--global-only] [--no-codex-plugin]
+  fclt setup [--json] [--dry-run] [--include-project] [--no-codex-plugin]
   fclt setup codex-plugin [--dry-run] [--json] [--no-codex-install]
 
 The default command initializes or safely updates the global operating model,
-initializes the current git repository when present, prepares review state, and
-installs the Codex plugin when Codex is available. It is safe to run again.
+prepares review state, and installs the Codex plugin when Codex is available.
+Project enrollment is separate and preview-first.
 
 Options:
   --json                Print machine-readable bootstrap and readiness output
   --dry-run             Report planned writes without changing state
-  --global-only         Do not initialize the current repository
+  --include-project     Include an exact no-write project enrollment plan
   --no-codex-plugin     Keep setup CLI-only even when Codex is available
   --no-codex-install    Prepare plugin files without running codex plugin add
 `);
@@ -283,7 +285,7 @@ export async function setupCommand(argv: string[]): Promise<void> {
   try {
     const result = await bootstrapFclt({
       dryRun: args.includes("--dry-run"),
-      includeProject: args.includes("--global-only") ? false : undefined,
+      includeProject: args.includes("--include-project"),
       installCodexPlugin: args.includes("--no-codex-plugin")
         ? false
         : undefined,
@@ -296,6 +298,10 @@ export async function setupCommand(argv: string[]): Promise<void> {
       console.log(`global: ${result.globalRoot}`);
       console.log(`project: ${result.projectRoot ?? "(none)"}`);
       console.log(`changed: ${result.changedPaths.length}`);
+      if (result.projectEnrollmentPlan) {
+        console.log("project enrollment plan:");
+        console.log(JSON.stringify(result.projectEnrollmentPlan, null, 2));
+      }
       if (result.repairActions.length > 0) {
         console.log("next actions:");
         for (const action of result.repairActions) {

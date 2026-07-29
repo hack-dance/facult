@@ -1,18 +1,23 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
 import {
+  chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
+  rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { runFixtureGit } from "../test/git-fixture";
 import { renderCanonicalText } from "./agents";
-import { facultAiIndexPath } from "./paths";
+import { facultAiIndexPath, facultLocalStateRoot } from "./paths";
 import {
   checkRemoteUpdates,
   installRemoteItem,
@@ -53,13 +58,46 @@ function sha256Hex(input: string): string {
 }
 
 async function makeTempRoot(): Promise<{ home: string; root: string }> {
-  const dir = await mkdtemp(join(tmpdir(), "facult-remote-"));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "facult-remote-")));
   tempDir = dir;
   const home = join(dir, "home");
   const root = join(home, "agents", ".facult");
   await mkdir(home, { recursive: true });
   await mkdir(root, { recursive: true });
   return { home, root };
+}
+
+async function initializeGitRepository(
+  repoDir: string,
+  home: string
+): Promise<void> {
+  await mkdir(repoDir, { recursive: true });
+  await runFixtureGit({
+    argv: ["init", "-b", "main", repoDir],
+    repoDir,
+    homeDir: home,
+  });
+  await writeFile(join(repoDir, "README.md"), "# Fixture\n");
+  await runFixtureGit({
+    argv: ["add", "."],
+    repoDir,
+    homeDir: home,
+    cwd: repoDir,
+  });
+  await runFixtureGit({
+    argv: [
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.test",
+      "commit",
+      "-m",
+      "fixture",
+    ],
+    repoDir,
+    homeDir: home,
+    cwd: repoDir,
+  });
 }
 
 async function withMutedConsole(fn: () => Promise<void>) {
@@ -1256,7 +1294,7 @@ describe("templates command", () => {
     expect(automationToml).toContain("scope-promoter");
     expect(automationToml).toContain("evolution-planner");
     expect(automationToml).toContain("verification-auditor");
-    expect(automationToml).toContain("fclt templates init project-ai");
+    expect(automationToml).toContain("fclt project init --json");
     expect(automationToml).toContain("blocked by missing project AI state");
     expect(automationToml).toContain("not graph-backed");
     expect(automationToml).toContain("Recorded writebacks");
@@ -1266,7 +1304,7 @@ describe("templates command", () => {
     const memory = await readFile(join(automationDir, "memory.md"), "utf8");
     expect(memory).toContain("$feedback-loop-setup");
     expect(memory).toContain("$capability-evolution");
-    expect(memory).toContain("bootstrap baseline project AI state");
+    expect(memory).toContain("preview baseline project AI state");
   });
 
   it("supports project-scoped automation scaffolding with explicit scope root", async () => {
@@ -1675,59 +1713,100 @@ describe("templates command", () => {
     );
   });
 
-  it("scaffolds the builtin project-ai pack into a repo-local .ai", async () => {
+  it("previews minimal project-ai enrollment without writing", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     process.chdir(repoDir);
 
-    await withMutedConsole(async () => {
+    const { logs, errors } = await withCapturedConsole(async () => {
       await templatesCommand(["init", "project-ai"], {
         homeDir: home,
         cwd: repoDir,
       });
     });
 
-    expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
-    expect(
-      await Bun.file(
-        join(repoDir, ".ai", "instructions", "PROJECT_CAPABILITY.md")
-      ).exists()
-    ).toBe(true);
-    const evolutionText = await Bun.file(
-      join(repoDir, ".ai", "instructions", "EVOLUTION.md")
-    ).text();
-    expect(evolutionText).toContain("fclt ai writeback add");
-    expect(evolutionText).toContain("Current supported proposal kinds");
-
-    const skillText = await Bun.file(
-      join(repoDir, ".ai", "skills", "capability-evolution", "SKILL.md")
-    ).text();
-    expect(skillText).toContain("Proposal Kind Selection");
-    expect(skillText).toContain("fclt ai evolve draft EV-00001 --append");
-    expect(
-      await Bun.file(facultAiIndexPath(home, join(repoDir, ".ai"))).exists()
-    ).toBe(true);
+    expect(errors).toEqual([]);
+    const plan = JSON.parse(logs.join("\n")) as {
+      projectRoot: string;
+      protections: { automaticGuidanceCopy: boolean };
+      canonicalWrites: Array<{ path: string }>;
+    };
+    expect(plan.projectRoot).toBe(repoDir);
+    expect(plan.protections.automaticGuidanceCopy).toBe(false);
+    expect(plan.canonicalWrites.map((write) => write.path)).toEqual([
+      join(repoDir, ".ai", ".gitignore"),
+      join(repoDir, ".ai", "config.toml"),
+    ]);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
   });
 
-  it("scaffolds the builtin project-ai pack into an explicit root", async () => {
+  it("keeps project-ai alias apply zero-write under common --dry-run", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    await initializeGitRepository(repoDir, home);
+
+    const previewOutput = await withCapturedConsole(async () => {
+      await templatesCommand(
+        ["init", "project-ai", "--project-root", repoDir, "--json"],
+        {
+          homeDir: home,
+          cwd: repoDir,
+        }
+      );
+    });
+    expect(previewOutput.errors).toEqual([]);
+    const plan = JSON.parse(previewOutput.logs.join("\n")) as {
+      planSha256: string;
+      canonicalWrites: Array<{ path: string }>;
+      generatedWrites: Array<{ path: string }>;
+      machineLocalWrites: Array<{ path: string }>;
+    };
+
+    const dryRunOutput = await withCapturedConsole(async () => {
+      await templatesCommand(
+        [
+          "init",
+          "project-ai",
+          "--project-root",
+          repoDir,
+          "--apply",
+          "--plan-sha",
+          plan.planSha256,
+          "--dry-run",
+          "--json",
+        ],
+        {
+          homeDir: home,
+          cwd: repoDir,
+        }
+      );
+    });
+
+    expect(dryRunOutput.errors).toEqual([]);
+    expect(
+      (JSON.parse(dryRunOutput.logs.join("\n")) as { planSha256: string })
+        .planSha256
+    ).toBe(plan.planSha256);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
+    expect(await Bun.file(facultLocalStateRoot(home)).exists()).toBe(false);
+    for (const pathValue of [
+      ...plan.canonicalWrites,
+      ...plan.generatedWrites,
+      ...plan.machineLocalWrites,
+    ].map((write) => write.path)) {
+      expect(await Bun.file(pathValue).exists()).toBe(false);
+    }
+  });
+
+  it("previews project-ai enrollment into an explicit root", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--root", join(repoDir, ".ai")],
         {
@@ -1738,27 +1817,20 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
-  it("scaffolds the builtin project-ai pack from an explicit project root", async () => {
+  it("previews project-ai enrollment from an explicit project root", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--project-root", repoDir],
         {
@@ -1769,16 +1841,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
@@ -1786,10 +1851,10 @@ describe("templates command", () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--project-root", repoDir],
         {
@@ -1801,16 +1866,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
@@ -1818,10 +1876,10 @@ describe("templates command", () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(["init", "project-ai", "--project-root=~/repo"], {
         homeDir: home,
         cwd: otherDir,
@@ -1829,16 +1887,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, "~", "repo", ".ai")).exists()).toBe(
       false
     );
@@ -1996,7 +2047,7 @@ describe("templates command", () => {
     expect(await readFile(agentsPath, "utf8")).toBe(agentsText);
   });
 
-  it("seeds project AGENTS.global.md from the repo AGENTS.md", async () => {
+  it("does not seed project AGENTS.global.md from repo guidance", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     await mkdir(repoDir, { recursive: true });
@@ -2017,10 +2068,246 @@ describe("templates command", () => {
       join(repoDir, ".ai", "AGENTS.global.md"),
       "utf8"
     );
-    expect(agentsText).toContain("# Project Agent Instructions");
-    expect(agentsText).toContain("- Use repo-specific checks.");
-    expect(agentsText).toContain("## Facult Operating Model");
+    expect(agentsText).not.toContain("# Project Agent Instructions");
+    expect(agentsText).not.toContain("- Use repo-specific checks.");
+    expect(agentsText).toContain("# Global Agent Instructions");
     expect(agentsText).toContain("<!-- fclty:global/core/writeback -->");
+    expect(
+      await readFile(join(repoDir, ".ai", ".gitignore"), "utf8")
+    ).toContain("/.facult/");
+  });
+
+  it("refuses a symlinked project ignore leaf before full-pack writes", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const victimPath = join(home, "victim.txt");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(victimPath, "do not change\n", "utf8");
+    await symlink(victimPath, join(repoDir, ".ai", ".gitignore"));
+
+    const output = await withCapturedConsole(async () => {
+      await templatesCommand(["init", "operating-model", "--project"], {
+        homeDir: home,
+        cwd: repoDir,
+      });
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(output.errors.join("\n")).toContain(
+      "Refusing unsafe project ignore file"
+    );
+    expect(await readFile(victimPath, "utf8")).toBe("do not change\n");
+    expect(
+      await Bun.file(join(repoDir, ".ai", "AGENTS.global.md")).exists()
+    ).toBe(false);
+    expect(await Bun.file(join(repoDir, ".ai", ".facult")).exists()).toBe(
+      false
+    );
+  });
+
+  it("rejects unsupported Windows project installation before full-pack writes", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    await initializeGitRepository(repoDir, home);
+
+    await expect(
+      scaffoldBuiltinOperatingModelPack({
+        homeDir: home,
+        rootDir: join(repoDir, ".ai"),
+        platform: "win32",
+      })
+    ).rejects.toThrow("unsupported on win32");
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
+  });
+
+  it("refuses a hard-linked project ignore leaf without changing its peer", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const victimPath = join(home, "victim.txt");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(victimPath, "do not change\n", "utf8");
+    await link(victimPath, join(repoDir, ".ai", ".gitignore"));
+
+    const output = await withCapturedConsole(async () => {
+      await templatesCommand(["init", "operating-model", "--project"], {
+        homeDir: home,
+        cwd: repoDir,
+      });
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(output.errors.join("\n")).toContain(
+      "Refusing unsafe project ignore file"
+    );
+    expect(await readFile(victimPath, "utf8")).toBe("do not change\n");
+    expect(
+      await Bun.file(join(repoDir, ".ai", "AGENTS.global.md")).exists()
+    ).toBe(false);
+    expect(await Bun.file(join(repoDir, ".ai", ".facult")).exists()).toBe(
+      false
+    );
+  });
+
+  it("propagates project ignore access failures without treating authored rules as absent", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const aiRoot = join(repoDir, ".ai");
+    const ignorePath = join(aiRoot, ".gitignore");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(aiRoot, { recursive: true });
+    await writeFile(ignorePath, "/authored-rule\n", "utf8");
+    await chmod(aiRoot, 0o000);
+    let failure: unknown;
+    try {
+      await scaffoldBuiltinOperatingModelPack({
+        homeDir: home,
+        rootDir: aiRoot,
+      });
+    } catch (error) {
+      failure = error;
+    } finally {
+      await chmod(aiRoot, 0o700);
+    }
+
+    expect((failure as NodeJS.ErrnoException | undefined)?.code).toBe("EACCES");
+    expect(await readFile(ignorePath, "utf8")).toBe("/authored-rule\n");
+    expect(await Bun.file(join(aiRoot, "AGENTS.global.md")).exists()).toBe(
+      false
+    );
+  });
+
+  it("refuses a special-file project ignore leaf without opening it", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const ignorePath = join(repoDir, ".ai", ".gitignore");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    const fifo = Bun.spawnSync(["mkfifo", ignorePath]);
+    expect(fifo.exitCode).toBe(0);
+
+    const output = await withCapturedConsole(async () => {
+      await templatesCommand(["init", "operating-model", "--project"], {
+        homeDir: home,
+        cwd: repoDir,
+      });
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(output.errors.join("\n")).toContain(
+      "Refusing unsafe project ignore file"
+    );
+    expect((await lstat(ignorePath)).isFIFO()).toBe(true);
+    expect(
+      await Bun.file(join(repoDir, ".ai", "AGENTS.global.md")).exists()
+    ).toBe(false);
+  });
+
+  it("reappends full-pack protections after existing ignore negations", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(
+      join(repoDir, ".ai", ".gitignore"),
+      [
+        "/.facult/",
+        "!/.facult/",
+        "/config.local.toml",
+        "!/config.local.toml",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    await withMutedConsole(async () => {
+      await templatesCommand(["init", "operating-model", "--project"], {
+        homeDir: home,
+        cwd: repoDir,
+      });
+    });
+
+    const ignore = await readFile(join(repoDir, ".ai", ".gitignore"), "utf8");
+    expect(ignore.lastIndexOf("/.facult/")).toBeGreaterThan(
+      ignore.lastIndexOf("!/.facult/")
+    );
+    expect(ignore.lastIndexOf("/config.local.toml")).toBeGreaterThan(
+      ignore.lastIndexOf("!/config.local.toml")
+    );
+  });
+
+  it("preserves existing project ignore mode", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const ignorePath = join(repoDir, ".ai", ".gitignore");
+    await initializeGitRepository(repoDir, home);
+    await mkdir(dirname(ignorePath), { recursive: true });
+    await writeFile(ignorePath, "/authored-rule\n", "utf8");
+    await chmod(ignorePath, 0o640);
+
+    await scaffoldBuiltinOperatingModelPack({
+      homeDir: home,
+      rootDir: join(repoDir, ".ai"),
+    });
+
+    expect((await lstat(ignorePath)).mode % 0o1000).toBe(0o640);
+  });
+
+  it("creates a repo-readable project ignore despite a restrictive umask", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    await initializeGitRepository(repoDir, home);
+
+    const proc = Bun.spawn(
+      [
+        "sh",
+        "-c",
+        'umask 077; exec bun run "$1" templates init operating-model --project',
+        "sh",
+        join(import.meta.dir, "index.ts"),
+      ],
+      {
+        cwd: repoDir,
+        env: { ...process.env, HOME: home },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [exitCode, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stderr).text(),
+    ]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(
+      (await lstat(join(repoDir, ".ai", ".gitignore"))).mode % 0o1000
+    ).toBe(0o644);
+    expect(
+      (
+        await lstat(
+          join(
+            repoDir,
+            ".ai",
+            ".facult",
+            "packs",
+            "facult-operating-model.json"
+          )
+        )
+      ).mode % 0o1000
+    ).toBe(0o600);
   });
 
   it("updates unmodified builtin operating-model files using the pack manifest", async () => {
@@ -2133,6 +2420,30 @@ describe("templates command", () => {
       })
     ).rejects.toThrow();
     expect((await lstat(skillPath)).isSymbolicLink()).toBe(true);
+  });
+
+  it("preserves a project ignore edited at the final commit boundary", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    const aiRoot = join(repoDir, ".ai");
+    await mkdir(aiRoot, { recursive: true });
+    const ignorePath = join(aiRoot, ".gitignore");
+    const reviewedPath = join(aiRoot, ".gitignore.reviewed");
+    await writeFile(ignorePath, "/before\n", "utf8");
+    process.chdir(repoDir);
+
+    await expect(
+      scaffoldBuiltinOperatingModelPack({
+        homeDir: home,
+        rootDir: aiRoot,
+        beforeProjectIgnoreCommit: async () => {
+          await rename(ignorePath, reviewedPath);
+          await writeFile(ignorePath, "/concurrent\n", "utf8");
+        },
+      })
+    ).rejects.toThrow("conditional commit boundary");
+    expect(await readFile(ignorePath, "utf8")).toBe("/concurrent\n");
+    expect(await readFile(reviewedPath, "utf8")).toBe("/before\n");
   });
 
   it("bootstraps the builtin operating-model pack into a project root", async () => {

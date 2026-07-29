@@ -5,7 +5,12 @@ This page groups the main `fclt` commands by job. Use `fclt --help` and `fclt <c
 ## Discovery
 
 ```bash
-fclt setup [--global-only] [--no-codex-plugin] [--json]
+fclt setup [--include-project] [--no-codex-plugin] [--json]
+fclt projects discover --root <path> [--root <path>] [--since <duration>] [--json]
+fclt projects status [--root <path>] [--json]
+fclt project init [--project-root <path>] [--guidance <path>] [--apply --plan-sha <sha>] [--json]
+fclt project disable|ignore|inactive|remove [--project-root <path>] [--json]
+fclt project rollback --receipt <id> [--apply] [--json]
 fclt status [--json]
 fclt doctor [--json] [--repair]
 fclt paths [--json]
@@ -16,10 +21,11 @@ fclt show <selector>
 fclt find <query>
 ```
 
-Use `fclt setup` once after installation to bootstrap global capability, the current repository
-when present, review state, indexes, and optional Codex integration. It is idempotent and preserves
-local edits and WB/EV history. The remaining commands let you inspect tool state without claiming
-ownership of rendered files.
+Use `fclt setup` once after installation to bootstrap global capability,
+review state, indexes, and optional Codex integration. It is idempotent and
+does not initialize the current repository. `--include-project` adds an exact,
+no-write enrollment plan. Use `projects discover` for bounded read-only
+inventory, then `project init` preview/apply for one selected repository.
 `doctor --json` is read-only and reports schema version 2 setup health, loop readiness, optional
 integration degradation, legacy managed/autosync recovery coverage, and recommended actions.
 `legacyRecovery.state` is `clear`, `contained`, `cleanup_required`, or `blocked`; cleanup is offered
@@ -56,7 +62,7 @@ The graph explains how instructions, snippets, config refs, and rendered targets
 ```bash
 fclt templates list
 fclt templates init operating-model [--global|--project|--root PATH] [--update] [--force]
-fclt templates init project-ai [--update] [--force]
+fclt templates init project-ai [--project-root PATH|--root PATH] [--guidance PATH] [--apply --plan-sha SHA]
 fclt templates init instruction <name>
 fclt templates init snippet <marker>
 fclt templates init skill <name>
@@ -67,7 +73,10 @@ fclt consolidate --auto keep-current --from <path>
 fclt index [--force]
 ```
 
-Use these to create or normalize canonical capability in `~/.ai` or `<repo>/.ai`.
+Use these to create or normalize canonical capability in `~/.ai` or
+`<repo>/.ai`. `project-ai` is a compatibility alias for minimal, preview-first
+`project init`; use `operating-model --project` only for an explicit full-pack
+install.
 
 ## Per-asset deployment planning
 

@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   realpath,
@@ -20,6 +22,7 @@ import {
   resolve,
 } from "node:path";
 import { isCancel, multiselect, select, text } from "@clack/prompts";
+import { replaceVerifiedFileAt } from "./audit/safe-openat";
 import {
   builtinOperatingModelInstallRelPath,
   facultBuiltinPackRoot,
@@ -45,6 +48,7 @@ import {
 } from "./legacy-mutation-policy";
 import {
   facultRootDir,
+  pathsPhysicallyEquivalent,
   projectRootFromAiRoot,
   readFacultConfig,
   withFacultRootScope,
@@ -84,6 +88,8 @@ import { parseJsonLenient } from "./util/json";
 
 const REMOTE_STATE_VERSION = 1;
 const VERSION_TOKEN_RE = /[A-Za-z]+|[0-9]+/g;
+// biome-ignore lint/suspicious/noBitwiseOperators: secure open flags require OS bitmask composition.
+const NOFOLLOW_READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const QUERY_SPLIT_RE = /\s+/;
 const MD_EXT_RE = /\.md$/i;
 const FILE_EXT_RE = /\.[A-Za-z0-9]+$/;
@@ -458,7 +464,7 @@ Use this memory for pattern continuity:
 - For wide reviews, partition evidence by cwd first; do not let one repo's evidence stand in for another.
 - Grounding: prefer evidence from session messages, tool calls, shell commands, diffs, tests, commits, and touched files.
 - Threshold: only encode signal when you can name what was learned, why it matters, and the most plausible destination.
-- Scope: default to project writeback only when the repo has a project-local \`.ai\` root for capability context. If a local writable repo is missing one, bootstrap baseline project AI state with \`fclt templates init project-ai\` before retrying project-scoped writeback. Writeback/evolution review artifacts still belong under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\`, not inside the repo-local \`.ai\`. If bootstrap fails or the repo is not writable, treat that as the blocker instead of silently falling back to global runtime state.
+- Scope: default to project writeback only when the repo has a project-local \`.ai\` root for capability context. If a local writable repo is missing one, preview baseline project AI state with \`fclt project init --json\`, review the exact plan, and apply it with the returned plan hash only when authorized. Writeback/evolution review artifacts still belong under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\`, not inside the repo-local \`.ai\`. If enrollment is not authorized, fails, or the repo is not writable, treat that as the blocker instead of silently falling back to global runtime state.
 - Promote to global only when the same signal appears across multiple repos or clearly targets shared doctrine, shared agents, or shared skills.
 - Verification: distinguish one-off friction from a repeated pattern before escalating it.
 - If available, use [$feedback-loop-setup]({{feedbackLoopSkill}}) when the review needs stronger feedback loops or verification framing.
@@ -484,7 +490,7 @@ Grounding rules:
 
 Decision rules:
 - Use \`fclt ai writeback add\` when the signal, target asset, and scope are clear.
-- Before attempting project-scoped writeback, verify the cwd has a repo-local \`.ai\` root for capability context. If it does not and the cwd is a local writable repo, run \`fclt templates init project-ai\` from that repo root, then continue. Do not write writeback/evolution review artifacts into the repo-local \`.ai\`; fclt mirrors them under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\` with cwd/project metadata. If bootstrap fails or the repo is not writable, report the writeback as blocked by missing project AI state rather than falling back to merged/global runtime state.
+- Before attempting project-scoped writeback, verify the cwd has a repo-local \`.ai\` root for capability context. If it does not and the cwd is a local writable repo, run \`fclt project init --json\`, review its exact writes, and apply the unchanged plan with \`--apply --plan-sha <sha>\` only when authorized. Do not write writeback/evolution review artifacts into the repo-local \`.ai\`; fclt mirrors them under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\` with cwd/project metadata. If enrollment is not authorized, fails, or the repo is not writable, report the writeback as blocked by missing project AI state rather than falling back to merged/global runtime state.
 - Before passing \`--asset\`, verify the target resolves in the Facult graph. If the destination is a raw file path or otherwise not graph-backed, report that as a missing-asset blocker instead of retrying blind.
 - Use \`fclt ai evolve\` only when repeated signal is strong enough to justify a reviewable capability change.
 - Prefer project scope unless the learning clearly belongs in shared global doctrine, shared agents, shared skills, or other cross-project capability.
@@ -1586,6 +1592,137 @@ function serializeBuiltinPackManifest(manifest: BuiltinPackManifest): string {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
+const PROJECT_AI_PROTECTIVE_IGNORE = `# fclt machine-local and generated state
+/.facult/
+/config.local.toml
+`;
+
+function appendProjectAiProtectiveIgnore(existing: string): string {
+  const lines = existing.replace(/\r\n/g, "\n").split("\n");
+  const protections = PROJECT_AI_PROTECTIVE_IGNORE.trimEnd().split("\n");
+  const protectedLines = new Set(protections);
+  const out = lines.filter((line) => !protectedLines.has(line));
+  while (out.at(-1) === "") {
+    out.pop();
+  }
+  if (out.length > 0) {
+    out.push("");
+  }
+  out.push(...protections);
+  return `${out.join("\n")}\n`;
+}
+
+interface ProjectAiIgnoreSnapshot {
+  content: string;
+  identity: {
+    dev: number;
+    ino: number;
+  } | null;
+  mode: number | null;
+}
+
+function assertSafeProjectAiIgnoreEntry(
+  pathValue: string,
+  entry: Awaited<ReturnType<typeof lstat>>
+): void {
+  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) {
+    throw new Error(`Refusing unsafe project ignore file: ${pathValue}`);
+  }
+}
+
+async function assertSafeProjectAiIgnoreParent(
+  pathValue: string
+): Promise<void> {
+  const parent = dirname(pathValue);
+  const entry = await lstat(parent);
+  if (entry.isSymbolicLink() || !entry.isDirectory()) {
+    throw new Error(`Refusing unsafe project ignore directory: ${parent}`);
+  }
+  if (!pathsPhysicallyEquivalent(await realpath(parent), resolve(parent))) {
+    throw new Error(`Refusing unsafe project ignore directory: ${parent}`);
+  }
+}
+
+async function readProjectAiIgnore(
+  pathValue: string
+): Promise<ProjectAiIgnoreSnapshot> {
+  let entry: Awaited<ReturnType<typeof lstat>>;
+  try {
+    entry = await lstat(pathValue);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { content: "", identity: null, mode: null };
+    }
+    throw error;
+  }
+  assertSafeProjectAiIgnoreEntry(pathValue, entry);
+  const handle = await open(pathValue, NOFOLLOW_READ_FLAGS);
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== entry.dev ||
+      opened.ino !== entry.ino
+    ) {
+      throw new Error(`Refusing unsafe project ignore file: ${pathValue}`);
+    }
+    return {
+      content: await handle.readFile("utf8"),
+      identity: { dev: opened.dev, ino: opened.ino },
+      mode: opened.mode % 0o1000,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameProjectAiIgnoreSnapshot(
+  left: ProjectAiIgnoreSnapshot,
+  right: ProjectAiIgnoreSnapshot
+): boolean {
+  return (
+    left.content === right.content &&
+    left.identity?.dev === right.identity?.dev &&
+    left.identity?.ino === right.identity?.ino &&
+    left.mode === right.mode
+  );
+}
+
+async function writeProjectAiIgnore(
+  pathValue: string,
+  content: string,
+  expected: ProjectAiIgnoreSnapshot,
+  beforeCommit: (() => Promise<void>) | undefined,
+  safeRoot: string
+): Promise<void> {
+  await assertSafeProjectAiIgnoreParent(pathValue);
+  const current = await readProjectAiIgnore(pathValue);
+  if (!sameProjectAiIgnoreSnapshot(current, expected)) {
+    throw new Error(`Project ignore file changed before commit: ${pathValue}`);
+  }
+  await replaceVerifiedFileAt({
+    beforeExchange: beforeCommit,
+    contents: content,
+    directoryPath: dirname(pathValue),
+    expected:
+      expected.identity === null
+        ? null
+        : {
+            contents: expected.content,
+            identity: expected.identity,
+            mode: expected.mode ?? 0o644,
+          },
+    fileName: basename(pathValue),
+    maxBytes: Math.max(
+      Buffer.byteLength(content),
+      Buffer.byteLength(expected.content)
+    ),
+    mode: expected.mode ?? 0o644,
+    safeRoot,
+  });
+}
+
 const OPERATING_MODEL_SNIPPET_FRAME = `## Working mode
 
 <!-- fclty:global/baseline -->
@@ -1635,26 +1772,15 @@ async function firstExistingFileText(
 }
 
 async function seedAgentsGlobalText(args: {
-  rootDir: string;
   homeDir?: string;
   fallbackText: string;
 }): Promise<{ text: string; seededFromExisting: boolean }> {
   const home = args.homeDir ?? homedir();
-  const projectRoot = projectRootFromAiRoot(args.rootDir, home);
-  const seedText = await firstExistingFileText(
-    projectRoot
-      ? [
-          join(projectRoot, "AGENTS.md"),
-          join(projectRoot, "CLAUDE.md"),
-          join(projectRoot, ".codex", "AGENTS.md"),
-          join(projectRoot, ".claude", "CLAUDE.md"),
-        ]
-      : [
-          join(home, ".codex", "AGENTS.md"),
-          join(home, ".claude", "CLAUDE.md"),
-          join(home, ".cursor", "AGENTS.md"),
-        ]
-  );
+  const seedText = await firstExistingFileText([
+    join(home, ".codex", "AGENTS.md"),
+    join(home, ".claude", "CLAUDE.md"),
+    join(home, ".cursor", "AGENTS.md"),
+  ]);
   if (!seedText?.trim()) {
     return { text: args.fallbackText, seededFromExisting: false };
   }
@@ -1671,6 +1797,10 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
   force?: boolean;
   update?: boolean;
   installedAs?: string;
+  /** @internal Platform branch override for cross-platform regression tests. */
+  platform?: NodeJS.Platform;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  beforeProjectIgnoreCommit?: () => Promise<void>;
 }): Promise<InstallResult> {
   const rootDir = resolve(args.rootDir);
   const packRoot = facultBuiltinPackRoot("facult-operating-model");
@@ -1681,6 +1811,33 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
   const manifestFiles: BuiltinPackManifest["files"] = {
     ...(existingManifest?.files ?? {}),
   };
+  const projectRoot = projectRootFromAiRoot(rootDir, args.homeDir);
+
+  if (projectRoot) {
+    const ignorePath = join(rootDir, ".gitignore");
+    const existingIgnore = await readProjectAiIgnore(ignorePath);
+    const protectiveIgnore = appendProjectAiProtectiveIgnore(
+      existingIgnore.content
+    );
+    if (protectiveIgnore !== existingIgnore.content) {
+      changedPaths.push(ignorePath);
+      if (!args.dryRun) {
+        if ((args.platform ?? process.platform) === "win32") {
+          throw new Error(
+            "Project operating-model installation is unsupported on win32 because protective ignore replacement is unavailable"
+          );
+        }
+        await ensurePackDirectory(dirname(ignorePath));
+        await writeProjectAiIgnore(
+          ignorePath,
+          protectiveIgnore,
+          existingIgnore,
+          args.beforeProjectIgnoreCommit,
+          projectRoot
+        );
+      }
+    }
+  }
 
   for (const sourcePath of files) {
     const relPath = relative(packRoot, sourcePath);
@@ -1692,9 +1849,10 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
     const rawSourceText = await Bun.file(sourcePath).text();
     const targetExists = await pathExists(targetPath);
     const seed =
-      targetRelPath === "AGENTS.global.md" && !targetExists
+      targetRelPath === "AGENTS.global.md" &&
+      !targetExists &&
+      projectRoot === null
         ? await seedAgentsGlobalText({
-            rootDir,
             homeDir: args.homeDir,
             fallbackText: rawSourceText,
           })
@@ -1810,33 +1968,6 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
     changedPaths: uniqueSorted(changedPaths),
     skippedPaths: uniqueSorted(skippedPaths),
   };
-}
-
-export async function scaffoldBuiltinProjectAiPack(args: {
-  cwd?: string;
-  rootDir?: string;
-  homeDir?: string;
-  dryRun?: boolean;
-  force?: boolean;
-  update?: boolean;
-}): Promise<InstallResult> {
-  const cwd = resolve(args.cwd ?? process.cwd());
-  const rootDir = args.rootDir
-    ? resolveCliContextRoot({
-        rootArg: args.rootDir,
-        scope: "project",
-        cwd,
-        homeDir: args.homeDir,
-      })
-    : join(cwd, ".ai");
-  return await scaffoldBuiltinOperatingModelPack({
-    rootDir,
-    homeDir: args.homeDir,
-    dryRun: args.dryRun,
-    force: args.force,
-    update: args.update,
-    installedAs: "project-ai",
-  });
 }
 
 function compareVersions(a: string, b: string): number {
@@ -3303,7 +3434,7 @@ function printTemplatesHelp() {
               "fclt templates init operating-model [--global|--project|--root PATH] [--update] [--force] [--dry-run]"
             ),
             renderCode(
-              "fclt templates init project-ai [--project-root PATH|--root PATH] [--update] [--force] [--dry-run]"
+              "fclt templates init project-ai [--project-root PATH|--root PATH] [--guidance PATH] [--apply --plan-sha SHA]"
             ),
             renderCode(
               "fclt templates init automation <template-id> [--scope global|project|wide] [--name <name>] [--project-root <path>] [--cwds <path1,path2>] [--rrule <RRULE>] [--status PAUSED|ACTIVE] [--yes] [--dry-run]"
@@ -3314,6 +3445,7 @@ function printTemplatesHelp() {
           title: "Notes",
           lines: renderBullets([
             `Templates are powered by the builtin ${renderCode(BUILTIN_INDEX_NAME)} index.`,
+            `${renderCode("templates init project-ai")} is a preview-first alias for minimal ${renderCode("project init")}; use ${renderCode("operating-model --project")} only for an explicit full-pack install.`,
             "Automation templates scaffold Codex automation files under ~/.codex/automations/.",
             `${renderCode("--yes")} and ${renderCode("--non-interactive")} skip scope prompts and use inferred defaults when possible.`,
             "Use project scope for one repo root, wide/global scope for many explicit roots.",
@@ -3365,14 +3497,38 @@ function parseLongFlag(argv: string[], flag: string): string | null {
   return null;
 }
 
+function parseLongFlags(argv: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg) {
+      continue;
+    }
+    if (arg === flag) {
+      const value = argv[i + 1];
+      if (value) {
+        values.push(value);
+      }
+      i += 1;
+    } else if (arg.startsWith(`${flag}=`)) {
+      values.push(arg.slice(flag.length + 1));
+    }
+  }
+  return values;
+}
+
 const TEMPLATE_INIT_VALUE_FLAGS = new Set([
   "--automation-status",
+  "--cadence",
   "--cwds",
+  "--guidance",
   "--name",
+  "--plan-sha",
   "--project-root",
   "--root",
   "--rrule",
   "--scope",
+  "--source",
   "--status",
 ]);
 
@@ -3857,44 +4013,48 @@ export async function templatesCommand(
 
   if (kind === "project-ai") {
     try {
-      const result = await scaffoldBuiltinProjectAiPack({
-        cwd: ctx.cwd,
-        rootDir:
-          parsedArgs.rootArg ??
-          (parsedArgs.projectRootArg
-            ? projectAiRootFromProjectArg(
-                parsedArgs.projectRootArg,
-                ctx.homeDir
-              )
-            : ctx.rootDir),
-        homeDir: ctx.homeDir,
-        dryRun,
-        force,
-        update,
-      });
-      if (json) {
-        console.log(JSON.stringify(result, null, 2));
-        return;
+      if (force || update) {
+        throw new Error(
+          "project-ai is now a minimal preview-first enrollment alias; use operating-model --project for an explicit full-pack install"
+        );
       }
-      const action = dryRun ? "Would scaffold" : "Scaffolded";
-      console.log(
-        renderPage({
-          title: `fclt templates init ${kind}`,
-          subtitle: `${action} ${result.installedAs}`,
-          sections: [
-            {
-              title: "Changed Paths",
-              lines: renderBullets(result.changedPaths),
-            },
-            ...(result.skippedPaths?.length
-              ? [
-                  {
-                    title: "Skipped Local Edits",
-                    lines: renderBullets(result.skippedPaths),
-                  },
-                ]
-              : []),
-          ],
+      if (args.includes("--schedule")) {
+        throw new Error(
+          "Minimal project enrollment does not install scheduling; enroll first, then enable a reviewed project loop separately"
+        );
+      }
+      const selectedRoot = parsedArgs.projectRootArg
+        ? resolve(
+            expandHomePath(parsedArgs.projectRootArg, ctx.homeDir ?? homedir())
+          )
+        : parsedArgs.rootArg
+          ? dirname(
+              projectAiRootFromProjectArg(parsedArgs.rootArg, ctx.homeDir)
+            )
+          : ctx.rootDir
+            ? dirname(resolve(ctx.rootDir))
+            : resolve(ctx.cwd ?? process.cwd());
+      const forwarded = ["init", "--project-root", selectedRoot];
+      for (const flag of ["--guidance", "--source"]) {
+        for (const value of parseLongFlags(args, flag)) {
+          forwarded.push(flag, value);
+        }
+      }
+      for (const flag of ["--cadence", "--plan-sha"]) {
+        const value = parseLongFlag(args, flag);
+        if (value) {
+          forwarded.push(flag, value);
+        }
+      }
+      for (const flag of ["--apply", "--dry-run", "--json"]) {
+        if (args.includes(flag)) {
+          forwarded.push(flag);
+        }
+      }
+      await import("./projects").then(({ projectCommand }) =>
+        projectCommand(forwarded, {
+          cwd: ctx.cwd,
+          homeDir: ctx.homeDir,
         })
       );
       return;
