@@ -95,6 +95,10 @@ const PROTECTIVE_IGNORE_LINES = [
 ];
 const SECRET_SHAPE_RE =
   /(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[^\s"'#]{8,}/i;
+const STANDALONE_CREDENTIAL_RE =
+  /\b(?:gh[pour]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255}|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[0-9A-Za-z_-]{35}|(?:sk|rk)_live_[0-9A-Za-z]{16,}|xox[baprs]-[0-9A-Za-z-]{10,})\b/;
+const GITHUB_STATELESS_TOKEN_RE =
+  /(?:^|[^A-Za-z0-9_])ghs_[A-Za-z0-9._-]{36,}(?=$|[^A-Za-z0-9._-])/m;
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 const LOCAL_UNIX_ABSOLUTE_PATH_RE =
   /(?:^|[\s"'`([{=>:])\/(?!\/)(?=[^\s"'`)\]}>])/m;
@@ -836,12 +840,29 @@ function filePreconditionFromSnapshot(
 }
 
 async function gitRoot(pathValue: string): Promise<string> {
+  const resolvedPath = resolve(pathValue);
   const result = await runGit({
-    cwd: resolve(pathValue),
+    cwd: resolvedPath,
     argv: ["rev-parse", "--show-toplevel"],
   });
   if (result.exitCode !== 0 || !result.stdout) {
-    throw new Error(`Not a Git repository: ${resolve(pathValue)}`);
+    try {
+      await lstat(join(resolvedPath, ".git"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`Not a Git repository: ${resolvedPath}`);
+      }
+      throw new Error(
+        `Git repository inspection failed for ${resolvedPath}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+    throw new Error(
+      `Git repository inspection failed for ${resolvedPath}: ${
+        result.stderr || "git rev-parse returned no repository root"
+      }`
+    );
   }
   return await realpath(result.stdout).catch(() => resolve(result.stdout));
 }
@@ -897,7 +918,10 @@ export async function resolveRepositoryExecutionIdentity(
 async function inspectRepository(
   rootValue: string,
   homeDir?: string,
-  options?: { stabilizeIdentity?: boolean }
+  options?: {
+    stabilizeIdentity?: boolean;
+    stabilizationContext?: RepositoryStabilizationContext;
+  }
 ): Promise<DiscoveredProject> {
   const root = await gitRoot(rootValue);
   const [rawIdentity, branch, head, lastCommit, statusResult] =
@@ -918,6 +942,7 @@ async function inspectRepository(
           identity: rawIdentity,
           projectRoot: root,
           homeDir: resolve(homeDir ?? process.env.HOME ?? homedir()),
+          context: options?.stabilizationContext,
         });
   const aiRoot = join(root, ".ai");
   return {
@@ -1024,10 +1049,17 @@ export async function discoverProjects(args: {
   }
   const cutoff = parseSince(args.since, args.now ?? new Date());
   const discovered = await discoverGitRoots({ roots, maxVisits, maxResults });
+  const homeDir = resolve(args.homeDir ?? process.env.HOME ?? homedir());
+  const stabilizationContext: RepositoryStabilizationContext = {
+    registry: await loadRegistry(homeDir),
+    portableAliasProofs: new Map(),
+  };
   const inspected = await Promise.all(
     discovered.roots.map(async (root) => {
       try {
-        return await inspectRepository(root, args.homeDir);
+        return await inspectRepository(root, homeDir, {
+          stabilizationContext,
+        });
       } catch (error) {
         if (
           error instanceof Error &&
@@ -1453,7 +1485,12 @@ function privacyFindings(
   options?: { gitIgnorePatterns?: boolean }
 ): string[] {
   const findings: string[] = [];
-  if (SECRET_SHAPE_RE.test(content) || PRIVATE_KEY_RE.test(content)) {
+  if (
+    SECRET_SHAPE_RE.test(content) ||
+    STANDALONE_CREDENTIAL_RE.test(content) ||
+    GITHUB_STATELESS_TOKEN_RE.test(content) ||
+    PRIVATE_KEY_RE.test(content)
+  ) {
     findings.push("secret-shaped content");
   }
   const filteredContent = options?.gitIgnorePatterns
@@ -2878,15 +2915,57 @@ async function verifiedPortableAliases(args: {
   return verified;
 }
 
+interface RepositoryStabilizationContext {
+  registry: ProjectRegistry;
+  portableAliasProofs: Map<string, Promise<Set<string>>>;
+}
+
+function requiresPortableAliasProof(args: {
+  entry: ProjectRegistryEntry;
+  identity: RepositoryIdentity;
+  key: string;
+}): boolean {
+  return (
+    args.identity.stability === "portable" &&
+    args.key !== args.identity.id &&
+    args.entry.repositoryId !== args.identity.id &&
+    (args.entry.aliases ?? []).includes(args.identity.id)
+  );
+}
+
+function cachedPortableAliases(
+  context: RepositoryStabilizationContext,
+  key: string,
+  entry: ProjectRegistryEntry
+): Promise<Set<string>> {
+  const cached = context.portableAliasProofs.get(key);
+  if (cached) {
+    return cached;
+  }
+  const proof = verifiedPortableAliases({ entry, key });
+  context.portableAliasProofs.set(key, proof);
+  return proof;
+}
+
 async function stabilizeRepositoryIdentity(args: {
   homeDir: string;
   identity: RepositoryIdentity;
   projectRoot: string;
+  context?: RepositoryStabilizationContext;
 }): Promise<RepositoryIdentity> {
-  const registry = await loadRegistry(args.homeDir);
+  const context = args.context ?? {
+    registry: await loadRegistry(args.homeDir),
+    portableAliasProofs: new Map<string, Promise<Set<string>>>(),
+  };
   const matches: [string, ProjectRegistryEntry][] = [];
-  for (const [key, entry] of Object.entries(registry.projects)) {
-    const portableAliases = await verifiedPortableAliases({ entry, key });
+  for (const [key, entry] of Object.entries(context.registry.projects)) {
+    const portableAliases = requiresPortableAliasProof({
+      entry,
+      identity: args.identity,
+      key,
+    })
+      ? await cachedPortableAliases(context, key, entry)
+      : undefined;
     if (
       registryEntryMatchesIdentity({
         verifiedPortableAliases: portableAliases,
@@ -3141,6 +3220,22 @@ interface ProjectMutationLockObservation {
   owner: ProjectMutationLockOwner | null;
 }
 
+function projectMutationLockObservationRaced(
+  error: unknown,
+  lockPath: string
+): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const ownerPath = projectMutationLockOwnerPath(lockPath);
+  return (
+    error.message ===
+      `Project enrollment mutation lock changed while reading its owner: ${lockPath}` ||
+    (error.message.startsWith("Canonical project file changed ") &&
+      error.message.endsWith(`: ${ownerPath}`))
+  );
+}
+
 async function observeProjectMutationLock(
   lockPath: string
 ): Promise<ProjectMutationLockObservation | null> {
@@ -3307,7 +3402,19 @@ async function withProjectsMutationLock<T>(
           throw error;
         }
       }
-      const observed = await observeProjectMutationLock(lockPath);
+      let observed: ProjectMutationLockObservation | null;
+      try {
+        observed = await observeProjectMutationLock(lockPath);
+      } catch (error) {
+        if (projectMutationLockObservationRaced(error, lockPath)) {
+          // The winner may be publishing or releasing its lock. Waiting is
+          // safe; reclaiming or treating a transient observation as fatal is
+          // not.
+          await Bun.sleep(PROJECT_MUTATION_LOCK_RETRY_MS);
+          continue;
+        }
+        throw error;
+      }
       if (!observed) {
         continue;
       }

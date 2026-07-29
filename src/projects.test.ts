@@ -177,7 +177,7 @@ describe("project discovery", () => {
     expect(await Bun.file(join(repo, ".ai")).exists()).toBe(false);
   });
 
-  it("skips an abandoned Git candidate without losing healthy discovery results", async () => {
+  it("propagates corrupt Git candidates instead of reporting complete discovery", async () => {
     const { root, home } = await makeFixture();
     const portfolio = join(root, "portfolio");
     const healthy = join(portfolio, "healthy");
@@ -190,18 +190,14 @@ describe("project discovery", () => {
       "utf8"
     );
 
-    const discovery = await discoverProjects({
-      roots: [portfolio],
-      homeDir: home,
-      maxVisits: 100,
-      maxResults: 10,
-    });
-
-    expect(discovery.projects.map((project) => project.root)).toEqual([
-      healthy,
-    ]);
-    expect(discovery.groups).toHaveLength(1);
-    expect(discovery.bounds.truncated).toBe(false);
+    await expect(
+      discoverProjects({
+        roots: [portfolio],
+        homeDir: home,
+        maxVisits: 100,
+        maxResults: 10,
+      })
+    ).rejects.toThrow("Git repository inspection failed");
   });
 
   it("rejects missing explicit roots instead of reporting complete empty discovery", async () => {
@@ -1675,6 +1671,15 @@ Read \\server\share\private.toml.
         "docs/windows-forward-unc.md":
           "# Local\n\nRead //server/share/private.toml.\n",
         "docs/secret.md": "# Secret\n\napi_key = abcdefghijklmnop\n",
+        "docs/github-token.md":
+          "# Secret\n\nghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n",
+        "docs/github-fine-grained-token.md":
+          "# Secret\n\ngithub_pat_11AA00_exampleExampleExampleExample\n",
+        "docs/github-stateless-token.md": `# Secret
+
+ghs_APP_ID.${"a".repeat(240)}.${"b".repeat(240)}
+`,
+        "docs/aws-token.md": "# Secret\n\nAKIAIOSFODNN7EXAMPLE\n",
       },
     });
     await mkdir(join(repo, ".ai"), { recursive: true });
@@ -1730,6 +1735,20 @@ Read \\server\share\private.toml.
         guidance: ["docs/secret.md"],
       })
     ).rejects.toThrow("secret-shaped content");
+    for (const guidance of [
+      "docs/github-token.md",
+      "docs/github-fine-grained-token.md",
+      "docs/github-stateless-token.md",
+      "docs/aws-token.md",
+    ]) {
+      await expect(
+        planProjectEnrollment({
+          projectRoot: repo,
+          homeDir: home,
+          guidance: [guidance],
+        })
+      ).rejects.toThrow("secret-shaped content");
+    }
   });
 
   it("preserves existing ignore rules and versioned canonical config", async () => {
@@ -4527,7 +4546,7 @@ describe("project enrollment lifecycle", () => {
     await writeFile(gitDir, "gitdir: /definitely/missing/git-dir\n", "utf8");
     try {
       await expect(buildProjectsStatus({ homeDir: home })).rejects.toThrow(
-        "Not a Git repository"
+        "Git repository inspection failed"
       );
       const reEnrollment = await planProjectEnrollment({
         projectRoot: secondClone,
@@ -4540,7 +4559,7 @@ describe("project enrollment lifecycle", () => {
           expectedPlanSha256: reEnrollment.planSha256,
           homeDir: home,
         })
-      ).rejects.toThrow("Not a Git repository");
+      ).rejects.toThrow("Git repository inspection failed");
       expect(await readFile(first.registryPath, "utf8")).toBe(registryBefore);
     } finally {
       await rm(gitDir);
