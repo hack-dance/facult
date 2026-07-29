@@ -139,7 +139,7 @@ function migrateLinkedWorkStatuses(args: {
       }
       const observation: LinkedWorkStatusObservation = {
         issueRef,
-        observedAt: entry.lastSeenAt,
+        observedAt: proof.observedAt ?? "1970-01-01T00:00:00.000Z",
         terminal: true,
         sourceId: proof.sourceId,
         sourceType: proof.sourceType,
@@ -265,6 +265,7 @@ async function lockOwnerIsLive(path: string): Promise<boolean> {
 
 async function acquireRecoveryClaim(args: {
   lockPath: string;
+  onStaleClaimInspected?: () => void | Promise<void>;
   ownerToken: string;
   takeoverPath: string;
 }): Promise<FileHandle> {
@@ -290,6 +291,7 @@ async function acquireRecoveryClaim(args: {
       `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
     );
   }
+  await args.onStaleClaimInspected?.();
   try {
     await rename(
       args.takeoverPath,
@@ -315,7 +317,8 @@ async function acquireRecoveryClaim(args: {
 async function withStateLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
-  onLockAcquired?: () => void | Promise<void>
+  onLockAcquired?: () => void | Promise<void>,
+  onStaleClaimInspected?: () => void | Promise<void>
 ): Promise<T> {
   await mkdir(dirname(lockPath), { recursive: true });
   const ownerToken = randomUUID();
@@ -332,6 +335,7 @@ async function withStateLock<T>(
     const takeoverPath = `${lockPath}.takeover`;
     const takeover = await acquireRecoveryClaim({
       lockPath,
+      onStaleClaimInspected,
       ownerToken,
       takeoverPath,
     });
@@ -354,6 +358,14 @@ async function withStateLock<T>(
       }
       if (await lockOwnerIsLive(lockPath)) {
         throw new Error(`A live reconciliation owner still holds ${lockPath}`);
+      }
+      const takeoverOwner = JSON.parse(
+        await readFile(takeoverPath, "utf8")
+      ) as { token?: unknown };
+      if (takeoverOwner.token !== ownerToken) {
+        throw new Error(
+          `Reconciliation recovery ownership changed for ${takeoverPath}`
+        );
       }
       await rename(lockPath, `${lockPath}.stale-${Date.now()}-${ownerToken}`);
       handle = await open(lockPath, "wx");
@@ -400,6 +412,9 @@ async function withStateLock<T>(
   );
   heartbeat.unref();
   try {
+    if (!(await stillOwnsPath())) {
+      throw new Error(`Reconciliation lock ownership changed for ${lockPath}`);
+    }
     await onLockAcquired?.();
     return await fn();
   } finally {
@@ -1108,6 +1123,7 @@ function resolutionProofs(records: SourceRecord[]): ResolutionProof[] {
       sourceId: record.sourceId,
       sourceType: record.sourceType,
       sourceRecordId: record.recordId,
+      observedAt: record.observedAt,
       kind:
         record.sourceType === "git" &&
         record.provenance.onDefaultBranch === true
@@ -1482,6 +1498,8 @@ export async function reconcileSources(args: {
   persist?: boolean;
   /** @internal Adversarial test hook; production callers must not set this. */
   onLockAcquired?: () => void | Promise<void>;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  onStaleClaimInspected?: () => void | Promise<void>;
 }): Promise<ReconciliationReview> {
   const { config } = await loadReconciliationConfig(args);
   const enabledSources = config.sources.filter(
@@ -1764,7 +1782,8 @@ export async function reconcileSources(args: {
     : await withStateLock(
         facultAiReconciliationLockPath(args.homeDir, args.rootDir),
         execute,
-        args.onLockAcquired
+        args.onLockAcquired,
+        args.onStaleClaimInspected
       );
 }
 

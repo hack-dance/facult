@@ -1627,6 +1627,22 @@ describe("source reconciliation", () => {
     expect(migratedState.linkedWorkStatuses?.["HACK-1202"]).toMatchObject({
       sourceType: "evidence-export",
     });
+
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "reopened",
+            kind: "status-change",
+            observedAt: "2026-07-07T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
   });
 
   it("resolves linked-work families from bounded terminal status readback", async () => {
@@ -2356,6 +2372,65 @@ describe("source reconciliation", () => {
         name.startsWith(`${basename(takeoverPath)}.stale-`)
       )
     ).toBe(true);
+  });
+
+  it("serializes concurrent recovery of the same abandoned takeover claim", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    let inspected = 0;
+    let releaseInspections: (() => void) | undefined;
+    const bothInspected = new Promise<void>((resolve) => {
+      releaseInspections = resolve;
+    });
+    const onStaleClaimInspected = async (): Promise<void> => {
+      inspected += 1;
+      if (inspected === 2) {
+        releaseInspections?.();
+      }
+      await bothInspected;
+    };
+    const attempt = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+        onStaleClaimInspected,
+      });
+    const results = await Promise.allSettled([attempt(), attempt()]);
+
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected")
+    ).toHaveLength(1);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
   });
 
   it("reports unavailable cursor freshness without changing coverage semantics", async () => {

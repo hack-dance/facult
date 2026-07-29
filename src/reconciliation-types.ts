@@ -166,6 +166,7 @@ export interface ResolutionProof {
   sourceId: string;
   sourceType: ReconciliationSourceType;
   sourceRecordId: string;
+  observedAt?: string;
   kind: "linked_work_terminal" | "default_branch_containment";
   issueRefs: string[];
   evidenceKey: string;

@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   realpath,
@@ -2945,6 +2946,67 @@ describe("project enrollment lifecycle", () => {
     expect(await Bun.file(aiRoot).exists()).toBe(false);
     expect(
       await Bun.file(plan.machineLocalWrites[0]?.path ?? "").exists()
+    ).toBe(false);
+  });
+
+  it("holds legacy runtime writer locks through the final state rename", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const legacyLock = join(
+      legacyState,
+      "ai/project/reconciliation/state.json.lock"
+    );
+    await mkdir(dirname(legacyLock), { recursive: true });
+    await writeFile(
+      join(legacyState, "ai/project/reconciliation/state.json"),
+      "{}\n",
+      "utf8"
+    );
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    let competingWriterBlocked = false;
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      beforeLegacyStateRename: async ({ source }) => {
+        if (source !== legacyState) {
+          return;
+        }
+        try {
+          const competitor = await open(legacyLock, "wx");
+          await competitor.close();
+        } catch (error) {
+          competingWriterBlocked =
+            error instanceof Error &&
+            "code" in error &&
+            (error as NodeJS.ErrnoException).code === "EEXIST";
+        }
+      },
+    });
+
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    expect(competingWriterBlocked).toBe(true);
+    expect(await Bun.file(legacyState).exists()).toBe(false);
+    expect(
+      await Bun.file(
+        join(selectedState, "ai/project/reconciliation/state.json")
+      ).exists()
+    ).toBe(true);
+    expect(
+      await Bun.file(
+        join(selectedState, "ai/project/reconciliation/state.json.lock")
+      ).exists()
     ).toBe(false);
   });
 
