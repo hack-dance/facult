@@ -141,7 +141,7 @@ describe("resolveCliContextRoot", () => {
     ).toThrow("No project-local .ai root found:");
     expect(() =>
       resolveCliContextRoot({ homeDir, cwd, scope: "project" })
-    ).toThrow('Run "fclt templates init project-ai" in the repo first');
+    ).toThrow('Run "fclt project init" to preview minimal enrollment');
   });
 
   it("does not treat the global home .ai root as project state", async () => {

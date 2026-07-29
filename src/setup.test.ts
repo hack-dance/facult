@@ -276,7 +276,7 @@ describe("zero-config setup", () => {
     expect(await Bun.file(configPath).text()).toBe("{invalid\n");
   });
 
-  it("bootstraps an isolated CLI-only home and project idempotently", async () => {
+  it("keeps setup global and returns a no-write project plan only when requested", async () => {
     const home = await tempHome("fclt-setup-cli-");
     const repo = await initRepo(home);
 
@@ -289,74 +289,84 @@ describe("zero-config setup", () => {
     expect(first.stderr).toBe("");
     const result = JSON.parse(first.stdout) as {
       health: string;
-      projectRoot: string;
+      projectRoot: string | null;
+      projectEnrollmentPlan: null;
       readiness: {
         global: {
           loop: { state: string; capabilities: Record<string, boolean> };
         };
-        project: {
-          loop: { state: string; capabilities: Record<string, boolean> };
-        };
+        project: null;
       };
     };
     expect(result.health).toBe("ready");
-    expect(result.projectRoot).toBe(join(repo, ".ai"));
+    expect(result.projectRoot).toBeNull();
+    expect(result.projectEnrollmentPlan).toBeNull();
     expect(result.readiness.global.loop.state).toBe("ready");
-    expect(result.readiness.project.loop.state).toBe("ready");
+    expect(result.readiness.project).toBeNull();
     expect(result.readiness.global.loop.capabilities.writebackSkill).toBe(true);
     expect(result.readiness.global.loop.capabilities.evolutionSkill).toBe(true);
     expect(
       result.readiness.global.loop.capabilities.reconciliation
     ).toMatchObject({ configured: true, sourceCount: 1 });
     expect(
-      result.readiness.project.loop.capabilities.reconciliation
-    ).toMatchObject({ configured: true, sourceCount: 2 });
-    expect(
       JSON.parse(
         await Bun.file(join(home, ".ai", "reconciliation.json")).text()
       ).sources
     ).toHaveLength(1);
-    expect(
-      JSON.parse(
-        await Bun.file(join(repo, ".ai", "reconciliation.json")).text()
-      ).sources
-    ).toHaveLength(2);
+    expect(await Bun.file(join(repo, ".ai")).exists()).toBe(false);
 
-    const add = await runCli({
+    const preview = await runCli({
+      home,
+      cwd: repo,
+      argv: ["setup", "--include-project", "--json", "--no-codex-plugin"],
+    });
+    expect(preview.code).toBe(0);
+    const planned = JSON.parse(preview.stdout) as {
+      projectRoot: string;
+      projectEnrollmentPlan: {
+        projectRoot: string;
+        planSha256: string;
+        protections: { automaticGuidanceCopy: boolean };
+      };
+      repairActions: Array<{ command: string }>;
+    };
+    expect(planned.projectRoot).toBe(join(repo, ".ai"));
+    expect(planned.projectEnrollmentPlan.projectRoot).toBe(repo);
+    expect(
+      planned.projectEnrollmentPlan.protections.automaticGuidanceCopy
+    ).toBe(false);
+    expect(planned.repairActions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: expect.stringContaining(
+            `--plan-sha ${planned.projectEnrollmentPlan.planSha256}`
+          ),
+        }),
+      ])
+    );
+    expect(await Bun.file(join(repo, ".ai")).exists()).toBe(false);
+
+    const apply = await runCli({
       home,
       cwd: repo,
       argv: [
-        "ai",
-        "writeback",
-        "add",
-        "--kind",
-        "reusable_pattern",
-        "--summary",
-        "Preserve this history across setup reruns.",
-        "--asset",
-        "skill:capability-evolution",
-        "--evidence",
-        "test:idempotent-setup",
-        "--project",
+        "project",
+        "init",
+        "--project-root",
+        repo,
+        "--apply",
+        "--plan-sha",
+        planned.projectEnrollmentPlan.planSha256,
+        "--json",
       ],
     });
-    expect(add.code).toBe(0);
-
-    const second = await runCli({
-      home,
-      cwd: repo,
-      argv: ["setup", "--json", "--no-codex-plugin"],
-    });
-    expect(second.code).toBe(0);
-    expect((JSON.parse(second.stdout) as { health: string }).health).toBe(
-      "ready"
+    expect(apply.code).toBe(0);
+    expect(await Bun.file(join(repo, ".ai", "config.toml")).exists()).toBe(
+      true
     );
-    const list = await runCli({
-      home,
-      cwd: repo,
-      argv: ["ai", "writeback", "list", "--project", "--json"],
-    });
-    expect(list.stdout).toContain("Preserve this history");
+    expect(await Bun.file(join(repo, ".ai", "AGENTS.global.md")).exists()).toBe(
+      false
+    );
   }, 20_000);
 
   it("does not bootstrap a nested project inside a git-backed global root", async () => {
@@ -380,7 +390,7 @@ describe("zero-config setup", () => {
     expect(result.readiness.project).toBeNull();
   }, 20_000);
 
-  it("records and assesses project writeback using only the documented bootstrap", async () => {
+  it("records and assesses project writeback after explicit enrollment", async () => {
     const home = await tempHome("fclt-setup-loop-");
     const repo = await initRepo(home);
     expect(
@@ -389,6 +399,32 @@ describe("zero-config setup", () => {
           home,
           cwd: repo,
           argv: ["setup", "--json", "--no-codex-plugin"],
+        })
+      ).code
+    ).toBe(0);
+    const preview = await runCli({
+      home,
+      cwd: repo,
+      argv: ["project", "init", "--project-root", repo, "--json"],
+    });
+    expect(preview.code).toBe(0);
+    const planSha256 = (JSON.parse(preview.stdout) as { planSha256: string })
+      .planSha256;
+    expect(
+      (
+        await runCli({
+          home,
+          cwd: repo,
+          argv: [
+            "project",
+            "init",
+            "--project-root",
+            repo,
+            "--apply",
+            "--plan-sha",
+            planSha256,
+            "--json",
+          ],
         })
       ).code
     ).toBe(0);

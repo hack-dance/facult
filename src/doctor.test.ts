@@ -1681,6 +1681,34 @@ test("project doctor accepts loop skills inherited from the global root", async 
     expect(setupErr).toBe("");
     expect(setupCode).toBe(0);
     expect(setupOut).not.toBe("");
+    const projectSetup = Bun.spawn(
+      [
+        "bun",
+        "run",
+        cliEntry,
+        "templates",
+        "init",
+        "operating-model",
+        "--project",
+      ],
+      {
+        cwd: repo,
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    expect(await projectSetup.exited).toBe(0);
+    const projectReviewSetup = Bun.spawn(
+      ["bun", "run", cliEntry, "ai", "review", "init", "--project"],
+      {
+        cwd: repo,
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    expect(await projectReviewSetup.exited).toBe(0);
 
     await Promise.all([
       rm(join(repo, ".ai", "skills", "fclt-writeback"), {
@@ -1719,7 +1747,7 @@ test("project doctor accepts loop skills inherited from the global root", async 
       };
     };
     expect(report.health.ok).toBe(true);
-    expect(report.loop.state).toBe("ready");
+    expect(report.loop.state).toBe("degraded");
     expect(report.loop.blockers).not.toContain("writeback_skill_missing");
     expect(report.loop.blockers).not.toContain("evolution_skill_missing");
     expect(report.loop.capabilities.writebackSkill).toBe(true);
@@ -1747,6 +1775,19 @@ test("doctor blocks loop readiness when reconciliation has no enabled sources", 
       { cwd: repo, env, stdout: "pipe", stderr: "pipe" }
     );
     expect(await setup.exited).toBe(0);
+    const projectSetup = Bun.spawn(
+      [
+        "bun",
+        "run",
+        cliEntry,
+        "templates",
+        "init",
+        "operating-model",
+        "--project",
+      ],
+      { cwd: repo, env, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(await projectSetup.exited).toBe(0);
     await Bun.write(
       join(repo, ".ai", "reconciliation.json"),
       JSON.stringify({ version: 1, sources: [] })
@@ -2183,7 +2224,7 @@ test("doctor --repair does not replace project AGENTS.global.md with global defa
     expect(err).toBe("");
     expect(out).toContain("project AGENTS.global.md");
     expect(out).toContain(
-      `fclt templates init project-ai --project-root '${repoDir}' --force`
+      `fclt templates init operating-model --root '${aiRoot}' --force`
     );
     expect(out).not.toContain("Repaired canonical AGENTS.global.md");
     expect(await readFile(agentsPath, "utf8")).toBe(projectGuidance);
@@ -2306,7 +2347,7 @@ test("doctor --json flags generated-only project ai roots without exiting nonzer
     expect(report.actions).toContainEqual(
       expect.objectContaining({
         id: "init-project-ai",
-        command: `fclt templates init project-ai --project-root '${projectRoot}'`,
+        command: `fclt project init --project-root '${projectRoot}'`,
       })
     );
   } finally {

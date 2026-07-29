@@ -458,7 +458,7 @@ Use this memory for pattern continuity:
 - For wide reviews, partition evidence by cwd first; do not let one repo's evidence stand in for another.
 - Grounding: prefer evidence from session messages, tool calls, shell commands, diffs, tests, commits, and touched files.
 - Threshold: only encode signal when you can name what was learned, why it matters, and the most plausible destination.
-- Scope: default to project writeback only when the repo has a project-local \`.ai\` root for capability context. If a local writable repo is missing one, bootstrap baseline project AI state with \`fclt templates init project-ai\` before retrying project-scoped writeback. Writeback/evolution review artifacts still belong under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\`, not inside the repo-local \`.ai\`. If bootstrap fails or the repo is not writable, treat that as the blocker instead of silently falling back to global runtime state.
+- Scope: default to project writeback only when the repo has a project-local \`.ai\` root for capability context. If a local writable repo is missing one, preview baseline project AI state with \`fclt project init --json\`, review the exact plan, and apply it with the returned plan hash only when authorized. Writeback/evolution review artifacts still belong under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\`, not inside the repo-local \`.ai\`. If enrollment is not authorized, fails, or the repo is not writable, treat that as the blocker instead of silently falling back to global runtime state.
 - Promote to global only when the same signal appears across multiple repos or clearly targets shared doctrine, shared agents, or shared skills.
 - Verification: distinguish one-off friction from a repeated pattern before escalating it.
 - If available, use [$feedback-loop-setup]({{feedbackLoopSkill}}) when the review needs stronger feedback loops or verification framing.
@@ -484,7 +484,7 @@ Grounding rules:
 
 Decision rules:
 - Use \`fclt ai writeback add\` when the signal, target asset, and scope are clear.
-- Before attempting project-scoped writeback, verify the cwd has a repo-local \`.ai\` root for capability context. If it does not and the cwd is a local writable repo, run \`fclt templates init project-ai\` from that repo root, then continue. Do not write writeback/evolution review artifacts into the repo-local \`.ai\`; fclt mirrors them under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\` with cwd/project metadata. If bootstrap fails or the repo is not writable, report the writeback as blocked by missing project AI state rather than falling back to merged/global runtime state.
+- Before attempting project-scoped writeback, verify the cwd has a repo-local \`.ai\` root for capability context. If it does not and the cwd is a local writable repo, run \`fclt project init --json\`, review its exact writes, and apply the unchanged plan with \`--apply --plan-sha <sha>\` only when authorized. Do not write writeback/evolution review artifacts into the repo-local \`.ai\`; fclt mirrors them under global \`~/.ai/writebacks/projects/...\` and \`~/.ai/evolution/projects/...\` with cwd/project metadata. If enrollment is not authorized, fails, or the repo is not writable, report the writeback as blocked by missing project AI state rather than falling back to merged/global runtime state.
 - Before passing \`--asset\`, verify the target resolves in the Facult graph. If the destination is a raw file path or otherwise not graph-backed, report that as a missing-asset blocker instead of retrying blind.
 - Use \`fclt ai evolve\` only when repeated signal is strong enough to justify a reviewable capability change.
 - Prefer project scope unless the learning clearly belongs in shared global doctrine, shared agents, shared skills, or other cross-project capability.
@@ -1586,6 +1586,27 @@ function serializeBuiltinPackManifest(manifest: BuiltinPackManifest): string {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
+const PROJECT_AI_PROTECTIVE_IGNORE = `# fclt machine-local and generated state
+/.facult/
+/config.local.toml
+`;
+
+function appendProjectAiProtectiveIgnore(existing: string): string {
+  const lines = existing.replace(/\r\n/g, "\n").split("\n");
+  while (lines.at(-1) === "") {
+    lines.pop();
+  }
+  for (const line of PROJECT_AI_PROTECTIVE_IGNORE.trimEnd().split("\n")) {
+    if (!lines.includes(line)) {
+      if (line.startsWith("#") && lines.length > 0 && lines.at(-1) !== "") {
+        lines.push("");
+      }
+      lines.push(line);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 const OPERATING_MODEL_SNIPPET_FRAME = `## Working mode
 
 <!-- fclty:global/baseline -->
@@ -1635,26 +1656,15 @@ async function firstExistingFileText(
 }
 
 async function seedAgentsGlobalText(args: {
-  rootDir: string;
   homeDir?: string;
   fallbackText: string;
 }): Promise<{ text: string; seededFromExisting: boolean }> {
   const home = args.homeDir ?? homedir();
-  const projectRoot = projectRootFromAiRoot(args.rootDir, home);
-  const seedText = await firstExistingFileText(
-    projectRoot
-      ? [
-          join(projectRoot, "AGENTS.md"),
-          join(projectRoot, "CLAUDE.md"),
-          join(projectRoot, ".codex", "AGENTS.md"),
-          join(projectRoot, ".claude", "CLAUDE.md"),
-        ]
-      : [
-          join(home, ".codex", "AGENTS.md"),
-          join(home, ".claude", "CLAUDE.md"),
-          join(home, ".cursor", "AGENTS.md"),
-        ]
-  );
+  const seedText = await firstExistingFileText([
+    join(home, ".codex", "AGENTS.md"),
+    join(home, ".claude", "CLAUDE.md"),
+    join(home, ".cursor", "AGENTS.md"),
+  ]);
   if (!seedText?.trim()) {
     return { text: args.fallbackText, seededFromExisting: false };
   }
@@ -1681,6 +1691,22 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
   const manifestFiles: BuiltinPackManifest["files"] = {
     ...(existingManifest?.files ?? {}),
   };
+  const projectRoot = projectRootFromAiRoot(rootDir, args.homeDir);
+
+  if (projectRoot) {
+    const ignorePath = join(rootDir, ".gitignore");
+    const existingIgnore = (await pathExists(ignorePath))
+      ? await Bun.file(ignorePath).text()
+      : "";
+    const protectiveIgnore = appendProjectAiProtectiveIgnore(existingIgnore);
+    if (protectiveIgnore !== existingIgnore) {
+      changedPaths.push(ignorePath);
+      if (!args.dryRun) {
+        await ensurePackDirectory(dirname(ignorePath));
+        await Bun.write(ignorePath, protectiveIgnore);
+      }
+    }
+  }
 
   for (const sourcePath of files) {
     const relPath = relative(packRoot, sourcePath);
@@ -1692,9 +1718,10 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
     const rawSourceText = await Bun.file(sourcePath).text();
     const targetExists = await pathExists(targetPath);
     const seed =
-      targetRelPath === "AGENTS.global.md" && !targetExists
+      targetRelPath === "AGENTS.global.md" &&
+      !targetExists &&
+      projectRoot === null
         ? await seedAgentsGlobalText({
-            rootDir,
             homeDir: args.homeDir,
             fallbackText: rawSourceText,
           })
@@ -1810,33 +1837,6 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
     changedPaths: uniqueSorted(changedPaths),
     skippedPaths: uniqueSorted(skippedPaths),
   };
-}
-
-export async function scaffoldBuiltinProjectAiPack(args: {
-  cwd?: string;
-  rootDir?: string;
-  homeDir?: string;
-  dryRun?: boolean;
-  force?: boolean;
-  update?: boolean;
-}): Promise<InstallResult> {
-  const cwd = resolve(args.cwd ?? process.cwd());
-  const rootDir = args.rootDir
-    ? resolveCliContextRoot({
-        rootArg: args.rootDir,
-        scope: "project",
-        cwd,
-        homeDir: args.homeDir,
-      })
-    : join(cwd, ".ai");
-  return await scaffoldBuiltinOperatingModelPack({
-    rootDir,
-    homeDir: args.homeDir,
-    dryRun: args.dryRun,
-    force: args.force,
-    update: args.update,
-    installedAs: "project-ai",
-  });
 }
 
 function compareVersions(a: string, b: string): number {
@@ -3303,7 +3303,7 @@ function printTemplatesHelp() {
               "fclt templates init operating-model [--global|--project|--root PATH] [--update] [--force] [--dry-run]"
             ),
             renderCode(
-              "fclt templates init project-ai [--project-root PATH|--root PATH] [--update] [--force] [--dry-run]"
+              "fclt templates init project-ai [--project-root PATH|--root PATH] [--guidance PATH] [--apply --plan-sha SHA]"
             ),
             renderCode(
               "fclt templates init automation <template-id> [--scope global|project|wide] [--name <name>] [--project-root <path>] [--cwds <path1,path2>] [--rrule <RRULE>] [--status PAUSED|ACTIVE] [--yes] [--dry-run]"
@@ -3314,6 +3314,7 @@ function printTemplatesHelp() {
           title: "Notes",
           lines: renderBullets([
             `Templates are powered by the builtin ${renderCode(BUILTIN_INDEX_NAME)} index.`,
+            `${renderCode("templates init project-ai")} is a preview-first alias for minimal ${renderCode("project init")}; use ${renderCode("operating-model --project")} only for an explicit full-pack install.`,
             "Automation templates scaffold Codex automation files under ~/.codex/automations/.",
             `${renderCode("--yes")} and ${renderCode("--non-interactive")} skip scope prompts and use inferred defaults when possible.`,
             "Use project scope for one repo root, wide/global scope for many explicit roots.",
@@ -3365,14 +3366,38 @@ function parseLongFlag(argv: string[], flag: string): string | null {
   return null;
 }
 
+function parseLongFlags(argv: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg) {
+      continue;
+    }
+    if (arg === flag) {
+      const value = argv[i + 1];
+      if (value) {
+        values.push(value);
+      }
+      i += 1;
+    } else if (arg.startsWith(`${flag}=`)) {
+      values.push(arg.slice(flag.length + 1));
+    }
+  }
+  return values;
+}
+
 const TEMPLATE_INIT_VALUE_FLAGS = new Set([
   "--automation-status",
+  "--cadence",
   "--cwds",
+  "--guidance",
   "--name",
+  "--plan-sha",
   "--project-root",
   "--root",
   "--rrule",
   "--scope",
+  "--source",
   "--status",
 ]);
 
@@ -3857,44 +3882,48 @@ export async function templatesCommand(
 
   if (kind === "project-ai") {
     try {
-      const result = await scaffoldBuiltinProjectAiPack({
-        cwd: ctx.cwd,
-        rootDir:
-          parsedArgs.rootArg ??
-          (parsedArgs.projectRootArg
-            ? projectAiRootFromProjectArg(
-                parsedArgs.projectRootArg,
-                ctx.homeDir
-              )
-            : ctx.rootDir),
-        homeDir: ctx.homeDir,
-        dryRun,
-        force,
-        update,
-      });
-      if (json) {
-        console.log(JSON.stringify(result, null, 2));
-        return;
+      if (force || update) {
+        throw new Error(
+          "project-ai is now a minimal preview-first enrollment alias; use operating-model --project for an explicit full-pack install"
+        );
       }
-      const action = dryRun ? "Would scaffold" : "Scaffolded";
-      console.log(
-        renderPage({
-          title: `fclt templates init ${kind}`,
-          subtitle: `${action} ${result.installedAs}`,
-          sections: [
-            {
-              title: "Changed Paths",
-              lines: renderBullets(result.changedPaths),
-            },
-            ...(result.skippedPaths?.length
-              ? [
-                  {
-                    title: "Skipped Local Edits",
-                    lines: renderBullets(result.skippedPaths),
-                  },
-                ]
-              : []),
-          ],
+      if (args.includes("--schedule")) {
+        throw new Error(
+          "Minimal project enrollment does not install scheduling; enroll first, then enable a reviewed project loop separately"
+        );
+      }
+      const selectedRoot = parsedArgs.projectRootArg
+        ? resolve(
+            expandHomePath(parsedArgs.projectRootArg, ctx.homeDir ?? homedir())
+          )
+        : parsedArgs.rootArg
+          ? dirname(
+              projectAiRootFromProjectArg(parsedArgs.rootArg, ctx.homeDir)
+            )
+          : ctx.rootDir
+            ? dirname(resolve(ctx.rootDir))
+            : resolve(ctx.cwd ?? process.cwd());
+      const forwarded = ["init", "--project-root", selectedRoot];
+      for (const flag of ["--guidance", "--source"]) {
+        for (const value of parseLongFlags(args, flag)) {
+          forwarded.push(flag, value);
+        }
+      }
+      for (const flag of ["--cadence", "--plan-sha"]) {
+        const value = parseLongFlag(args, flag);
+        if (value) {
+          forwarded.push(flag, value);
+        }
+      }
+      for (const flag of ["--apply", "--json"]) {
+        if (args.includes(flag)) {
+          forwarded.push(flag);
+        }
+      }
+      await import("./projects").then(({ projectCommand }) =>
+        projectCommand(forwarded, {
+          cwd: ctx.cwd,
+          homeDir: ctx.homeDir,
         })
       );
       return;

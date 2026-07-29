@@ -1,108 +1,141 @@
-# Project `.ai`
+# Guided Project Onboarding
 
-A project `.ai` root stores repo-owned capability. It is for source that should travel with the codebase, not for generated state, review queues, or private local context.
+Project onboarding is preview-first and minimal. It creates only the canonical
+files required to identify and configure one repository; installing the full
+operating pack and rendering tool output remain separate decisions.
 
-Create one with:
+## Discover
 
-```bash
-cd /path/to/repo
-fclt templates init project-ai
-fclt index --project
-fclt status --project
-```
-
-If automation selects a repo-local root through the environment, declare its
-scope explicitly:
+Discovery is read-only, bounded, and restricted to explicit roots:
 
 ```bash
-FACULT_ROOT_DIR=/path/to/repo/.ai FACULT_ROOT_SCOPE=project fclt status --project
+fclt projects discover --root ~/dev --since 30d --json
 ```
 
-An unscoped `FACULT_ROOT_DIR` is treated as global for safety. This prevents a
-custom global root that happens to be named `.ai` from becoming project state
-during an ancestor search.
+The result groups duplicate clones and worktrees by a stable repository
+identity, reports dirty state and existing `.ai` coverage, and says when a
+bound truncated the scan. Review and select repositories individually; the
+command never enrolls its results.
 
-Typical layout:
+## Preview And Apply
+
+Preview the exact plan before any write:
+
+```bash
+fclt project init --project-root /path/to/repo --json
+```
+
+The plan distinguishes canonical, generated, and machine-local writes and
+includes file preconditions, privacy findings, rollback behavior, and a plan
+hash. Minimal enrollment writes:
 
 ```text
 <repo>/.ai/
+  .gitignore
   config.toml
-  instructions/
-  snippets/
-  agents/
-  skills/
-  mcp/
-  tools/
 ```
 
-## What Belongs In Project `.ai`
+The protective `.ai/.gitignore` is committed first and excludes `.facult/` and
+`config.local.toml`. Generated indexes, the project registry, receipts, and
+scheduling state stay under fclt's machine-local application-data root.
 
-Use project `.ai` for:
-
-- repo-specific instructions
-- project review skills
-- project MCP definitions without secrets
-- project snippets
-- project sync policy
-- canonical automation prompts that should travel with the repo
-
-Do not put these in project `.ai`:
-
-- writeback queues
-- evolution proposal metadata
-- generated index/graph state
-- local machine paths
-- secrets
-- private review artifacts
-
-Project-scoped writebacks and evolution proposals are stored in machine-local `fclt` state and mirrored for review under global `~/.ai/writebacks/projects/<slug-hash>/` and `~/.ai/evolution/projects/<slug-hash>/`.
-
-## Migration From Generated-Only Roots
-
-Some repos may contain `<repo>/.ai/.facult/ai/index.json` and `graph.json` without any canonical source. That makes the repo look like it has project AI state even though there is nothing durable to render.
-
-Current behavior:
+After reviewing the entire plan, apply that unchanged plan:
 
 ```bash
-fclt status --project
-fclt sync --project --dry-run
+fclt project init --project-root /path/to/repo \
+  --apply --plan-sha <sha-from-preview> --json
 ```
 
-`status` reports `project-generated-only`, and `sync` skips until canonical source is restored or initialized.
+Apply refuses stale source hashes or changed destination preconditions. It does
+not install the operating pack, enable managed rendering, schedule a loop, or
+copy repository guidance.
 
-## Project Sync Policy
+`fclt templates init project-ai` remains a preview-first compatibility alias.
+It has the same minimal contract and does not accept the old `--update` or
+`--force` behavior.
 
-Project sync is default-deny. Nothing from global or project canonical source renders into repo-local managed tool outputs unless the repo opts in.
+## Existing Repository Guidance
 
-Example:
+Root `AGENTS.md` or `CLAUDE.md` remains the canonical repository rulebook.
+fclt never copies either file automatically into `.ai/AGENTS.global.md`.
 
-```toml
-version = 1
-
-[project_sync.codex]
-skills = ["project-review"]
-agents = ["review-operator"]
-mcp_servers = ["github"]
-global_docs = true
-tool_rules = true
-tool_config = true
-```
-
-This includes inherited global assets. If a global skill should appear in project-managed Codex output, list it explicitly.
-
-## Next
-
-- Read [Concepts](./concepts.md) for source, generated state, machine-local state, and rendered outputs.
-- Read [Managed mode](./managed-mode.md) before syncing project assets into tool outputs.
-- Read [Security and trust](./security-trust.md) before committing MCP config.
-
-## Verification
-
-Use these commands after changing project `.ai`:
+To adopt a reviewed reference, name each file explicitly:
 
 ```bash
+fclt project init --project-root /path/to/repo \
+  --guidance AGENTS.md --json
+```
+
+The plan previews the complete content and SHA-256 hash. Adoption is
+reference-only and is refused when the source is untracked, modified, outside
+the repository, secret-shaped, or contains a machine-local absolute path.
+Reviewing and applying a plan therefore cannot turn a dirty checkout or a
+machine-specific document into committed project capability.
+
+If the full built-in operating pack is actually wanted, preview it separately:
+
+```bash
+fclt templates init operating-model --project --dry-run
+fclt templates init operating-model --project
+```
+
+Project full-pack install also does not seed `AGENTS.global.md` from
+`AGENTS.md` or `CLAUDE.md`.
+
+## Status And Lifecycle
+
+Inspect selected roots and registered projects:
+
+```bash
+fclt projects status --root /path/to/repo --json
+fclt projects status --json
+```
+
+Status explains canonical coverage, protective-ignore health, generated-index
+health, guidance references, scheduler state, pending review, and duplicate
+locations without exposing private file contents.
+
+Lifecycle decisions are non-destructive:
+
+```bash
+fclt project disable --project-root /path/to/repo --json
+fclt project ignore --project-root /path/to/repo --json
+fclt project remove --project-root /path/to/repo --json
+```
+
+They preserve canonical files, receipts, machine-local review history, and the
+repository registry. Re-enroll an intentionally selected project with a newly
+reviewed `fclt project init` plan.
+
+Rollback also previews by default:
+
+```bash
+fclt project rollback --receipt <receipt-id> --json
+fclt project rollback --receipt <receipt-id> --apply --json
+```
+
+Rollback removes only files created by that receipt when their hashes still
+match. It refuses drift and preserves the receipt and review history.
+
+## Scope And Verification
+
+Project `.ai` stores repo-owned canonical capability. Do not place generated
+state, local machine paths, secrets, writeback queues, or private review
+artifacts there. Project-scoped writebacks and evolution proposals remain in
+machine-local state with review mirrors under global
+`~/.ai/writebacks/projects/` and `~/.ai/evolution/projects/`.
+
+An environment-selected project root must declare
+`FACULT_ROOT_SCOPE=project`; an unscoped `FACULT_ROOT_DIR` is global for safety.
+
+After enrollment:
+
+```bash
+fclt projects status --root /path/to/repo --json
 fclt status --project
 fclt list skills --project
-fclt graph AGENTS.global.md --project
 fclt sync codex --project --dry-run
 ```
+
+Read [Concepts](./concepts.md) for the state model and [Managed
+mode](./managed-mode.md) before opting into rendered tool output.

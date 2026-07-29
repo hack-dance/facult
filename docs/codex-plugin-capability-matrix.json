@@ -172,7 +172,7 @@
       "risk": "reversible_mutation",
       "scope": "explicit global|global_and_project plus project cwd",
       "preview": "default; calls released setup --dry-run JSON contract",
-      "apply": "dryRun=false plus approve=true against the released setup contract",
+      "apply": "dryRun=false plus approve=true applies global setup; project enrollment remains a separate plan-hash CLI action",
       "rollback": "preserved existing capability state and reported repair actions",
       "verification": "doctor loop readiness plus fresh-session plugin discovery"
     },
@@ -225,7 +225,7 @@
     },
     {
       "id": "templates.init_operating_model",
-      "cli": "templates init operating-model|project-ai",
+      "cli": "project init|projects discover|projects status|templates init operating-model",
       "cliAvailability": "available",
       "mcp": {
         "disposition": "exposed",

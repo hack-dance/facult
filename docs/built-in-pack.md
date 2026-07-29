@@ -76,12 +76,18 @@ fclt templates init operating-model --global --update
 
 `--update` refreshes only files that still match the last installed pack manifest and skips local edits. See [Built-in pack upgrades](./pack-upgrades.md).
 
-Use `project-ai` when the target is the current repo:
+Use guided onboarding when the target needs only a minimal project layer:
 
 ```bash
 cd /path/to/repo
-fclt templates init project-ai
+fclt project init --json
+fclt project init --apply --plan-sha <sha-from-preview> --json
 ```
+
+This writes the protective `.ai/.gitignore` before generated state and does
+not install this full pack or copy repo guidance. Use
+`fclt templates init project-ai` only as the equivalent preview-first legacy
+alias.
 
 Legacy managed mode is a deprecated rendering layer. Inspect its plan without changing tool state:
 

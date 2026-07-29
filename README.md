@@ -91,17 +91,17 @@ fclt --version
 
 The npm package is named `facult` for registry compatibility. The command is `fclt`.
 
-Then bootstrap the complete writeback/evolution loop from your home directory or a repository:
+Then bootstrap the global writeback/evolution loop:
 
 ```bash
 fclt setup
 ```
 
-That one command safely initializes or updates global `~/.ai`, initializes the current git
-repository's `<repo>/.ai` when applicable, creates review-state paths, rebuilds capability
-discovery, and installs the Codex plugin when Codex is available. It preserves local edits and
-existing WB/EV history, and it is safe to run again. Use `fclt setup --global-only` outside a
-project or `fclt setup --no-codex-plugin` for a CLI-only install.
+That command safely initializes or updates global `~/.ai`, creates review-state paths, rebuilds
+capability discovery, and installs the Codex plugin when Codex is available. It does not initialize
+the current repository. It preserves local edits and existing WB/EV history, and it is safe to run
+again. Use `fclt setup --include-project` to include a no-write project enrollment plan, or
+`fclt setup --no-codex-plugin` for a CLI-only install.
 
 One-off usage:
 
@@ -265,13 +265,19 @@ fclt templates init operating-model --global --update --dry-run
 fclt templates init operating-model --global --update
 ```
 
-Create a repo-local `.ai` root:
+Preview and apply a minimal repo-local `.ai` root:
 
 ```bash
 cd /path/to/repo
-fclt templates init project-ai
+fclt project init --json
+fclt project init --apply --plan-sha <sha-from-preview> --json
 fclt status --project
 ```
+
+Minimal enrollment never copies `AGENTS.md` or `CLAUDE.md`. Use
+`--guidance AGENTS.md` only for an explicit, fully previewed reference to a
+tracked clean rulebook. Full operating-pack install remains a separate
+`fclt templates init operating-model --project` action.
 
 Create individual capability units:
 
@@ -566,7 +572,12 @@ Keep tracked MCP config secret-free. Use local overlays such as `mcp/servers.loc
 Discovery:
 
 ```bash
-fclt setup [--global-only] [--no-codex-plugin] [--json]
+fclt setup [--include-project] [--no-codex-plugin] [--json]
+fclt projects discover --root <path> [--root <path>] [--since <duration>] [--json]
+fclt projects status [--root <path>] [--json]
+fclt project init [--project-root <path>] [--guidance <path>] [--apply --plan-sha <sha>] [--json]
+fclt project disable|ignore|inactive|remove [--project-root <path>] [--json]
+fclt project rollback --receipt <id> [--apply] [--json]
 fclt status [--json]
 fclt doctor [--json] [--repair]
 fclt paths [--json]
@@ -585,7 +596,7 @@ Canonical store:
 ```bash
 fclt templates list
 fclt templates init operating-model [--global|--project|--root PATH] [--update]
-fclt templates init project-ai [--update]
+fclt templates init project-ai [--project-root PATH|--root PATH] [--guidance PATH] [--apply --plan-sha SHA]
 fclt templates init instruction <name>
 fclt templates init snippet <marker>
 fclt templates init skill <name>

@@ -14,6 +14,7 @@ import {
 import { parseJsonLenient } from "./util/json";
 
 const WINDOWS_ABSOLUTE_PATH_RE = /^[A-Za-z]:[\\/]/;
+const PROJECT_REPOSITORY_ID_RE = /^repo_[a-f0-9]{24}$/;
 
 export interface FacultConfig {
   /**
@@ -293,6 +294,31 @@ export function machineStateProjectKey(
   config?: FacultConfig | null
 ): string {
   const projectRoot = projectRootFromAiRoot(rootDir, home, config);
+  if (projectRoot) {
+    const projectConfigPath = join(rootDir, "config.toml");
+    try {
+      const parsed = Bun.TOML.parse(readFileSync(projectConfigPath, "utf8"));
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        "project" in parsed
+      ) {
+        const project = (parsed as Record<string, unknown>).project;
+        if (isPlainObject(project)) {
+          const repositoryId = project.repository_id;
+          if (
+            typeof repositoryId === "string" &&
+            PROJECT_REPOSITORY_ID_RE.test(repositoryId)
+          ) {
+            return repositoryId;
+          }
+        }
+      }
+    } catch {
+      // Fall back to the legacy path-derived key for unenrolled projects.
+    }
+  }
   const labelSource = projectRoot ?? rootDir;
   const label = basename(labelSource).trim().toLowerCase();
   const slug = label.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");

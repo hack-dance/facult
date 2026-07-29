@@ -76,11 +76,13 @@ For a new install, prefer the complete one-command bootstrap:
 fclt setup
 ```
 
-It prepares global and current-repo capability, review state, indexes, and the plugin. The same
-command is available to Codex through `fclt_setup`, so a plugin-led install does not require the
-user to know capability roots or state paths. The MCP form requires an explicit `global` or
-`global_and_project` scope, defaults to dry-run, requires an explicit project `cwd`, and only
-applies when `dryRun: false` and `approve: true` are both present.
+It prepares global capability, review state, indexes, and the plugin. The same
+command is available to Codex through `fclt_setup`, so a plugin-led install
+does not require the user to know global state paths. The MCP form requires an
+explicit `global` or `global_and_project` scope and defaults to dry-run.
+`global_and_project` requires an explicit project `cwd` and returns the exact
+no-write minimal enrollment plan. Applying that project plan remains a
+separate CLI action requiring its returned plan hash.
 
 Use the narrow plugin-only command when the CLI loop is already healthy:
 

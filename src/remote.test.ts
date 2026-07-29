@@ -5,12 +5,14 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runFixtureGit } from "../test/git-fixture";
 import { renderCanonicalText } from "./agents";
 import { facultAiIndexPath } from "./paths";
 import {
@@ -53,13 +55,46 @@ function sha256Hex(input: string): string {
 }
 
 async function makeTempRoot(): Promise<{ home: string; root: string }> {
-  const dir = await mkdtemp(join(tmpdir(), "facult-remote-"));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "facult-remote-")));
   tempDir = dir;
   const home = join(dir, "home");
   const root = join(home, "agents", ".facult");
   await mkdir(home, { recursive: true });
   await mkdir(root, { recursive: true });
   return { home, root };
+}
+
+async function initializeGitRepository(
+  repoDir: string,
+  home: string
+): Promise<void> {
+  await mkdir(repoDir, { recursive: true });
+  await runFixtureGit({
+    argv: ["init", "-b", "main", repoDir],
+    repoDir,
+    homeDir: home,
+  });
+  await writeFile(join(repoDir, "README.md"), "# Fixture\n");
+  await runFixtureGit({
+    argv: ["add", "."],
+    repoDir,
+    homeDir: home,
+    cwd: repoDir,
+  });
+  await runFixtureGit({
+    argv: [
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.test",
+      "commit",
+      "-m",
+      "fixture",
+    ],
+    repoDir,
+    homeDir: home,
+    cwd: repoDir,
+  });
 }
 
 async function withMutedConsole(fn: () => Promise<void>) {
@@ -1256,7 +1291,7 @@ describe("templates command", () => {
     expect(automationToml).toContain("scope-promoter");
     expect(automationToml).toContain("evolution-planner");
     expect(automationToml).toContain("verification-auditor");
-    expect(automationToml).toContain("fclt templates init project-ai");
+    expect(automationToml).toContain("fclt project init --json");
     expect(automationToml).toContain("blocked by missing project AI state");
     expect(automationToml).toContain("not graph-backed");
     expect(automationToml).toContain("Recorded writebacks");
@@ -1266,7 +1301,7 @@ describe("templates command", () => {
     const memory = await readFile(join(automationDir, "memory.md"), "utf8");
     expect(memory).toContain("$feedback-loop-setup");
     expect(memory).toContain("$capability-evolution");
-    expect(memory).toContain("bootstrap baseline project AI state");
+    expect(memory).toContain("preview baseline project AI state");
   });
 
   it("supports project-scoped automation scaffolding with explicit scope root", async () => {
@@ -1675,59 +1710,42 @@ describe("templates command", () => {
     );
   });
 
-  it("scaffolds the builtin project-ai pack into a repo-local .ai", async () => {
+  it("previews minimal project-ai enrollment without writing", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     process.chdir(repoDir);
 
-    await withMutedConsole(async () => {
+    const { logs, errors } = await withCapturedConsole(async () => {
       await templatesCommand(["init", "project-ai"], {
         homeDir: home,
         cwd: repoDir,
       });
     });
 
-    expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
-    expect(
-      await Bun.file(
-        join(repoDir, ".ai", "instructions", "PROJECT_CAPABILITY.md")
-      ).exists()
-    ).toBe(true);
-    const evolutionText = await Bun.file(
-      join(repoDir, ".ai", "instructions", "EVOLUTION.md")
-    ).text();
-    expect(evolutionText).toContain("fclt ai writeback add");
-    expect(evolutionText).toContain("Current supported proposal kinds");
-
-    const skillText = await Bun.file(
-      join(repoDir, ".ai", "skills", "capability-evolution", "SKILL.md")
-    ).text();
-    expect(skillText).toContain("Proposal Kind Selection");
-    expect(skillText).toContain("fclt ai evolve draft EV-00001 --append");
-    expect(
-      await Bun.file(facultAiIndexPath(home, join(repoDir, ".ai"))).exists()
-    ).toBe(true);
+    expect(errors).toEqual([]);
+    const plan = JSON.parse(logs.join("\n")) as {
+      projectRoot: string;
+      protections: { automaticGuidanceCopy: boolean };
+      canonicalWrites: Array<{ path: string }>;
+    };
+    expect(plan.projectRoot).toBe(repoDir);
+    expect(plan.protections.automaticGuidanceCopy).toBe(false);
+    expect(plan.canonicalWrites.map((write) => write.path)).toEqual([
+      join(repoDir, ".ai", ".gitignore"),
+      join(repoDir, ".ai", "config.toml"),
+    ]);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
   });
 
-  it("scaffolds the builtin project-ai pack into an explicit root", async () => {
+  it("previews project-ai enrollment into an explicit root", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--root", join(repoDir, ".ai")],
         {
@@ -1738,27 +1756,20 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
-  it("scaffolds the builtin project-ai pack from an explicit project root", async () => {
+  it("previews project-ai enrollment from an explicit project root", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--project-root", repoDir],
         {
@@ -1769,16 +1780,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
@@ -1786,10 +1790,10 @@ describe("templates command", () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(
         ["init", "project-ai", "--project-root", repoDir],
         {
@@ -1801,16 +1805,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, ".ai")).exists()).toBe(false);
   });
 
@@ -1818,10 +1815,10 @@ describe("templates command", () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     const otherDir = join(home, "other");
-    await mkdir(repoDir, { recursive: true });
+    await initializeGitRepository(repoDir, home);
     await mkdir(otherDir, { recursive: true });
 
-    await withMutedConsole(async () => {
+    const { logs } = await withCapturedConsole(async () => {
       await templatesCommand(["init", "project-ai", "--project-root=~/repo"], {
         homeDir: home,
         cwd: otherDir,
@@ -1829,16 +1826,9 @@ describe("templates command", () => {
     });
 
     expect(
-      await Bun.file(
-        join(
-          repoDir,
-          ".ai",
-          "skills",
-          "project-operating-layer-design",
-          "SKILL.md"
-        )
-      ).exists()
-    ).toBe(true);
+      (JSON.parse(logs.join("\n")) as { projectRoot: string }).projectRoot
+    ).toBe(repoDir);
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
     expect(await Bun.file(join(otherDir, "~", "repo", ".ai")).exists()).toBe(
       false
     );
@@ -1996,7 +1986,7 @@ describe("templates command", () => {
     expect(await readFile(agentsPath, "utf8")).toBe(agentsText);
   });
 
-  it("seeds project AGENTS.global.md from the repo AGENTS.md", async () => {
+  it("does not seed project AGENTS.global.md from repo guidance", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");
     await mkdir(repoDir, { recursive: true });
@@ -2017,10 +2007,13 @@ describe("templates command", () => {
       join(repoDir, ".ai", "AGENTS.global.md"),
       "utf8"
     );
-    expect(agentsText).toContain("# Project Agent Instructions");
-    expect(agentsText).toContain("- Use repo-specific checks.");
-    expect(agentsText).toContain("## Facult Operating Model");
+    expect(agentsText).not.toContain("# Project Agent Instructions");
+    expect(agentsText).not.toContain("- Use repo-specific checks.");
+    expect(agentsText).toContain("# Global Agent Instructions");
     expect(agentsText).toContain("<!-- fclty:global/core/writeback -->");
+    expect(
+      await readFile(join(repoDir, ".ai", ".gitignore"), "utf8")
+    ).toContain("/.facult/");
   });
 
   it("updates unmodified builtin operating-model files using the pack manifest", async () => {

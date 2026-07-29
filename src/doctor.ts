@@ -1017,16 +1017,12 @@ async function inspectLegacyRecovery(args: {
   };
 }
 
-function projectAiInitCommand(rootDir: string, flags: string[] = []): string {
+function projectAiInitCommand(rootDir: string): string {
   const projectRoot = projectRootFromAiRoot(rootDir);
-  const rootFlag = projectRoot ? "--project-root" : "--root";
   const rootValue = projectRoot ?? rootDir;
-  return [
-    "fclt templates init project-ai",
-    rootFlag,
-    shellQuote(rootValue),
-    ...flags,
-  ].join(" ");
+  return ["fclt project init", "--project-root", shellQuote(rootValue)].join(
+    " "
+  );
 }
 
 async function inspectCanonicalGlobalDocs(
@@ -1045,7 +1041,7 @@ async function inspectCanonicalGlobalDocs(
   const text = await readFile(pathValue, "utf8");
   const issues: DoctorIssue[] = [];
   const refreshCommand = opts.projectRoot
-    ? projectAiInitCommand(rootDir, ["--force"])
+    ? `fclt templates init operating-model --root ${shellQuote(rootDir)} --force`
     : "fclt templates init operating-model --global --force";
   const docLabel = opts.projectRoot
     ? "project AGENTS.global.md"
@@ -1625,7 +1621,7 @@ export async function buildDoctorReport(opts?: {
           ? "Refresh project operating model"
           : "Refresh global operating model",
         command: projectRoot
-          ? projectAiInitCommand(rootDir, ["--force"])
+          ? `fclt templates init operating-model --root ${shellQuote(rootDir)} --force`
           : "fclt templates init operating-model --global --force",
         risk: "canonical_write",
       });
@@ -1658,7 +1654,7 @@ export async function buildDoctorReport(opts?: {
       });
       actions.push({
         id: "init-project-ai",
-        label: "Initialize project AI root",
+        label: "Preview minimal project enrollment",
         command: projectAiInitCommand(rootDir),
         risk: "canonical_write",
       });
@@ -1768,13 +1764,15 @@ export async function buildDoctorReport(opts?: {
         message:
           "Required writeback/evolution skills are missing from the selected root.",
         fix: projectRoot
-          ? "Run `fclt setup` from the project root."
-          : "Run `fclt setup --global-only`.",
+          ? "Run `fclt templates init operating-model --project` for an explicit full-pack install."
+          : "Run `fclt setup`.",
       });
       actions.push({
         id: "bootstrap-loop-assets",
         label: "Install required writeback/evolution assets",
-        command: projectRoot ? "fclt setup" : "fclt setup --global-only",
+        command: projectRoot
+          ? "fclt templates init operating-model --project"
+          : "fclt setup",
         risk: "canonical_write",
       });
     }

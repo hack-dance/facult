@@ -58,9 +58,16 @@ The pack source stores the composed entry template at `snippets/templates/agents
 
 That installed `AGENTS.global.md` is not meant to hold every rule.
 
-If first install finds existing agent guidance, `fclt` seeds `AGENTS.global.md` from it and appends the Facult operating-model frame. Global installs look for existing global tool docs such as `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`; project installs look for repo-local `AGENTS.md` or `CLAUDE.md`.
+On a global first install, `fclt` can seed `AGENTS.global.md` from existing
+global tool docs such as `~/.codex/AGENTS.md` and
+`~/.claude/CLAUDE.md`, then append the Facult operating-model frame. Project
+installs never seed from repo-local `AGENTS.md` or `CLAUDE.md`; those files
+remain canonical repository guidance and require explicit reviewed
+`fclt project init --guidance <path>` reference adoption.
 
-Seeded files are user-owned. They are intentionally excluded from the pack manifest so `--update` skips them unless you explicitly replace them with `--force` or edit them manually.
+Globally seeded files are user-owned. They are intentionally excluded from the
+pack manifest so `--update` skips them unless you explicitly replace them with
+`--force` or edit them manually.
 
 Use:
 
