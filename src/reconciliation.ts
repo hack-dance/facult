@@ -119,6 +119,7 @@ function compareLinkedWorkStatusObservations(
 
 function migrateLinkedWorkStatuses(args: {
   resolutionProofs: NonNullable<ReconciliationState["resolutionProofs"]>;
+  synthesizeMissing: boolean;
   statuses: Record<string, LegacyLinkedWorkStatusObservation>;
 }): NonNullable<ReconciliationState["linkedWorkStatuses"]> {
   const authoritativeSourceIds = new Set(
@@ -145,6 +146,9 @@ function migrateLinkedWorkStatuses(args: {
       ...observation,
       sourceType: "evidence-export",
     };
+  }
+  if (!args.synthesizeMissing) {
+    return migrated;
   }
   const existingIssueRefs = new Set(Object.keys(migrated));
   for (const entry of Object.values(args.resolutionProofs)) {
@@ -216,6 +220,7 @@ function parseState(value: unknown): ReconciliationState {
     resolutionProofs,
     linkedWorkStatuses: migrateLinkedWorkStatuses({
       resolutionProofs,
+      synthesizeMissing: value.linkedWorkStatuses === undefined,
       statuses: isPlainObject(value.linkedWorkStatuses)
         ? (value.linkedWorkStatuses as Record<
             string,

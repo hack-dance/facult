@@ -1716,6 +1716,18 @@ describe("source reconciliation", () => {
         linkedWorkStatuses?: Record<string, unknown>;
       };
       expect(state.linkedWorkStatuses?.[issueRef]).toBeUndefined();
+
+      const repeated = await run();
+      expect(repeated.resolvedSignalFamilies).not.toContain(familyId);
+      const repeatedState = JSON.parse(
+        await readFile(
+          facultAiReconciliationStatePath(fixture.homeDir, fixture.rootDir),
+          "utf8"
+        )
+      ) as {
+        linkedWorkStatuses?: Record<string, unknown>;
+      };
+      expect(repeatedState.linkedWorkStatuses?.[issueRef]).toBeUndefined();
     }
   });
 
