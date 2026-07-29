@@ -2027,6 +2027,10 @@ async function planLegacyProjectStateMigrations(args: {
     const destinationTree = await inspectProjectStateTree(
       candidate.destination
     );
+    assertNoMigratingRuntimeLocks({
+      path: candidate.destination,
+      tree: destinationTree,
+    });
     const rebuildableOverlaps = assertDisjointProjectStateTrees({
       allowRebuildableOverlaps: candidate.allowRebuildableOverlaps,
       source: sourceTree,
@@ -2118,6 +2122,10 @@ async function migrateLegacyProjectState(args: {
         ? await inspectProjectStateTree(candidate.destination)
         : null;
     if (destinationTree) {
+      assertNoMigratingRuntimeLocks({
+        path: candidate.destination,
+        tree: destinationTree,
+      });
       if (destinationTree.sha256 !== candidate.destinationTreeSha256) {
         throw new Error(
           `Reviewed legacy project state migration is stale: ${candidate.destination}`
