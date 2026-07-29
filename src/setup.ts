@@ -94,6 +94,11 @@ export async function bootstrapFclt(
   });
   const detectedProject = findGitRootFromPath(cwd);
   const includeProject = opts.includeProject ?? false;
+  if (includeProject && !detectedProject) {
+    throw new Error(
+      `Project setup was requested outside a Git checkout: ${cwd}`
+    );
+  }
   const projectCandidateRoot = resolve(detectedProject ?? cwd, ".ai");
   const projectTargetsGlobalRoot =
     (detectedProject !== null &&

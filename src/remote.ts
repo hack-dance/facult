@@ -1797,6 +1797,8 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
   force?: boolean;
   update?: boolean;
   installedAs?: string;
+  /** @internal Platform branch override for cross-platform regression tests. */
+  platform?: NodeJS.Platform;
   /** @internal Adversarial test hook; production callers must not set this. */
   beforeProjectIgnoreCommit?: () => Promise<void>;
 }): Promise<InstallResult> {
@@ -1820,6 +1822,11 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
     if (protectiveIgnore !== existingIgnore.content) {
       changedPaths.push(ignorePath);
       if (!args.dryRun) {
+        if ((args.platform ?? process.platform) === "win32") {
+          throw new Error(
+            "Project operating-model installation is unsupported on win32 because protective ignore replacement is unavailable"
+          );
+        }
         await ensurePackDirectory(dirname(ignorePath));
         await writeProjectAiIgnore(
           ignorePath,

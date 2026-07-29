@@ -2106,6 +2106,21 @@ describe("templates command", () => {
     );
   });
 
+  it("rejects unsupported Windows project installation before full-pack writes", async () => {
+    const { home } = await makeTempRoot();
+    const repoDir = join(home, "repo");
+    await initializeGitRepository(repoDir, home);
+
+    await expect(
+      scaffoldBuiltinOperatingModelPack({
+        homeDir: home,
+        rootDir: join(repoDir, ".ai"),
+        platform: "win32",
+      })
+    ).rejects.toThrow("unsupported on win32");
+    expect(await Bun.file(join(repoDir, ".ai")).exists()).toBe(false);
+  });
+
   it("refuses a hard-linked project ignore leaf without changing its peer", async () => {
     const { home } = await makeTempRoot();
     const repoDir = join(home, "repo");

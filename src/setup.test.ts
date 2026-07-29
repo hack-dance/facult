@@ -556,6 +556,21 @@ describe("zero-config setup", () => {
     );
   }, 20_000);
 
+  it("rejects requested project setup outside a Git checkout before writing", async () => {
+    const home = await tempHome("fclt-setup-no-project-");
+    const before = await snapshotFiles(home);
+
+    await expect(
+      bootstrapFclt({
+        homeDir: home,
+        cwd: home,
+        includeProject: true,
+        installCodexPlugin: false,
+      })
+    ).rejects.toThrow("outside a Git checkout");
+    expect(await snapshotFiles(home)).toEqual(before);
+  });
+
   it("does not bootstrap a nested project inside a git-backed global root", async () => {
     const home = await tempHome("fclt-setup-global-root-");
     const globalRoot = join(home, ".ai");
