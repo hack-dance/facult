@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { chmod, mkdir, readdir, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   facultAiReconciliationLockPath,
   facultAiReconciliationReviewDir,
@@ -1555,6 +1555,80 @@ describe("source reconciliation", () => {
     expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
   });
 
+  it("migrates persisted terminal linked-work proof from pre-status state", async () => {
+    const fixture = await makeFixture();
+    const exportPath = join(fixture.projectRoot, "issues.json");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          { id: "issues", type: "evidence-export", path: "issues.json" },
+        ],
+      })
+    );
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "open",
+            kind: "status-change",
+            observedAt: "2026-07-05T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    const opened = await run();
+    const familyId = opened.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a linked-work family");
+    }
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "done",
+            kind: "status-change",
+            observedAt: "2026-07-06T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "done",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    const statePath = facultAiReconciliationStatePath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const legacyState = JSON.parse(await readFile(statePath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    legacyState.linkedWorkStatuses = undefined;
+    await Bun.write(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    await Bun.write(exportPath, JSON.stringify(evidenceExport([])));
+
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+    const migratedState = JSON.parse(await readFile(statePath, "utf8")) as {
+      linkedWorkStatuses?: Record<string, { sourceType?: string }>;
+    };
+    expect(migratedState.linkedWorkStatuses?.["HACK-1202"]).toMatchObject({
+      sourceType: "evidence-export",
+    });
+  });
+
   it("resolves linked-work families from bounded terminal status readback", async () => {
     const fixture = await makeFixture();
     const linkedWork = [
@@ -2238,6 +2312,50 @@ describe("source reconciliation", () => {
 
     expect(review.coverageComplete).toBe(true);
     expect(await Bun.file(lockPath).exists()).toBe(false);
+  });
+
+  it("recovers an abandoned reconciliation takeover claim", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+    });
+
+    expect(review.coverageComplete).toBe(true);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
+    expect(
+      (await readdir(dirname(lockPath))).some((name) =>
+        name.startsWith(`${basename(takeoverPath)}.stale-`)
+      )
+    ).toBe(true);
   });
 
   it("reports unavailable cursor freshness without changing coverage semantics", async () => {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   type FileHandle,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -35,6 +36,7 @@ import type {
   ReconciliationConfig,
   ReconciliationFreshness,
   ReconciliationReview,
+  ReconciliationSourceType,
   ReconciliationState,
   ReconciliationWindow,
   ResolutionProof,
@@ -52,7 +54,7 @@ const CAPABILITY_RE =
   /\b(?:capability|writeback|evolution|instruction|skill|agent|runbook|reconciliation|feedback loop|verification)\b/i;
 const NOISE_RE =
   /\b(?:chore|format|typo|timestamp|heartbeat unchanged|no-op)\b/i;
-const RECONCILIATION_ENGINE_VERSION = 6;
+const RECONCILIATION_ENGINE_VERSION = 7;
 const STOP_WORD_RE =
   /\b(?:the|and|for|with|from|this|that|into|was|were|are|has|have)\b/g;
 const NON_ALPHANUMERIC_RE = /[^a-z0-9]+/g;
@@ -86,6 +88,77 @@ function emptyState(): ReconciliationState {
   };
 }
 
+type LegacyLinkedWorkStatusObservation = Omit<
+  LinkedWorkStatusObservation,
+  "sourceType"
+> & {
+  sourceType?: ReconciliationSourceType;
+};
+
+function migrateLinkedWorkStatuses(args: {
+  resolutionProofs: NonNullable<ReconciliationState["resolutionProofs"]>;
+  statuses: Record<string, LegacyLinkedWorkStatusObservation>;
+}): NonNullable<ReconciliationState["linkedWorkStatuses"]> {
+  const authoritativeSourceIds = new Set(
+    Object.values(args.resolutionProofs)
+      .filter(
+        (entry) =>
+          entry.proof.kind === "linked_work_terminal" &&
+          entry.proof.sourceType === "evidence-export"
+      )
+      .map((entry) => entry.proof.sourceId)
+  );
+  const migrated: NonNullable<ReconciliationState["linkedWorkStatuses"]> = {};
+  for (const [issueRef, observation] of Object.entries(args.statuses)) {
+    if (
+      observation.sourceType !== "evidence-export" &&
+      !(
+        observation.sourceType === undefined &&
+        authoritativeSourceIds.has(observation.sourceId)
+      )
+    ) {
+      continue;
+    }
+    migrated[issueRef] = {
+      ...observation,
+      sourceType: "evidence-export",
+    };
+  }
+  const existingIssueRefs = new Set(Object.keys(migrated));
+  for (const entry of Object.values(args.resolutionProofs)) {
+    const proof = entry.proof;
+    if (
+      proof.kind !== "linked_work_terminal" ||
+      proof.sourceType !== "evidence-export"
+    ) {
+      continue;
+    }
+    for (const issueRef of proof.issueRefs) {
+      if (existingIssueRefs.has(issueRef)) {
+        continue;
+      }
+      const observation: LinkedWorkStatusObservation = {
+        issueRef,
+        observedAt: entry.lastSeenAt,
+        terminal: true,
+        sourceId: proof.sourceId,
+        sourceType: proof.sourceType,
+        sourceRecordId: proof.sourceRecordId,
+        ...(proof.status ? { status: proof.status } : {}),
+      };
+      const prior = migrated[issueRef];
+      if (
+        !prior ||
+        `${prior.observedAt}\n${prior.sourceRecordId}` <
+          `${observation.observedAt}\n${observation.sourceRecordId}`
+      ) {
+        migrated[issueRef] = observation;
+      }
+    }
+  }
+  return migrated;
+}
+
 function parseState(value: unknown): ReconciliationState {
   if (!isPlainObject(value) || value.version !== 1) {
     throw new Error("Unsupported reconciliation state schema");
@@ -105,6 +178,11 @@ function parseState(value: unknown): ReconciliationState {
   ) {
     throw new Error("Malformed reconciliation state schema");
   }
+  const resolutionProofs = isPlainObject(value.resolutionProofs)
+    ? (value.resolutionProofs as NonNullable<
+        ReconciliationState["resolutionProofs"]
+      >)
+    : {};
   return {
     version: 1,
     sources: value.sources as ReconciliationState["sources"],
@@ -113,16 +191,16 @@ function parseState(value: unknown): ReconciliationState {
     families: isPlainObject(value.families)
       ? (value.families as NonNullable<ReconciliationState["families"]>)
       : {},
-    resolutionProofs: isPlainObject(value.resolutionProofs)
-      ? (value.resolutionProofs as NonNullable<
-          ReconciliationState["resolutionProofs"]
-        >)
-      : {},
-    linkedWorkStatuses: isPlainObject(value.linkedWorkStatuses)
-      ? (value.linkedWorkStatuses as NonNullable<
-          ReconciliationState["linkedWorkStatuses"]
-        >)
-      : {},
+    resolutionProofs,
+    linkedWorkStatuses: migrateLinkedWorkStatuses({
+      resolutionProofs,
+      statuses: isPlainObject(value.linkedWorkStatuses)
+        ? (value.linkedWorkStatuses as Record<
+            string,
+            LegacyLinkedWorkStatusObservation
+          >)
+        : {},
+    }),
     reviews: value.reviews as ReconciliationState["reviews"],
   };
 }
@@ -147,6 +225,93 @@ async function atomicWrite(path: string, value: string): Promise<void> {
   await rename(temporaryPath, path);
 }
 
+async function lockOwnerIsLive(path: string): Promise<boolean> {
+  let ownerPid: number | undefined;
+  let recordedProcessStartedAt: string | undefined;
+  try {
+    const owner = JSON.parse(await readFile(path, "utf8")) as {
+      pid?: unknown;
+      processStartedAt?: unknown;
+    };
+    if (!(typeof owner.pid === "number" && Number.isSafeInteger(owner.pid))) {
+      return false;
+    }
+    ownerPid = owner.pid;
+    recordedProcessStartedAt =
+      typeof owner.processStartedAt === "string"
+        ? owner.processStartedAt
+        : undefined;
+    try {
+      process.kill(owner.pid, 0);
+    } catch (error) {
+      return (
+        error instanceof Error &&
+        "code" in error &&
+        (error as NodeJS.ErrnoException).code !== "ESRCH"
+      );
+    }
+  } catch {
+    return false;
+  }
+  const observedProcessStartedAt =
+    recordedProcessStartedAt && ownerPid
+      ? processStartIdentity(ownerPid)
+      : undefined;
+  return (
+    !(recordedProcessStartedAt && observedProcessStartedAt) ||
+    recordedProcessStartedAt === observedProcessStartedAt
+  );
+}
+
+async function acquireRecoveryClaim(args: {
+  lockPath: string;
+  ownerToken: string;
+  takeoverPath: string;
+}): Promise<FileHandle> {
+  try {
+    return await open(args.takeoverPath, "wx");
+  } catch (error) {
+    if (
+      !(error instanceof Error && "code" in error) ||
+      (error as NodeJS.ErrnoException).code !== "EEXIST"
+    ) {
+      throw error;
+    }
+  }
+  const info = await lstat(args.takeoverPath).catch(() => null);
+  const ageMs = info ? Date.now() - info.mtime.getTime() : 0;
+  const safeTakeoverFile = info?.isFile() === true && !info.isSymbolicLink();
+  if (
+    !safeTakeoverFile ||
+    ageMs <= RECONCILIATION_LOCK_LEASE_MS ||
+    (await lockOwnerIsLive(args.takeoverPath))
+  ) {
+    throw new Error(
+      `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
+    );
+  }
+  try {
+    await rename(
+      args.takeoverPath,
+      `${args.takeoverPath}.stale-${Date.now()}-${args.ownerToken}`
+    );
+    return await open(args.takeoverPath, "wx");
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      ["EEXIST", "ENOENT"].includes(
+        String((error as NodeJS.ErrnoException).code)
+      )
+    ) {
+      throw new Error(
+        `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
+      );
+    }
+    throw error;
+  }
+}
+
 async function withStateLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
@@ -165,20 +330,11 @@ async function withStateLock<T>(
       throw error;
     }
     const takeoverPath = `${lockPath}.takeover`;
-    let takeover: FileHandle;
-    try {
-      takeover = await open(takeoverPath, "wx");
-    } catch (takeoverError) {
-      if (
-        !(takeoverError instanceof Error && "code" in takeoverError) ||
-        (takeoverError as NodeJS.ErrnoException).code !== "EEXIST"
-      ) {
-        throw takeoverError;
-      }
-      throw new Error(
-        `Another reconciliation is recovering ${lockPath} using ${takeoverPath}`
-      );
-    }
+    const takeover = await acquireRecoveryClaim({
+      lockPath,
+      ownerToken,
+      takeoverPath,
+    });
     try {
       await takeover.writeFile(
         `${JSON.stringify({
@@ -188,6 +344,7 @@ async function withStateLock<T>(
           processStartedAt: processStartIdentity(process.pid),
         })}\n`
       );
+      await takeover.sync();
       const info = await stat(lockPath).catch(() => null);
       const ageMs = info ? Date.now() - info.mtime.getTime() : 0;
       if (!(info && ageMs > RECONCILIATION_LOCK_LEASE_MS)) {
@@ -195,46 +352,8 @@ async function withStateLock<T>(
           `Another reconciliation is already updating ${lockPath}`
         );
       }
-      let ownerAlive = false;
-      let ownerPid: number | undefined;
-      let recordedProcessStartedAt: string | undefined;
-      try {
-        const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
-          pid?: unknown;
-          processStartedAt?: unknown;
-        };
-        if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid)) {
-          ownerPid = owner.pid;
-          recordedProcessStartedAt =
-            typeof owner.processStartedAt === "string"
-              ? owner.processStartedAt
-              : undefined;
-          try {
-            process.kill(owner.pid, 0);
-            ownerAlive = true;
-          } catch (ownerError) {
-            ownerAlive =
-              ownerError instanceof Error && "code" in ownerError
-                ? (ownerError as NodeJS.ErrnoException).code !== "ESRCH"
-                : false;
-          }
-        }
-      } catch {
-        ownerAlive = false;
-      }
-      if (ownerAlive) {
-        const observedProcessStartedAt =
-          recordedProcessStartedAt && ownerPid
-            ? processStartIdentity(ownerPid)
-            : undefined;
-        if (
-          !(recordedProcessStartedAt && observedProcessStartedAt) ||
-          recordedProcessStartedAt === observedProcessStartedAt
-        ) {
-          throw new Error(
-            `A live reconciliation owner still holds ${lockPath}`
-          );
-        }
+      if (await lockOwnerIsLive(lockPath)) {
+        throw new Error(`A live reconciliation owner still holds ${lockPath}`);
       }
       await rename(lockPath, `${lockPath}.stale-${Date.now()}-${ownerToken}`);
       handle = await open(lockPath, "wx");
@@ -944,7 +1063,10 @@ function linkedWorkStatusObservations(
   records: SourceRecord[]
 ): LinkedWorkStatusObservation[] {
   return records.flatMap((record) => {
-    if (typeof record.provenance.terminal !== "boolean") {
+    if (
+      record.sourceType !== "evidence-export" ||
+      typeof record.provenance.terminal !== "boolean"
+    ) {
       return [];
     }
     return record.issueRefs.map((issueRef) => ({
@@ -952,6 +1074,7 @@ function linkedWorkStatusObservations(
       observedAt: record.observedAt,
       terminal: record.provenance.terminal as boolean,
       sourceId: record.sourceId,
+      sourceType: record.sourceType,
       sourceRecordId: record.recordId,
       ...(typeof record.provenance.status === "string"
         ? { status: record.provenance.status }
@@ -1021,6 +1144,11 @@ function resolvedSignalFamilies(args: {
       .filter((proof) => proof.kind === "default_branch_containment")
       .map((proof) => proof.evidenceKey)
   );
+  const terminalEvidenceKeys = new Set(
+    args.proofs
+      .filter((proof) => proof.kind === "linked_work_terminal")
+      .map((proof) => proof.evidenceKey)
+  );
   return Object.entries(args.state.families ?? {})
     .flatMap(([familyId, family]) => {
       const currentSignals = args.signals.filter(
@@ -1041,7 +1169,13 @@ function resolvedSignalFamilies(args: {
         ...family.evidenceKeys,
         ...currentSignals.flatMap((signal) => signal.evidenceKeys),
       ].some((key) => defaultBranchEvidenceKeys.has(key));
-      return allLinkedWorkTerminal || exactEvidenceOnDefaultBranch
+      const exactEvidenceTerminal = [
+        ...family.evidenceKeys,
+        ...currentSignals.flatMap((signal) => signal.evidenceKeys),
+      ].some((key) => terminalEvidenceKeys.has(key));
+      return allLinkedWorkTerminal ||
+        exactEvidenceOnDefaultBranch ||
+        exactEvidenceTerminal
         ? [familyId]
         : [];
     })

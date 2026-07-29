@@ -73,6 +73,7 @@ const MIGRATING_RUNTIME_LOCK_PATHS = new Set([
   "ai/project/evolution/loop/state.json.lock",
   "ai/project/evolution/loop/state.json.lock.takeover",
   "ai/project/reconciliation/state.json.lock",
+  "ai/project/reconciliation/state.json.lock.takeover",
 ]);
 const PROJECT_CONFIG_KEYS = [
   "cadence",

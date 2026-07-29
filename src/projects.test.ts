@@ -2398,6 +2398,35 @@ describe("project enrollment lifecycle", () => {
     expect(await Bun.file(oldLockPath).exists()).toBe(true);
   });
 
+  it("rejects legacy reconciliation takeover files before planning a migration", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const oldLockPath = join(
+      legacyDir,
+      "ai",
+      "project",
+      "reconciliation",
+      "state.json.lock.takeover"
+    );
+    await mkdir(dirname(oldLockPath), { recursive: true });
+    await writeFile(oldLockPath, '{"pid":123}\n', "utf8");
+
+    await expect(
+      planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      })
+    ).rejects.toThrow("Refusing to migrate active project runtime state");
+    expect(await Bun.file(oldLockPath).exists()).toBe(true);
+  });
+
   it("rejects selected runtime lock files before planning a migration", async () => {
     const { root, home } = await makeFixture();
     const repo = join(root, "repo");
@@ -2478,7 +2507,7 @@ describe("project enrollment lifecycle", () => {
       "ai",
       "project",
       "reconciliation",
-      "state.json.lock"
+      "state.json.lock.takeover"
     );
     await mkdir(dirname(oldLockPath), { recursive: true });
     await writeFile(oldLockPath, '{"pid":123}\n', "utf8");

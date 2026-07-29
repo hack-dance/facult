@@ -178,6 +178,7 @@ export interface LinkedWorkStatusObservation {
   observedAt: string;
   terminal: boolean;
   sourceId: string;
+  sourceType: ReconciliationSourceType;
   sourceRecordId: string;
   status?: string;
 }
