@@ -215,9 +215,7 @@ describe("reconciliation config", () => {
     expect(() =>
       parseReconciliationConfig({
         version: 1,
-        sources: [
-          { id: "git", type: "git", freshnessThresholdHours: 0 },
-        ],
+        sources: [{ id: "git", type: "git", freshnessThresholdHours: 0 }],
       })
     ).toThrow("freshnessThresholdHours");
     expect(() =>
@@ -1514,9 +1512,9 @@ describe("source reconciliation", () => {
     expect(review.linkedWork).toEqual(linkedWork.map(([issue]) => issue));
     expect(review.signals).toHaveLength(linkedWork.length);
     expect(review.signals.every((signal) => !signal.unresolved)).toBe(true);
-    expect(review.signals.every((signal) => signal.disposition === "resolve-watch")).toBe(
-      true
-    );
+    expect(
+      review.signals.every((signal) => signal.disposition === "resolve-watch")
+    ).toBe(true);
     expect(review.resolutionProofs).toHaveLength(linkedWork.length);
     expect(review.resolutionProofs.map((proof) => proof.status).sort()).toEqual(
       linkedWork.map(([, status]) => status).sort()

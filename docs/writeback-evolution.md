@@ -76,7 +76,8 @@ credentials:
       "id": "git",
       "type": "git",
       "repository": "project",
-      "allBranches": true,
+      "defaultBranch": "main",
+      "freshnessThresholdHours": 168,
       "paths": [".ai", "AGENTS.md", "docs"]
     },
     {
@@ -120,7 +121,7 @@ the requested review window:
       "observedAt": "2026-07-08T14:30:00Z",
       "body": "Implementation completed",
       "refs": ["EXAMPLE-123"],
-      "terminal": true
+      "status": "done"
     }
   ]
 }
@@ -132,6 +133,24 @@ file and performs no network or credential access. A separate plugin or
 user-owned exporter can produce that file from any external system.
 Missing exports, missing logs, stale sources, and adapter failures produce
 degraded coverage instead of a false empty result.
+
+Coverage and cursor freshness are separate contracts. `coverageComplete`
+means every configured source proved the requested window; it does not mean a
+stored source cursor is current. JSON, persisted reports, and readable review
+artifacts expose a typed `freshness` state independently for each source and
+for the review overall. A cursor becomes stale only when its configured
+`freshnessThresholdHours` is exceeded (168 hours by default) or a bounded Git
+check finds newer activity on the configured default branch. Newer repository
+activity is checked independently of `paths`, so a complete path-filtered scan
+cannot mask a frozen Git cursor. An unchanged stale queue item is suppressed
+after its first notification.
+
+Terminal evidence-export statuses (`done`, `completed`, `canceled`,
+`obsolete`, `duplicate`, and their supported aliases) resolve a linked signal
+family when the bounded export proves all linked work terminal. Git evidence
+resolves a family only when the exact commit or equivalent patch is contained
+on the configured default branch. Both paths preserve source provenance and
+remain read-only; they do not close tracker work, edit Git, or apply proposals.
 
 Configure file sources narrowly around append-only logs, dated runbooks, or
 research streams that represent review evidence. Date section headings as

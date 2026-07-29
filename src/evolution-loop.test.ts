@@ -569,7 +569,10 @@ describe("evolution loop", () => {
       join(project.projectRoot, "docs", "review.md"),
       "Capability review cursor baseline.\n"
     );
-    await runProjectGit({ projectRoot: project.projectRoot, argv: ["add", "docs"] });
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["add", "docs"],
+    });
     await runProjectGit({
       projectRoot: project.projectRoot,
       argv: ["commit", "--quiet", "-m", "docs: cursor baseline"],
