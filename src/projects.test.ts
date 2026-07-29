@@ -19,10 +19,13 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runFixtureGit } from "../test/git-fixture";
+import { enableEvolutionLoop, runEvolutionLoop } from "./evolution-loop";
 import {
+  facultAiEvolutionLoopLockPath,
   facultAiEvolutionReviewDir,
   facultAiGraphPath,
   facultAiIndexPath,
+  facultAiReconciliationLockPath,
   facultAiReconciliationReviewDir,
   facultAiWritebackReviewDir,
   facultConfigPath,
@@ -41,6 +44,7 @@ import {
   resolveRepositoryIdentity,
   rollbackProjectEnrollment,
 } from "./projects";
+import { reconcileSources } from "./reconciliation";
 import {
   normalizeRepositoryRemote,
   repositoryPathComparisonKey,
@@ -2236,6 +2240,163 @@ describe("project enrollment lifecycle", () => {
     }
   });
 
+  it("refuses enrollment migration while reconciliation or evolution owns runtime state", async () => {
+    for (const writer of ["reconciliation", "evolution"] as const) {
+      const { root, home } = await makeFixture();
+      const repo = join(root, `repo-${writer}`);
+      await createRepository({ path: repo, home });
+      const aiRoot = join(repo, ".ai");
+      const legacyDir = join(
+        facultLocalStateRoot(home),
+        "projects",
+        legacyMachineStateProjectKey(aiRoot, home)
+      );
+      await mkdir(join(legacyDir, "journal"), { recursive: true });
+      await writeFile(
+        join(legacyDir, "journal", "events.jsonl"),
+        `${writer} state\n`,
+        "utf8"
+      );
+      await mkdir(aiRoot, { recursive: true });
+      await writeFile(
+        join(aiRoot, "reconciliation.json"),
+        `${JSON.stringify({
+          version: 1,
+          sources: [
+            {
+              id: "runtime-export",
+              type: "evidence-export",
+              path: "evidence.json",
+            },
+          ],
+        })}\n`,
+        "utf8"
+      );
+      await writeFile(
+        join(repo, "evidence.json"),
+        `${JSON.stringify({
+          version: 1,
+          producer: "migration-lock-fixture",
+          generatedAt: "2026-01-03T00:00:00.000Z",
+          coverage: {
+            since: "2026-01-01T00:00:00.000Z",
+            until: "2026-01-02T23:59:59.999Z",
+            complete: true,
+          },
+          events: [],
+        })}\n`,
+        "utf8"
+      );
+      if (writer === "evolution") {
+        await enableEvolutionLoop({
+          homeDir: home,
+          rootDir: aiRoot,
+          now: () => new Date("2026-01-03T00:00:00.000Z"),
+        });
+      }
+      const plan = await planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      });
+      expect(plan.stateMigrations.length).toBeGreaterThan(0);
+
+      let markLocked: (() => void) | undefined;
+      const locked = new Promise<void>((resolveLocked) => {
+        markLocked = resolveLocked;
+      });
+      let releaseWriter: (() => void) | undefined;
+      const holdWriter = new Promise<void>((resolveWriter) => {
+        releaseWriter = resolveWriter;
+      });
+      const writerRun =
+        writer === "reconciliation"
+          ? reconcileSources({
+              homeDir: home,
+              rootDir: aiRoot,
+              since: "2026-01-01",
+              until: "2026-01-02",
+              onLockAcquired: async () => {
+                markLocked?.();
+                await holdWriter;
+              },
+            })
+          : runEvolutionLoop({
+              homeDir: home,
+              rootDir: aiRoot,
+              since: "2026-01-01",
+              until: "2026-01-02",
+              now: () => new Date("2026-01-03T00:00:00.000Z"),
+              onLockAcquired: async () => {
+                markLocked?.();
+                await holdWriter;
+              },
+            });
+      await locked;
+
+      const expectedLockPath =
+        writer === "reconciliation"
+          ? facultAiReconciliationLockPath(home, aiRoot)
+          : facultAiEvolutionLoopLockPath(home, aiRoot);
+      expect(await Bun.file(expectedLockPath).exists()).toBe(true);
+      await expect(
+        applyProjectEnrollment({
+          plan,
+          expectedPlanSha256: plan.planSha256,
+          homeDir: home,
+        })
+      ).rejects.toThrow("another writer holds");
+      expect(await pathEntryExists(legacyDir)).toBe(true);
+
+      releaseWriter?.();
+      await writerRun;
+      const refreshed = await planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      });
+      await applyProjectEnrollment({
+        plan: refreshed,
+        expectedPlanSha256: refreshed.planSha256,
+        homeDir: home,
+      });
+      expect(await pathEntryExists(legacyDir)).toBe(false);
+      expect(
+        await Bun.file(
+          join(facultMachineStateDir(home, aiRoot), "journal", "events.jsonl")
+        ).exists()
+      ).toBe(true);
+    }
+  });
+
+  it("rejects legacy runtime lock files before planning a migration", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const oldLockPath = join(
+      legacyDir,
+      "ai",
+      "project",
+      "evolution",
+      "loop",
+      "state.json.lock"
+    );
+    await mkdir(dirname(oldLockPath), { recursive: true });
+    await writeFile(oldLockPath, '{"pid":123}\n', "utf8");
+
+    await expect(
+      planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      })
+    ).rejects.toThrow("Refusing to migrate active project runtime state");
+    expect(await Bun.file(oldLockPath).exists()).toBe(true);
+  });
+
   it("migrates a legacy key created through an equivalent symlink spelling", async () => {
     const { root, home } = await makeFixture();
     const repo = join(root, "repo");
@@ -3598,6 +3759,42 @@ describe("project enrollment lifecycle", () => {
         (event) => event.action === "enrolled"
       )
     ).toHaveLength(1);
+  });
+
+  it("uses a bindable mutation socket when the platform temp path is long", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    let endpoint: string | undefined;
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      beforeCanonicalWrite: async () => {
+        const owner = JSON.parse(
+          await readFile(
+            join(
+              facultLocalStateRoot(home),
+              "projects",
+              "mutation.lock",
+              "owner.json"
+            ),
+            "utf8"
+          )
+        ) as { endpoint?: string };
+        endpoint = owner.endpoint;
+      },
+    });
+
+    expect(endpoint).toBeDefined();
+    if (process.platform !== "win32") {
+      expect(Buffer.byteLength(endpoint!)).toBeLessThanOrEqual(96);
+    }
   });
 
   it("refuses an older receipt after a newer enrollment of the same checkout", async () => {

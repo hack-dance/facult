@@ -39,12 +39,15 @@ import {
   facultAiActivityHistoryManifestPath,
   facultAiEvolutionLoopAuditPath,
   facultAiEvolutionLoopConfigPath,
+  facultAiEvolutionLoopLockPath,
   facultAiEvolutionLoopStatePath,
   facultAiProposalDir,
+  facultAiReconciliationLockPath,
   facultAiReconciliationStatePath,
   facultAiWritebackQueuePath,
   withFacultRootScope,
 } from "./paths";
+import { reconcileSources } from "./reconciliation";
 
 const SIGNAL_FAMILY_ID_RE = /^SF-/;
 const COMPLETED_RUN_STATUS_RE = /^(complete|degraded)$/;
@@ -197,7 +200,6 @@ async function verifyPersistedGitContainmentTransition(
   });
   const afterMerge = await runEvolutionLoop({
     ...project,
-    since: "2026-01-01T00:00:00.000Z",
     until: "2026-01-05T00:00:00.000Z",
     now: () => new Date("2026-01-05T00:00:00.000Z"),
   });
@@ -212,7 +214,6 @@ async function verifyPersistedGitContainmentTransition(
 
   const quiet = await runEvolutionLoop({
     ...project,
-    since: "2026-01-01T00:00:00.000Z",
     until: "2026-01-06T00:00:00.000Z",
     now: () => new Date("2026-01-06T00:00:00.000Z"),
   });
@@ -818,6 +819,137 @@ describe("evolution loop", () => {
     );
   });
 
+  it("resolves a queued family from proof persisted before the loop commits", async () => {
+    const project = await makeProject();
+    const evidencePath = join(project.projectRoot, "evidence.json");
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "work-export",
+            type: "evidence-export",
+            path: "evidence.json",
+          },
+        ],
+      })}\n`
+    );
+    const writeEvidence = async (args: {
+      events: unknown[];
+      generatedAt: string;
+      since: string;
+      until: string;
+    }) =>
+      await Bun.write(
+        evidencePath,
+        `${JSON.stringify({
+          version: 1,
+          producer: "persisted-resolution-fixture",
+          generatedAt: args.generatedAt,
+          coverage: {
+            since: args.since,
+            until: args.until,
+            complete: true,
+          },
+          events: args.events,
+        })}\n`
+      );
+
+    await writeEvidence({
+      generatedAt: "2026-01-03T00:00:00.000Z",
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1033-open",
+          kind: "work-item",
+          observedAt: "2026-01-02T00:00:00.000Z",
+          title: "HACK-1033 reconciliation remains open",
+          refs: ["HACK-1033"],
+        },
+      ],
+    });
+    await enableEvolutionLoop({ ...project });
+    const first = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01",
+      until: "2026-01-02",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const pending = first.queue.find(
+      (item) => item.kind === "signal" && item.linkedWork.includes("HACK-1033")
+    );
+    if (!pending?.familyId) {
+      throw new Error("Expected HACK-1033 to create a queued signal family");
+    }
+    expect(pending.state).toBe("open");
+
+    await writeEvidence({
+      generatedAt: "2026-01-05T00:00:00.000Z",
+      since: "2026-01-03T00:00:00.000Z",
+      until: "2026-01-04T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1033-done",
+          kind: "status-change",
+          observedAt: "2026-01-04T00:00:00.000Z",
+          title: "HACK-1033 is done",
+          refs: ["HACK-1033"],
+          status: "done",
+          terminal: true,
+        },
+      ],
+    });
+    const directReview = await reconcileSources({
+      ...project,
+      since: "2026-01-03",
+      until: "2026-01-04",
+      incremental: true,
+    });
+    expect(directReview.resolvedSignalFamilies).toContain(pending.familyId);
+    const stateAfterDirectReview = JSON.parse(
+      await readFile(
+        facultAiReconciliationStatePath(project.homeDir, project.rootDir),
+        "utf8"
+      )
+    ) as { resolutionProofs?: Record<string, unknown> };
+    expect(
+      Object.keys(stateAfterDirectReview.resolutionProofs ?? {})
+    ).not.toHaveLength(0);
+
+    await writeEvidence({
+      generatedAt: "2026-01-06T00:00:00.000Z",
+      since: "2026-01-02T23:59:59.999Z",
+      until: "2026-01-05T23:59:59.999Z",
+      events: [],
+    });
+    const recoveryPreview = await reconcileSources({
+      ...project,
+      since: "2026-01-04T23:59:59.999Z",
+      until: "2026-01-05T23:59:59.999Z",
+      incremental: true,
+      persist: false,
+    });
+    expect(recoveryPreview.resolvedSignalFamilies).toContain(pending.familyId);
+    const recovered = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-05T23:59:59.999Z",
+      now: () => new Date("2026-01-06T00:00:00.000Z"),
+    });
+    expect(recovered.queue.find((item) => item.id === pending.id)?.state).toBe(
+      "resolved"
+    );
+    expect(recovered.delta.resolved).toContain(pending.id);
+
+    const quiet = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-06T23:59:59.999Z",
+      now: () => new Date("2026-01-07T00:00:00.000Z"),
+    });
+    expect(quiet.delta.notifiable).not.toContain(pending.id);
+  });
+
   it("alerts once for a stale cursor while keeping complete coverage", async () => {
     const project = await makeProject();
     for (const argv of [
@@ -1182,10 +1314,16 @@ describe("evolution loop", () => {
         await readdir(dirname(reconciliationStatePath), { recursive: true })
       ).sort()
     ).toEqual(reconciliationEntriesBefore);
-    expect(await Bun.file(`${reconciliationStatePath}.lock`).exists()).toBe(
-      false
-    );
-    expect(await Bun.file(`${statePath}.lock`).exists()).toBe(false);
+    expect(
+      await Bun.file(
+        facultAiReconciliationLockPath(project.homeDir, project.rootDir)
+      ).exists()
+    ).toBe(false);
+    expect(
+      await Bun.file(
+        facultAiEvolutionLoopLockPath(project.homeDir, project.rootDir)
+      ).exists()
+    ).toBe(false);
     expect(await Bun.file(preview.artifactPath).exists()).toBe(false);
   });
 
@@ -1686,11 +1824,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const statePath = facultAiEvolutionLoopStatePath(
+    const lockPath = facultAiEvolutionLoopLockPath(
       project.homeDir,
       project.rootDir
     );
-    const lockPath = `${statePath}.lock`;
     await Bun.write(
       lockPath,
       `${JSON.stringify({ pid: process.pid, startedAt: "2026-01-03T00:00:00.000Z" })}\n`
@@ -1750,7 +1887,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
     await Bun.write(
       lockPath,
       `${JSON.stringify({ pid: 2_147_483_647, startedAt: "2026-01-01T00:00:00.000Z" })}\n`
@@ -1879,7 +2019,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
     const takeoverPath = `${lockPath}.takeover`;
     const staleOwner = `${JSON.stringify({
       pid: 2_147_483_647,
@@ -1911,7 +2054,10 @@ describe("evolution loop", () => {
   it("does not reinterpret a non-file lock-path error as stale recovery", async () => {
     const project = await makeProject();
     await enableEvolutionLoop({ ...project });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
 
     await expect(
       runEvolutionLoop({

@@ -515,6 +515,25 @@ async function configuredDefaultBranch(args: {
   );
 }
 
+export async function gitDefaultBranchContainment(args: {
+  commit: string;
+  config: GitSourceConfig;
+  projectRoot: string;
+}): Promise<{ defaultBranch: string; onDefaultBranch: boolean }> {
+  const defaultBranch = await configuredDefaultBranch({
+    config: args.config,
+    projectRoot: args.projectRoot,
+  });
+  return {
+    defaultBranch: defaultBranch.display,
+    onDefaultBranch: await gitIsAncestor({
+      commit: args.commit,
+      ancestorOf: defaultBranch.ref,
+      projectRoot: args.projectRoot,
+    }),
+  };
+}
+
 async function gitIsAncestor(args: {
   commit: string;
   ancestorOf: string;

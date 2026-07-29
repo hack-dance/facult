@@ -263,6 +263,7 @@ export interface ReconciliationState {
       firstSeenAt: string;
       lastSeenAt: string;
       sourceIds: string[];
+      sourceRecordIds?: Record<string, string[]>;
       reviewIds: string[];
       defaultBranchContainment?: Record<string, string[]>;
     }
@@ -288,6 +289,15 @@ export interface ReconciliationState {
       evidenceKeys: string[];
       reviewIds: string[];
       signalIds: string[];
+    }
+  >;
+  resolutionProofs?: Record<
+    string,
+    {
+      firstSeenAt: string;
+      lastSeenAt: string;
+      reviewIds: string[];
+      proof: ResolutionProof;
     }
   >;
   reviews: Record<

@@ -28,6 +28,7 @@ import {
 import {
   facultAiEvolutionLoopAuditPath,
   facultAiEvolutionLoopConfigPath,
+  facultAiEvolutionLoopLockPath,
   facultAiEvolutionLoopReportDir,
   facultAiEvolutionLoopStatePath,
   facultAiEvolutionReviewDir,
@@ -2074,7 +2075,7 @@ async function runEvolutionLoopScoped(args: {
     },
     updatedAt: now.toISOString(),
   };
-  const lockPath = `${facultAiEvolutionLoopStatePath(args.homeDir, args.rootDir)}.lock`;
+  const lockPath = facultAiEvolutionLoopLockPath(args.homeDir, args.rootDir);
   const execute = async (): Promise<EvolutionLoopReport> => {
     if (!args.dryRun) {
       const lockedConfig = await loadConfig(args);

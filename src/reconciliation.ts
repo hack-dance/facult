@@ -10,11 +10,15 @@ import {
 import { dirname, join } from "node:path";
 import type { WritebackDisposition } from "./ai";
 import {
+  facultAiReconciliationLockPath,
   facultAiReconciliationReviewDir,
   facultAiReconciliationStatePath,
   projectRootFromAiRoot,
 } from "./paths";
-import { reconciliationAdapterFor } from "./reconciliation-adapters";
+import {
+  gitDefaultBranchContainment,
+  reconciliationAdapterFor,
+} from "./reconciliation-adapters";
 import {
   DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS,
   loadReconciliationConfig,
@@ -71,6 +75,7 @@ function emptyState(): ReconciliationState {
     evidence: {},
     decisions: {},
     families: {},
+    resolutionProofs: {},
     reviews: {},
   };
 }
@@ -85,6 +90,8 @@ function parseState(value: unknown): ReconciliationState {
       isPlainObject(value.evidence) &&
       isPlainObject(value.decisions) &&
       (value.families === undefined || isPlainObject(value.families)) &&
+      (value.resolutionProofs === undefined ||
+        isPlainObject(value.resolutionProofs)) &&
       isPlainObject(value.reviews)
     )
   ) {
@@ -97,6 +104,11 @@ function parseState(value: unknown): ReconciliationState {
     decisions: value.decisions as ReconciliationState["decisions"],
     families: isPlainObject(value.families)
       ? (value.families as NonNullable<ReconciliationState["families"]>)
+      : {},
+    resolutionProofs: isPlainObject(value.resolutionProofs)
+      ? (value.resolutionProofs as NonNullable<
+          ReconciliationState["resolutionProofs"]
+        >)
       : {},
     reviews: value.reviews as ReconciliationState["reviews"],
   };
@@ -123,18 +135,19 @@ async function atomicWrite(path: string, value: string): Promise<void> {
 }
 
 async function withStateLock<T>(
-  statePath: string,
-  fn: () => Promise<T>
+  lockPath: string,
+  fn: () => Promise<T>,
+  onLockAcquired?: () => void | Promise<void>
 ): Promise<T> {
-  const lockPath = `${statePath}.lock`;
   await mkdir(dirname(lockPath), { recursive: true });
   let handle: FileHandle;
   try {
     handle = await open(lockPath, "wx");
   } catch {
-    throw new Error(`Another reconciliation is already updating ${statePath}`);
+    throw new Error(`Another reconciliation is already updating ${lockPath}`);
   }
   try {
+    await onLockAcquired?.();
     return await fn();
   } finally {
     await handle.close();
@@ -816,15 +829,21 @@ function resolvedSignalFamilies(args: {
   proofs: ResolutionProof[];
   signals: CorrelatedSignal[];
 }): string[] {
+  const proofs = [
+    ...Object.values(args.state.resolutionProofs ?? {}).map(
+      (entry) => entry.proof
+    ),
+    ...args.proofs,
+  ];
   const terminalIssueKeys = new Set(
-    args.proofs
+    proofs
       .filter((proof) => proof.kind === "linked_work_terminal")
       .flatMap((proof) =>
         proof.issueRefs.map((issueRef) => `issue:${issueRef}`)
       )
   );
   const defaultBranchEvidenceKeys = new Set(
-    args.proofs
+    proofs
       .filter((proof) => proof.kind === "default_branch_containment")
       .map((proof) => proof.evidenceKey)
   );
@@ -992,6 +1011,19 @@ function updateState(args: {
   }
   for (const item of args.review.evidence) {
     const prior = next.evidence[item.dedupeKey];
+    const sourceRecordIds = structuredClone(prior?.sourceRecordIds ?? {});
+    for (const sourceId of item.sourceIds) {
+      sourceRecordIds[sourceId] = unique([
+        ...(sourceRecordIds[sourceId] ?? []),
+        ...args.review.decisions
+          .filter(
+            (decision) =>
+              decision.dedupeKey === item.dedupeKey &&
+              decision.sourceId === sourceId
+          )
+          .map((decision) => decision.sourceRecordId),
+      ]);
+    }
     const defaultBranchContainment = structuredClone(
       prior?.defaultBranchContainment ?? {}
     );
@@ -1011,11 +1043,38 @@ function updateState(args: {
       firstSeenAt: prior?.firstSeenAt ?? args.review.generatedAt,
       lastSeenAt: args.review.generatedAt,
       sourceIds: unique([...(prior?.sourceIds ?? []), ...item.sourceIds]),
+      sourceRecordIds,
       reviewIds: unique([...(prior?.reviewIds ?? []), args.review.reviewId]),
       ...(Object.keys(defaultBranchContainment).length > 0
         ? { defaultBranchContainment }
         : {}),
     };
+  }
+  const resolutionProofState = next.resolutionProofs ?? {};
+  next.resolutionProofs = resolutionProofState;
+  for (const proof of args.review.resolutionProofs) {
+    const key = sha256(
+      `${proof.kind}\n${proof.sourceId}\n${proof.sourceRecordId}\n${proof.evidenceKey}`
+    );
+    const prior = resolutionProofState[key];
+    resolutionProofState[key] = {
+      firstSeenAt: prior?.firstSeenAt ?? args.review.generatedAt,
+      lastSeenAt: args.review.generatedAt,
+      reviewIds: unique([...(prior?.reviewIds ?? []), args.review.reviewId]),
+      proof,
+    };
+    if (proof.kind !== "default_branch_containment") {
+      continue;
+    }
+    const evidence = next.evidence[proof.evidenceKey];
+    if (!evidence) {
+      continue;
+    }
+    evidence.defaultBranchContainment ??= {};
+    evidence.defaultBranchContainment[proof.sourceId] = unique([
+      ...(evidence.defaultBranchContainment[proof.sourceId] ?? []),
+      proof.sourceRecordId,
+    ]);
   }
   for (const decision of args.review.decisions) {
     next.decisions[decision.id] = {
@@ -1101,6 +1160,8 @@ export async function reconcileSources(args: {
   sourceIds?: string[];
   incremental?: boolean;
   persist?: boolean;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  onLockAcquired?: () => void | Promise<void>;
 }): Promise<ReconciliationReview> {
   const { config } = await loadReconciliationConfig(args);
   const enabledSources = config.sources.filter(
@@ -1165,6 +1226,7 @@ export async function reconcileSources(args: {
     const checkedAt = new Date().toISOString();
     const coverage: SourceCoverage[] = [];
     const records: SourceRecord[] = [];
+    const recheckedResolutionProofs: ResolutionProof[] = [];
     const adapterResults = new Map<string, AdapterScanResult>();
     for (const source of selectedConfig.sources) {
       const priorState = state.sources[source.id];
@@ -1205,6 +1267,45 @@ export async function reconcileSources(args: {
           : result.watermark;
       }
       adapterResults.set(source.id, result);
+      if (source.type === "git" && projectRoot) {
+        const pendingCommits = Object.entries(state.evidence).flatMap(
+          ([evidenceKey, evidence]) =>
+            (evidence.sourceRecordIds?.[source.id] ?? [])
+              .filter(
+                (recordId) =>
+                  !evidence.defaultBranchContainment?.[source.id]?.includes(
+                    recordId
+                  )
+              )
+              .map((recordId) => ({ evidenceKey, recordId }))
+        );
+        for (const pending of pendingCommits) {
+          const containment = await gitDefaultBranchContainment({
+            commit: pending.recordId,
+            config: source,
+            projectRoot,
+          });
+          if (!containment.onDefaultBranch) {
+            continue;
+          }
+          recheckedResolutionProofs.push({
+            sourceId: source.id,
+            sourceType: "git",
+            sourceRecordId: pending.recordId,
+            kind: "default_branch_containment",
+            issueRefs: [],
+            evidenceKey: pending.evidenceKey,
+            provenance: {
+              repository: projectRoot,
+              commit: pending.recordId,
+              defaultBranch: containment.defaultBranch,
+              onDefaultBranch: true,
+              terminal: true,
+              rechecked: true,
+            },
+          });
+        }
+      }
       const reviewRecords = args.incremental
         ? result.records.filter(
             (record) =>
@@ -1287,7 +1388,7 @@ export async function reconcileSources(args: {
           : coverageComplete
             ? "Zero signals discovered after every configured source was checked for this review window."
             : "No signals are reported, but configured coverage is degraded; this is not a proven empty review.";
-    const proofs = resolutionProofs(records);
+    const proofs = [...resolutionProofs(records), ...recheckedResolutionProofs];
     const review: ReconciliationReview = {
       version: 1,
       reviewId: window.id,
@@ -1341,7 +1442,11 @@ export async function reconcileSources(args: {
   };
   return args.persist === false
     ? await execute()
-    : await withStateLock(statePath, execute);
+    : await withStateLock(
+        facultAiReconciliationLockPath(args.homeDir, args.rootDir),
+        execute,
+        args.onLockAcquired
+      );
 }
 
 export async function reconciliationStatus(args: {
