@@ -2728,7 +2728,7 @@ describe("project enrollment lifecycle", () => {
       homeDir: home,
       afterLegacyStateQuarantine: async ({ quarantine, source }) => {
         quarantinePath = quarantine;
-        expect(await pathEntryExists(source)).toBe(false);
+        expect((await lstat(source)).isDirectory()).toBe(true);
         expect((await lstat(quarantine)).isDirectory()).toBe(true);
       },
     });
@@ -3103,6 +3103,64 @@ describe("project enrollment lifecycle", () => {
         })
       ).stateMigrations
     ).toEqual([]);
+  });
+
+  it("retains both original legacy writer guards through quarantine cleanup", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    const legacyJournal = join(legacyState, "journal", "events.jsonl");
+    const selectedQueue = join(selectedState, "review", "queue.jsonl");
+    const legacyLocks = [
+      join(legacyState, "ai/project/evolution/loop/state.json.lock"),
+      join(legacyState, "ai/project/reconciliation/state.json.lock"),
+    ];
+    await mkdir(dirname(legacyJournal), { recursive: true });
+    await writeFile(legacyJournal, "legacy journal\n", "utf8");
+    await mkdir(dirname(selectedQueue), { recursive: true });
+    await writeFile(selectedQueue, "selected queue\n", "utf8");
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const blockedLocks = new Set<string>();
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      afterLegacyStateQuarantine: async ({ source }) => {
+        expect(source).toBe(legacyState);
+        for (const pathValue of legacyLocks) {
+          try {
+            const competitor = await open(pathValue, "wx");
+            await competitor.close();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              (error as NodeJS.ErrnoException).code === "EEXIST"
+            ) {
+              blockedLocks.add(pathValue);
+            }
+          }
+        }
+      },
+    });
+
+    expect(blockedLocks).toEqual(new Set(legacyLocks));
+    expect(await pathEntryExists(legacyState)).toBe(false);
+    expect(await Bun.file(legacyJournal).exists()).toBe(false);
+    expect(
+      await Bun.file(join(selectedState, "journal", "events.jsonl")).text()
+    ).toBe("legacy journal\n");
   });
 
   it("compensates a legacy source reappearance after quarantine", async () => {

@@ -99,6 +99,24 @@ type LegacyLinkedWorkStatusObservation = Omit<
   sourceType?: ReconciliationSourceType;
 };
 
+function compareLinkedWorkStatusObservations(
+  left: LinkedWorkStatusObservation,
+  right: LinkedWorkStatusObservation
+): number {
+  const leftInstant = Date.parse(left.observedAt);
+  const rightInstant = Date.parse(right.observedAt);
+  if (Number.isFinite(leftInstant) && Number.isFinite(rightInstant)) {
+    return (
+      leftInstant - rightInstant ||
+      left.sourceRecordId.localeCompare(right.sourceRecordId)
+    );
+  }
+  return (
+    left.observedAt.localeCompare(right.observedAt) ||
+    left.sourceRecordId.localeCompare(right.sourceRecordId)
+  );
+}
+
 function migrateLinkedWorkStatuses(args: {
   resolutionProofs: NonNullable<ReconciliationState["resolutionProofs"]>;
   statuses: Record<string, LegacyLinkedWorkStatusObservation>;
@@ -154,8 +172,7 @@ function migrateLinkedWorkStatuses(args: {
       const prior = migrated[issueRef];
       if (
         !prior ||
-        `${prior.observedAt}\n${prior.sourceRecordId}` <
-          `${observation.observedAt}\n${observation.sourceRecordId}`
+        compareLinkedWorkStatusObservations(prior, observation) < 0
       ) {
         migrated[issueRef] = observation;
       }
@@ -1225,11 +1242,40 @@ function linkedWorkStatusObservations(
   });
 }
 
+function persistedLinkedWorkStatusesForConfig(args: {
+  config: ReconciliationConfig;
+  state: ReconciliationState;
+}): NonNullable<ReconciliationState["linkedWorkStatuses"]> {
+  const authoritativeSourceIds = new Set(
+    args.config.sources.flatMap((source) => {
+      const prior = args.state.sources[source.id];
+      return source.type === "evidence-export" &&
+        prior?.configDigest === sourceStateDigest(source) &&
+        prior.adapterVersion === reconciliationAdapterFor(source.type).version
+        ? [source.id]
+        : [];
+    })
+  );
+  return Object.fromEntries(
+    Object.entries(args.state.linkedWorkStatuses ?? {}).filter(
+      ([, observation]) => authoritativeSourceIds.has(observation.sourceId)
+    )
+  );
+}
+
 function latestLinkedWorkStatuses(args: {
+  config: ReconciliationConfig;
   state: ReconciliationState;
   observations: LinkedWorkStatusObservation[];
 }): Map<string, LinkedWorkStatusObservation> {
-  const latest = new Map(Object.entries(args.state.linkedWorkStatuses ?? {}));
+  const latest = new Map(
+    Object.entries(
+      persistedLinkedWorkStatusesForConfig({
+        config: args.config,
+        state: args.state,
+      })
+    )
+  );
   const observationsByIssue = new Map<string, LinkedWorkStatusObservation[]>();
   for (const observation of args.observations) {
     const observations = observationsByIssue.get(observation.issueRef) ?? [];
@@ -1253,10 +1299,8 @@ function mergeLinkedWorkStatusObservations(args: {
   prior?: LinkedWorkStatusObservation;
 }): LinkedWorkStatusObservation | undefined {
   let latest = args.prior;
-  const observations = [...args.observations].sort((left, right) =>
-    `${left.observedAt}\n${left.sourceRecordId}`.localeCompare(
-      `${right.observedAt}\n${right.sourceRecordId}`
-    )
+  const observations = [...args.observations].sort(
+    compareLinkedWorkStatusObservations
   );
   for (const observation of observations) {
     if (latest?.ordering === "unknown") {
@@ -1268,11 +1312,10 @@ function mergeLinkedWorkStatusObservations(args: {
       }
       continue;
     }
-    const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
-    const priorKey = latest
-      ? `${latest.observedAt}\n${latest.sourceRecordId}`
-      : undefined;
-    if (!(priorKey && priorKey > observationKey)) {
+    if (
+      !latest ||
+      compareLinkedWorkStatusObservations(latest, observation) <= 0
+    ) {
       latest = observation;
     }
   }
@@ -1303,12 +1346,14 @@ function resolutionProofs(records: SourceRecord[]): ResolutionProof[] {
 }
 
 function resolvedSignalFamilies(args: {
+  config: ReconciliationConfig;
   state: ReconciliationState;
   proofs: ResolutionProof[];
   signals: CorrelatedSignal[];
   linkedWorkStatuses: LinkedWorkStatusObservation[];
 }): string[] {
   const latestStatuses = latestLinkedWorkStatuses({
+    config: args.config,
     state: args.state,
     observations: args.linkedWorkStatuses,
   });
@@ -1453,6 +1498,7 @@ function updateState(args: {
   review: ReconciliationReview;
   adapterResults: Map<string, AdapterScanResult>;
   config: ReconciliationConfig;
+  statusConfig: ReconciliationConfig;
 }): ReconciliationState {
   const next = structuredClone(args.state);
   for (const coverage of args.review.coverage) {
@@ -1543,7 +1589,10 @@ function updateState(args: {
   }
   const resolutionProofState = next.resolutionProofs ?? {};
   next.resolutionProofs = resolutionProofState;
-  const linkedWorkStatusState = next.linkedWorkStatuses ?? {};
+  const linkedWorkStatusState = persistedLinkedWorkStatusesForConfig({
+    config: args.statusConfig,
+    state: args.state,
+  });
   next.linkedWorkStatuses = linkedWorkStatusState;
   const linkedWorkObservationsByIssue = new Map<
     string,
@@ -1683,6 +1732,10 @@ export async function reconcileSources(args: {
   const enabledSources = config.sources.filter(
     (source) => source.enabled !== false
   );
+  const enabledConfig: ReconciliationConfig = {
+    version: 1,
+    sources: enabledSources,
+  };
   const unknownSourceIds = (args.sourceIds ?? []).filter(
     (sourceId) => !enabledSources.some((source) => source.id === sourceId)
   );
@@ -1783,7 +1836,11 @@ export async function reconcileSources(args: {
           : result.watermark;
       }
       adapterResults.set(source.id, result);
-      if (source.type === "git" && projectRoot) {
+      if (
+        source.type === "git" &&
+        projectRoot &&
+        result.state !== "unavailable"
+      ) {
         const pendingCommits = Object.entries(state.evidence).flatMap(
           ([evidenceKey, evidence]) =>
             (evidence.sourceRecordIds?.[source.id] ?? []).map((recordId) => ({
@@ -1791,31 +1848,41 @@ export async function reconcileSources(args: {
               recordId,
             }))
         );
-        for (const pending of pendingCommits) {
-          const containment = await gitDefaultBranchContainment({
-            commit: pending.recordId,
-            config: source,
-            projectRoot,
-          });
-          if (!containment.onDefaultBranch) {
-            continue;
-          }
-          recheckedResolutionProofs.push({
-            sourceId: source.id,
-            sourceType: "git",
-            sourceRecordId: pending.recordId,
-            kind: "default_branch_containment",
-            issueRefs: [],
-            evidenceKey: pending.evidenceKey,
-            provenance: {
-              repository: projectRoot,
+        const sourceRecheckedProofs: ResolutionProof[] = [];
+        try {
+          for (const pending of pendingCommits) {
+            const containment = await gitDefaultBranchContainment({
               commit: pending.recordId,
-              defaultBranch: containment.defaultBranch,
-              onDefaultBranch: true,
-              terminal: true,
-              rechecked: true,
-            },
-          });
+              config: source,
+              projectRoot,
+            });
+            if (!containment.onDefaultBranch) {
+              continue;
+            }
+            sourceRecheckedProofs.push({
+              sourceId: source.id,
+              sourceType: "git",
+              sourceRecordId: pending.recordId,
+              kind: "default_branch_containment",
+              issueRefs: [],
+              evidenceKey: pending.evidenceKey,
+              provenance: {
+                repository: projectRoot,
+                commit: pending.recordId,
+                defaultBranch: containment.defaultBranch,
+                onDefaultBranch: true,
+                terminal: true,
+                rechecked: true,
+              },
+            });
+          }
+          recheckedResolutionProofs.push(...sourceRecheckedProofs);
+        } catch (error) {
+          result.state = "unavailable";
+          result.records = [];
+          result.unavailableReason = `Default-branch containment recheck failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`;
         }
       }
       const reviewRecords = args.incremental
@@ -1918,6 +1985,7 @@ export async function reconcileSources(args: {
       resolutionProofs: proofs,
       linkedWorkStatuses,
       resolvedSignalFamilies: resolvedSignalFamilies({
+        config: enabledConfig,
         state,
         proofs,
         signals: correlated.signals,
@@ -1947,6 +2015,7 @@ export async function reconcileSources(args: {
         review,
         adapterResults,
         config: selectedConfig,
+        statusConfig: enabledConfig,
       });
       if (latestReviewId(nextState) === review.reviewId) {
         await atomicWrite(join(reviewDir, "latest.md"), markdown);

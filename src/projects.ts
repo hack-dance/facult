@@ -2451,6 +2451,103 @@ async function migrateLegacyProjectState(args: {
     await rmdir(root);
   };
 
+  const quarantineExpectedDirectories = (
+    files: RebuildableFileBackup[]
+  ): Set<string> => {
+    const directories = new Set<string>(["."]);
+    for (const file of files) {
+      let parent = dirname(file.relativePath);
+      while (parent !== ".") {
+        directories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    return directories;
+  };
+
+  const assertQuarantinedFiles = async (
+    quarantine: QuarantinedSource,
+    requireAll: boolean
+  ): Promise<void> => {
+    const metadata = await lstatIfExists(quarantine.path);
+    if (
+      !metadata ||
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      metadata.dev !== quarantine.dev ||
+      metadata.ino !== quarantine.ino
+    ) {
+      throw new Error(
+        `Quarantined legacy project state binding changed: ${quarantine.path}`
+      );
+    }
+    const expectedFiles = new Map(
+      quarantine.files.map((file) => [file.relativePath, file])
+    );
+    const expectedDirectories = quarantineExpectedDirectories(quarantine.files);
+    const tree = await inspectProjectStateTree(quarantine.path);
+    for (const entry of tree.entries) {
+      if (
+        (entry.type === "file" && !expectedFiles.has(entry.path)) ||
+        (entry.type === "directory" && !expectedDirectories.has(entry.path))
+      ) {
+        throw new Error(
+          `Quarantined legacy project state changed: ${quarantine.path}`
+        );
+      }
+    }
+    const actualFiles = tree.entries.filter((entry) => entry.type === "file");
+    if (requireAll && actualFiles.length !== quarantine.files.length) {
+      throw new Error(
+        `Quarantined legacy project state changed: ${quarantine.path}`
+      );
+    }
+    for (const entry of actualFiles) {
+      const expected = expectedFiles.get(entry.path);
+      if (
+        !expected ||
+        entry.sha256 !== expected.sha256 ||
+        entry.mode !== expected.mode
+      ) {
+        throw new Error(
+          `Quarantined legacy project state changed: ${join(quarantine.path, entry.path)}`
+        );
+      }
+    }
+  };
+
+  const removeEmptyUnguardedSourceDirectories = async (
+    entry: CompletedMigration
+  ): Promise<void> => {
+    const ignoredPaths = [...ignoredEntriesFor(entry.source).keys()];
+    const guardedDirectories = new Set<string>(["."]);
+    for (const pathValue of ignoredPaths) {
+      let parent = dirname(pathValue);
+      while (parent !== ".") {
+        guardedDirectories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    const tree = await inspectProjectStateTree(
+      entry.source,
+      ignoredEntriesFor(entry.source)
+    );
+    for (const directory of tree.entries
+      .filter(
+        (item) =>
+          item.type === "directory" &&
+          item.path !== "." &&
+          !guardedDirectories.has(item.path)
+      )
+      .sort(
+        (left, right) =>
+          right.path.split("/").length - left.path.split("/").length ||
+          right.path.localeCompare(left.path)
+      )) {
+      await rmdir(join(entry.source, directory.path));
+    }
+  };
+
   const treeContainsReviewedEntries = (
     tree: ProjectStateTree,
     reviewed: ProjectStateTreeEntry[],
@@ -2480,25 +2577,35 @@ async function migrateLegacyProjectState(args: {
     const quarantined = await lstatIfExists(quarantine.path);
     if (quarantined) {
       if (
-        quarantined.isSymbolicLink() ||
-        !quarantined.isDirectory() ||
-        quarantined.dev !== quarantine.dev ||
-        quarantined.ino !== quarantine.ino
+        !source ||
+        source.dev !== entry.sourceDev ||
+        source.ino !== entry.sourceIno
       ) {
         throw new Error(
-          `Quarantined legacy project state changed before compensation: ${quarantine.path}`
+          `Legacy project state path changed before compensation: ${entry.source}`
         );
       }
-      if (source) {
-        await args.runtimeLocks?.releaseSource(entry.source);
-        await mergeDisjoint(quarantine.path, entry.source, "", [], new Set());
-        await removeEmptyStateTree(quarantine.path);
-      } else {
-        await rename(quarantine.path, entry.source);
-        args.runtimeLocks?.relocate(entry.source, entry.source);
+      await assertQuarantinedFiles(quarantine, false);
+      for (const file of quarantine.files) {
+        const quarantineFile = join(quarantine.path, file.relativePath);
+        const sourceFile = join(entry.source, file.relativePath);
+        const quarantinedFile = await lstatIfExists(quarantineFile);
+        if (!quarantinedFile) {
+          continue;
+        }
+        if (await lstatIfExists(sourceFile)) {
+          throw new Error(
+            `Legacy rebuildable state was recreated during compensation: ${sourceFile}`
+          );
+        }
+        await mkdir(dirname(sourceFile), { recursive: true, mode: 0o700 });
+        await rename(quarantineFile, sourceFile);
       }
+      await removeEmptyStateTree(quarantine.path);
     } else if (!source) {
-      await mkdir(entry.source, { recursive: true, mode: 0o700 });
+      throw new Error(
+        `Legacy project state path disappeared before compensation: ${entry.source}`
+      );
     }
   };
 
@@ -2999,74 +3106,46 @@ async function migrateLegacyProjectState(args: {
           `Legacy project state changed before quarantine: ${entry.source}`
         );
       }
-      await rename(entry.source, quarantinePath);
-      args.runtimeLocks?.relocate(entry.source, quarantinePath);
+      const rootMode =
+        remaining.entries.find((item) => item.path === ".")?.mode ?? 0o700;
+      await mkdir(quarantinePath, { mode: rootMode });
+      const quarantineRoot = await lstat(quarantinePath);
       entry.quarantine = {
-        dev: entry.sourceDev,
+        dev: quarantineRoot.dev,
         files,
-        ino: entry.sourceIno,
+        ino: quarantineRoot.ino,
         path: quarantinePath,
       };
-      const quarantined = await lstatIfExists(quarantinePath);
-      if (
-        !quarantined ||
-        quarantined.isSymbolicLink() ||
-        !quarantined.isDirectory() ||
-        quarantined.dev !== entry.sourceDev ||
-        quarantined.ino !== entry.sourceIno ||
-        (
-          await inspectProjectStateTree(
-            quarantinePath,
-            ignoredEntriesFor(entry.source)
-          )
-        ).sha256 !== remaining.sha256 ||
-        (await lstatIfExists(entry.source))
-      ) {
-        throw new Error(
-          `Legacy project state changed at quarantine boundary: ${entry.source}`
-        );
+      await chmod(quarantinePath, rootMode);
+      for (const file of files) {
+        const sourceFile = join(entry.source, file.relativePath);
+        const quarantineFile = join(quarantinePath, file.relativePath);
+        await mkdir(dirname(quarantineFile), {
+          recursive: true,
+          mode: 0o700,
+        });
+        await rename(sourceFile, quarantineFile);
       }
+      await removeEmptyUnguardedSourceDirectories(entry);
+      await assertGuardedSourceRemainder(entry);
+      await assertQuarantinedFiles(entry.quarantine, true);
       await args.afterQuarantine?.({
         destination: entry.destination,
         index,
         quarantine: quarantinePath,
         source: entry.source,
       });
-      if (
-        (await lstatIfExists(entry.source)) ||
-        (
-          await inspectProjectStateTree(
-            quarantinePath,
-            ignoredEntriesFor(entry.source)
-          )
-        ).sha256 !== remaining.sha256
-      ) {
+      try {
+        await assertGuardedSourceRemainder(entry);
+        await assertQuarantinedFiles(entry.quarantine, true);
+      } catch {
         throw new Error(
           `Legacy project state changed after quarantine: ${entry.source}`
         );
       }
-      const assertQuarantineBinding = async (): Promise<void> => {
-        const current = await lstatIfExists(quarantinePath);
-        if (
-          !current ||
-          current.isSymbolicLink() ||
-          !current.isDirectory() ||
-          current.dev !== entry.sourceDev ||
-          current.ino !== entry.sourceIno
-        ) {
-          throw new Error(
-            `Quarantined legacy project state binding changed: ${quarantinePath}`
-          );
-        }
-      };
-      await args.runtimeLocks?.releaseSource(entry.source);
       for (const file of files) {
-        if (await lstatIfExists(entry.source)) {
-          throw new Error(
-            `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-          );
-        }
-        await assertQuarantineBinding();
+        await assertGuardedSourceRemainder(entry);
+        await assertQuarantinedFiles(entry.quarantine, false);
         await unlinkVerifiedFileAt({
           directoryPath: dirname(join(quarantinePath, file.relativePath)),
           expectedSha256: file.sha256,
@@ -3083,26 +3162,16 @@ async function migrateLegacyProjectState(args: {
             right.path.localeCompare(left.path)
         );
       for (const directory of directories) {
-        if (await lstatIfExists(entry.source)) {
-          throw new Error(
-            `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-          );
+        const pathValue = join(quarantinePath, directory.path);
+        if (await lstatIfExists(pathValue)) {
+          await assertGuardedSourceRemainder(entry);
+          await rmdir(pathValue);
         }
-        await assertQuarantineBinding();
-        await rmdir(join(quarantinePath, directory.path));
       }
-      if (await lstatIfExists(entry.source)) {
-        throw new Error(
-          `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-        );
-      }
-      await assertQuarantineBinding();
+      await assertGuardedSourceRemainder(entry);
       await rmdir(quarantinePath);
-      if (await lstatIfExists(entry.source)) {
-        throw new Error(
-          `Legacy project state path reappeared after quarantine cleanup: ${entry.source}`
-        );
-      }
+      await assertGuardedSourceRemainder(entry);
+      await args.runtimeLocks?.releaseSource(entry.source);
     }
     for (const candidate of pending) {
       if (candidate.kind === "guarded-content-move") {
