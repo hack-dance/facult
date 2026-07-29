@@ -41,6 +41,7 @@ import type {
   CorrelatedSignal,
   ReconciliationFreshness,
   ReconciliationReview,
+  ResolutionProof,
   SourceCoverage,
 } from "./reconciliation-types";
 import {
@@ -1030,7 +1031,7 @@ function reconcileQueue(args: {
   prior: EvolutionLoopState;
   generatedAt: string;
   coverageComplete: boolean;
-  resolvedEvidenceKeys: string[];
+  resolutionProofs: ResolutionProof[];
   resolvedSignalFamilies: string[];
 }): {
   queue: Record<string, LoopQueueItem>;
@@ -1042,7 +1043,11 @@ function reconcileQueue(args: {
   const newIds: string[] = [];
   const changedIds: string[] = [];
   const resolvedIds: string[] = [];
-  const resolvedEvidenceKeys = new Set(args.resolvedEvidenceKeys);
+  const containedEvidenceKeys = new Set(
+    args.resolutionProofs
+      .filter((proof) => proof.kind === "default_branch_containment")
+      .map((proof) => proof.evidenceKey)
+  );
   const resolvedSignalFamilies = new Set(args.resolvedSignalFamilies);
   let unchangedSuppressed = 0;
   for (const raw of args.current) {
@@ -1104,7 +1109,7 @@ function reconcileQueue(args: {
     }
     const signalHasResolutionProof =
       prior.kind === "signal" &&
-      (prior.evidenceRefs.some((key) => resolvedEvidenceKeys.has(key)) ||
+      (prior.evidenceRefs.some((key) => containedEvidenceKeys.has(key)) ||
         Boolean(prior.familyId && resolvedSignalFamilies.has(prior.familyId)));
     if (
       !args.coverageComplete ||
@@ -2174,7 +2179,7 @@ async function runEvolutionLoopScoped(args: {
         prior,
         generatedAt,
         coverageComplete: review.coverageComplete,
-        resolvedEvidenceKeys: review.resolvedEvidenceKeys ?? [],
+        resolutionProofs: review.resolutionProofs ?? [],
         resolvedSignalFamilies: review.resolvedSignalFamilies ?? [],
       });
       const generationAfter = prior.generation + (args.dryRun ? 0 : 1);

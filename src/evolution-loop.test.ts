@@ -112,6 +112,113 @@ async function runProjectGit(args: {
   }
 }
 
+async function verifyPersistedGitContainmentTransition(
+  strategy: "fast-forward" | "merge-commit"
+) {
+  const project = await makeProject();
+  for (const argv of [
+    ["init", "--quiet", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+  ]) {
+    await runProjectGit({ projectRoot: project.projectRoot, argv });
+  }
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["commit", "--allow-empty", "--quiet", "-m", "chore: base"],
+    date: "2026-01-01T12:00:00.000Z",
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["switch", "--quiet", "-c", "feature"],
+  });
+  const capabilityPath = join(
+    project.rootDir,
+    "instructions",
+    "RECONCILIATION.md"
+  );
+  await mkdir(dirname(capabilityPath), { recursive: true });
+  await Bun.write(
+    capabilityPath,
+    "# Reconciliation\n\nCapability implementation linked to HACK-1033.\n"
+  );
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["add", ".ai/instructions"],
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["commit", "--quiet", "-m", "feat: add HACK-1033 reconciliation"],
+    date: "2026-01-02T12:00:00.000Z",
+  });
+  await Bun.write(
+    join(project.rootDir, "reconciliation.json"),
+    `${JSON.stringify({
+      version: 1,
+      sources: [
+        {
+          id: "git",
+          type: "git",
+          allBranches: true,
+          defaultBranch: "main",
+          paths: [".ai/instructions"],
+        },
+      ],
+    })}\n`
+  );
+  await enableEvolutionLoop({
+    ...project,
+    now: () => new Date("2026-01-03T00:00:00.000Z"),
+  });
+  const beforeMerge = await runEvolutionLoop({
+    ...project,
+    since: "2026-01-01T00:00:00.000Z",
+    until: "2026-01-03T00:00:00.000Z",
+    now: () => new Date("2026-01-03T00:00:00.000Z"),
+  });
+  const pending = beforeMerge.queue.find(
+    (item) => item.kind === "signal" && item.linkedWork.includes("HACK-1033")
+  );
+  if (!pending) {
+    throw new Error("Expected the feature commit to create a pending signal");
+  }
+
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["switch", "--quiet", "main"],
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv:
+      strategy === "fast-forward"
+        ? ["merge", "--ff-only", "feature"]
+        : ["merge", "--no-ff", "--no-edit", "feature"],
+    date: "2026-01-04T12:00:00.000Z",
+  });
+  const afterMerge = await runEvolutionLoop({
+    ...project,
+    since: "2026-01-01T00:00:00.000Z",
+    until: "2026-01-05T00:00:00.000Z",
+    now: () => new Date("2026-01-05T00:00:00.000Z"),
+  });
+  const resolved = afterMerge.queue.find((item) => item.id === pending.id);
+
+  const reconciliationState = JSON.parse(
+    await readFile(
+      facultAiReconciliationStatePath(project.homeDir, project.rootDir),
+      "utf8"
+    )
+  );
+
+  const quiet = await runEvolutionLoop({
+    ...project,
+    since: "2026-01-01T00:00:00.000Z",
+    until: "2026-01-06T00:00:00.000Z",
+    now: () => new Date("2026-01-06T00:00:00.000Z"),
+  });
+  return { afterMerge, pending, quiet, reconciliationState, resolved };
+}
+
 afterEach(async () => {
   for (const root of temporaryRoots.splice(0)) {
     await rm(root, { recursive: true, force: true });
@@ -553,6 +660,162 @@ describe("evolution loop", () => {
       "resolved"
     );
     expect(quiet.delta.notifiable).toHaveLength(0);
+  });
+
+  for (const [strategy, label] of [
+    ["fast-forward", "fast-forward merge"],
+    ["merge-commit", "merge commit"],
+  ] as const) {
+    it(`resolves persisted feature evidence after a ${label}`, async () => {
+      const result = await verifyPersistedGitContainmentTransition(strategy);
+
+      expect(result.pending.state).not.toBe("resolved");
+      expect(result.resolved).toMatchObject({
+        state: "resolved",
+        linkedWork: expect.arrayContaining(["HACK-1033"]),
+      });
+      expect(result.afterMerge.delta.resolved).toContain(result.pending.id);
+      expect(
+        Object.values(result.reconciliationState.evidence).some(
+          (entry) =>
+            typeof entry === "object" &&
+            entry !== null &&
+            "defaultBranchContainment" in entry
+        )
+      ).toBe(true);
+      expect(
+        result.quiet.queue.find((item) => item.id === result.pending.id)?.state
+      ).toBe("resolved");
+      expect(result.quiet.delta.notifiable).not.toContain(result.pending.id);
+    });
+  }
+
+  it("keeps a multi-issue family open when only one linked issue is terminal", async () => {
+    const project = await makeProject();
+    const evidencePath = join(project.projectRoot, "evidence.json");
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "work-export",
+            type: "evidence-export",
+            path: "evidence.json",
+          },
+        ],
+      })}\n`
+    );
+    const writeEvidence = async (args: {
+      generatedAt: string;
+      until: string;
+      events: unknown[];
+    }): Promise<void> => {
+      await Bun.write(
+        evidencePath,
+        `${JSON.stringify({
+          version: 1,
+          producer: "multi-issue-fixture",
+          generatedAt: args.generatedAt,
+          coverage: {
+            since: "2026-01-01T00:00:00.000Z",
+            until: args.until,
+            complete: true,
+          },
+          events: args.events,
+        })}\n`
+      );
+    };
+    await writeEvidence({
+      generatedAt: "2026-01-03T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      events: [
+        {
+          id: "family-open",
+          kind: "work-item",
+          observedAt: "2026-01-02T00:00:00.000Z",
+          title: "Capability implementation remains open",
+          refs: ["HACK-1101", "HACK-1102"],
+        },
+      ],
+    });
+    await enableEvolutionLoop({
+      ...project,
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const first = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const family = first.queue.find(
+      (item) =>
+        item.kind === "signal" &&
+        item.linkedWork.includes("HACK-1101") &&
+        item.linkedWork.includes("HACK-1102")
+    );
+    expect(family).toMatchObject({ state: "open" });
+
+    await writeEvidence({
+      generatedAt: "2026-01-05T00:00:00.000Z",
+      until: "2026-01-04T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1101-done",
+          kind: "status-change",
+          observedAt: "2026-01-04T00:00:00.000Z",
+          title: "HACK-1101 is done",
+          refs: ["HACK-1101"],
+          status: "done",
+        },
+      ],
+    });
+    const partial = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-04T23:59:59.999Z",
+      now: () => new Date("2026-01-05T00:00:00.000Z"),
+    });
+    const partialFamily = partial.queue.find((item) => item.id === family?.id);
+    expect(partialFamily).toMatchObject({
+      state: "open",
+      linkedWork: ["HACK-1101", "HACK-1102"],
+    });
+    expect(partial.delta.resolved).not.toContain(family?.id);
+
+    await writeEvidence({
+      generatedAt: "2026-01-07T00:00:00.000Z",
+      until: "2026-01-06T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1101-confirmed",
+          kind: "status-change",
+          observedAt: "2026-01-06T00:00:00.000Z",
+          title: "HACK-1101 remains done",
+          refs: ["HACK-1101"],
+          status: "done",
+        },
+        {
+          id: "hack-1102-done",
+          kind: "status-change",
+          observedAt: "2026-01-06T01:00:00.000Z",
+          title: "HACK-1102 is done",
+          refs: ["HACK-1102"],
+          status: "done",
+        },
+      ],
+    });
+    const terminal = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-06T23:59:59.999Z",
+      now: () => new Date("2026-01-07T00:00:00.000Z"),
+    });
+    expect(terminal.queue.find((item) => item.id === family?.id)).toMatchObject(
+      {
+        state: "resolved",
+        linkedWork: ["HACK-1101", "HACK-1102"],
+      }
+    );
   });
 
   it("alerts once for a stale cursor while keeping complete coverage", async () => {

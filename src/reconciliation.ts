@@ -324,12 +324,42 @@ function dispositionFor(args: {
         "Preserved the explicit disposition from the latest writeback state",
     };
   }
-  if (args.records.some((record) => record.provenance.terminal === true)) {
+  const exactImplementationOnDefaultBranch = args.records.some(
+    (record) =>
+      record.sourceType === "git" && record.provenance.onDefaultBranch === true
+  );
+  const terminalIssueRefs = new Set(
+    args.records
+      .filter(
+        (record) =>
+          record.provenance.terminal === true &&
+          !(
+            record.sourceType === "git" &&
+            record.provenance.onDefaultBranch === true
+          )
+      )
+      .flatMap((record) => record.issueRefs)
+  );
+  const hasTerminalLinkedWork = terminalIssueRefs.size > 0;
+  const allLinkedWorkTerminal =
+    args.issueRefs.length > 0 &&
+    args.issueRefs.every((issueRef) => terminalIssueRefs.has(issueRef));
+  if (exactImplementationOnDefaultBranch || allLinkedWorkTerminal) {
     return {
       disposition: "resolve-watch",
       target: args.issueRefs[0] ?? args.assetRefs[0],
       rationale:
         "Bounded current-source evidence proves the linked work is terminal or the exact implementation is on the default branch",
+    };
+  }
+  if (hasTerminalLinkedWork) {
+    return {
+      disposition: "task",
+      target: args.issueRefs.find(
+        (issueRef) => !terminalIssueRefs.has(issueRef)
+      ),
+      rationale:
+        "Some linked work is terminal, but the full prior and current linked-work family is not terminal",
     };
   }
   if (args.classifications.includes("capability-implementation")) {
@@ -529,15 +559,8 @@ function correlate(args: {
       )
       .map((entry) => entry.record);
     const assetRefs = unique(items.flatMap((item) => item.assetRefs));
-    const issueRefs = unique(items.flatMap((item) => item.issueRefs));
     const writebackRefs = unique(items.flatMap((item) => item.writebackRefs));
     const classifications = unique(items.map((item) => item.classification));
-    const disposition = dispositionFor({
-      records,
-      classifications,
-      assetRefs,
-      issueRefs,
-    });
     const id = `SG-${sha256(
       items
         .map((item) => item.dedupeKey)
@@ -555,6 +578,20 @@ function correlate(args: {
           leftId.localeCompare(rightId)
       );
     const priorFamily = matchingFamilies[0]?.[0];
+    const issueRefs = unique([
+      ...items.flatMap((item) => item.issueRefs),
+      ...matchingFamilies.flatMap(([, family]) =>
+        family.subjectKeys
+          .filter((key) => key.startsWith("issue:"))
+          .map((key) => key.slice("issue:".length))
+      ),
+    ]);
+    const disposition = dispositionFor({
+      records,
+      classifications,
+      assetRefs,
+      issueRefs,
+    });
     const familySeed =
       subjectKeys[0] ?? items.map((item) => item.dedupeKey).sort()[0] ?? id;
     const familyId = priorFamily ?? `SF-${sha256(familySeed).slice(0, 16)}`;
@@ -777,30 +814,62 @@ function resolutionProofs(records: SourceRecord[]): ResolutionProof[] {
 function resolvedSignalFamilies(args: {
   state: ReconciliationState;
   proofs: ResolutionProof[];
+  signals: CorrelatedSignal[];
 }): string[] {
   const terminalIssueKeys = new Set(
-    args.proofs.flatMap((proof) =>
-      proof.issueRefs.map((issueRef) => `issue:${issueRef}`)
-    )
+    args.proofs
+      .filter((proof) => proof.kind === "linked_work_terminal")
+      .flatMap((proof) =>
+        proof.issueRefs.map((issueRef) => `issue:${issueRef}`)
+      )
   );
-  const terminalEvidenceKeys = new Set(
-    args.proofs.map((proof) => proof.evidenceKey)
+  const defaultBranchEvidenceKeys = new Set(
+    args.proofs
+      .filter((proof) => proof.kind === "default_branch_containment")
+      .map((proof) => proof.evidenceKey)
   );
   return Object.entries(args.state.families ?? {})
-    .filter(([, family]) => {
-      const linkedIssues = family.subjectKeys.filter((key) =>
-        key.startsWith("issue:")
+    .flatMap(([familyId, family]) => {
+      const currentSignals = args.signals.filter(
+        (signal) =>
+          signal.familyId === familyId ||
+          signal.familyAliases?.includes(familyId)
       );
+      const linkedIssues = unique([
+        ...family.subjectKeys.filter((key) => key.startsWith("issue:")),
+        ...currentSignals.flatMap((signal) =>
+          signal.issueRefs.map((issueRef) => `issue:${issueRef}`)
+        ),
+      ]);
       const allLinkedWorkTerminal =
         linkedIssues.length > 0 &&
         linkedIssues.every((key) => terminalIssueKeys.has(key));
-      const exactEvidenceOnDefaultBranch = family.evidenceKeys.some((key) =>
-        terminalEvidenceKeys.has(key)
-      );
-      return allLinkedWorkTerminal || exactEvidenceOnDefaultBranch;
+      const exactEvidenceOnDefaultBranch = [
+        ...family.evidenceKeys,
+        ...currentSignals.flatMap((signal) => signal.evidenceKeys),
+      ].some((key) => defaultBranchEvidenceKeys.has(key));
+      return allLinkedWorkTerminal || exactEvidenceOnDefaultBranch
+        ? [familyId]
+        : [];
     })
-    .map(([familyId]) => familyId)
     .sort();
+}
+
+function isNewDefaultBranchContainment(args: {
+  record: SourceRecord;
+  state: ReconciliationState;
+}): boolean {
+  if (
+    args.record.sourceType !== "git" ||
+    args.record.provenance.onDefaultBranch !== true
+  ) {
+    return false;
+  }
+  return !args.state.evidence[
+    args.record.dedupeKey
+  ]?.defaultBranchContainment?.[args.record.sourceId]?.includes(
+    args.record.recordId
+  );
 }
 
 function renderReview(review: ReconciliationReview): string {
@@ -923,11 +992,29 @@ function updateState(args: {
   }
   for (const item of args.review.evidence) {
     const prior = next.evidence[item.dedupeKey];
+    const defaultBranchContainment = structuredClone(
+      prior?.defaultBranchContainment ?? {}
+    );
+    for (const proof of args.review.resolutionProofs) {
+      if (
+        proof.evidenceKey !== item.dedupeKey ||
+        proof.kind !== "default_branch_containment"
+      ) {
+        continue;
+      }
+      defaultBranchContainment[proof.sourceId] = unique([
+        ...(defaultBranchContainment[proof.sourceId] ?? []),
+        proof.sourceRecordId,
+      ]);
+    }
     next.evidence[item.dedupeKey] = {
       firstSeenAt: prior?.firstSeenAt ?? args.review.generatedAt,
       lastSeenAt: args.review.generatedAt,
       sourceIds: unique([...(prior?.sourceIds ?? []), ...item.sourceIds]),
       reviewIds: unique([...(prior?.reviewIds ?? []), args.review.reviewId]),
+      ...(Object.keys(defaultBranchContainment).length > 0
+        ? { defaultBranchContainment }
+        : {}),
     };
   }
   for (const decision of args.review.decisions) {
@@ -1124,7 +1211,10 @@ export async function reconcileSources(args: {
               !(
                 prior?.watermark &&
                 Date.parse(record.observedAt) <= Date.parse(prior.watermark) &&
-                state.evidence[record.dedupeKey]?.sourceIds.includes(source.id)
+                state.evidence[record.dedupeKey]?.sourceIds.includes(
+                  source.id
+                ) &&
+                !isNewDefaultBranchContainment({ record, state })
               )
           )
         : result.records;
@@ -1215,6 +1305,7 @@ export async function reconcileSources(args: {
       resolvedSignalFamilies: resolvedSignalFamilies({
         state,
         proofs,
+        signals: correlated.signals,
       }),
       resolvedEvidenceKeys: unique(
         records

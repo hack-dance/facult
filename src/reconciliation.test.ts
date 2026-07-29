@@ -1732,6 +1732,42 @@ describe("source reconciliation", () => {
     });
   });
 
+  it("does not use a develop or feature HEAD as default-branch proof", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=develop"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+      ["commit", "--allow-empty", "--quiet", "-m", "chore: develop base"],
+      ["switch", "--quiet", "-c", "feature"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "git", type: "git" }],
+      })
+    );
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+
+    expect(review.coverageComplete).toBe(false);
+    expect(review.coverage[0]).toMatchObject({
+      state: "unavailable",
+      recordsScanned: 0,
+    });
+    expect(review.coverage[0]?.unavailableReason).toContain(
+      "Git default branch is unavailable"
+    );
+  });
+
   it("separates complete coverage from a cursor stale after newer repository activity", async () => {
     const fixture = await makeFixture();
     for (const argv of [
@@ -1821,6 +1857,90 @@ describe("source reconciliation", () => {
       alertSourceIds: ["git"],
     });
     expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  });
+
+  it("bounds repository freshness activity to the review window", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "review.md"),
+      "Capability cursor baseline.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: establish cursor"],
+      date: "2026-01-02T12:00:00.000Z",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+            freshnessThresholdHours: 168,
+          },
+        ],
+      })
+    );
+    await reconcileSources({
+      ...fixture,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      incremental: true,
+    });
+
+    await Bun.write(join(fixture.projectRoot, "jan-4.txt"), "activity\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "jan-4.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "chore: January 4 activity"],
+      date: "2026-01-04T12:00:00.000Z",
+    });
+    await Bun.write(join(fixture.projectRoot, "jan-10.txt"), "later tip\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "jan-10.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "chore: January 10 tip"],
+      date: "2026-01-10T12:00:00.000Z",
+    });
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-05T23:59:59.999Z",
+      incremental: true,
+      persist: false,
+    });
+
+    expect(review.coverage[0]).toMatchObject({
+      freshness: {
+        state: "stale",
+        reason: "newer_repository_activity",
+        cursorAt: "2026-01-02T12:00:00Z",
+        latestSourceAt: "2026-01-04T12:00:00Z",
+      },
+    });
   });
 
   it("checks exact Git evidence against the configured default branch", async () => {

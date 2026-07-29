@@ -264,6 +264,7 @@ export interface ReconciliationState {
       lastSeenAt: string;
       sourceIds: string[];
       reviewIds: string[];
+      defaultBranchContainment?: Record<string, string[]>;
     }
   >;
   decisions: Record<

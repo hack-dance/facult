@@ -507,10 +507,12 @@ async function configuredDefaultBranch(args: {
       return { display: branch, ref };
     }
   }
-  if (await gitRefExists("HEAD", args.projectRoot)) {
-    return { display: "HEAD", ref: "HEAD" };
+  if (!(await gitRefExists("HEAD", args.projectRoot))) {
+    throw new Error("Git repository does not have any commits yet");
   }
-  throw new Error("Git repository does not have any commits yet");
+  throw new Error(
+    "Git default branch is unavailable; configure defaultBranch or provide a proven remote HEAD, main, or master"
+  );
 }
 
 async function gitIsAncestor(args: {
@@ -616,7 +618,13 @@ const gitAdapter: ReconciliationAdapter = {
       });
       const latestDefaultBranch = (
         await runGit(
-          ["log", "-1", "--format=%H%x1f%cI", defaultBranch.ref],
+          [
+            "log",
+            "-1",
+            `--until=${context.window.until}`,
+            "--format=%H%x1f%cI",
+            defaultBranch.ref,
+          ],
           projectRoot
         )
       ).trim();
