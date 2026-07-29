@@ -62,6 +62,7 @@ const MAX_FILE_BYTES = 1_000_000;
 const MAX_FILES = 500;
 const MAX_BODY_CHARS = 4000;
 const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+const GIT_OBJECT_ID_RE = /^[0-9a-f]{40,64}$/i;
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -539,6 +540,25 @@ async function gitIsAncestor(args: {
   ancestorOf: string;
   projectRoot: string;
 }): Promise<boolean> {
+  if (!GIT_OBJECT_ID_RE.test(args.commit)) {
+    return false;
+  }
+  const verify = Bun.spawn({
+    cmd: [
+      Bun.which("git") ?? "/usr/bin/git",
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${args.commit}^{commit}`,
+    ],
+    cwd: args.projectRoot,
+    env: safeGitEnvironment(args.projectRoot),
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if ((await verify.exited) !== 0) {
+    return false;
+  }
   const proc = Bun.spawn({
     cmd: [
       Bun.which("git") ?? "/usr/bin/git",

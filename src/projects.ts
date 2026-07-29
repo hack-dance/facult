@@ -43,6 +43,7 @@ import {
   pathsPhysicallyEquivalent,
   preferredGlobalAiRoot,
 } from "./paths";
+import { processStartIdentity } from "./process-identity";
 import {
   type RepositoryExecutionIdentity,
   type RepositoryIdentity,
@@ -4330,6 +4331,7 @@ async function acquireProjectRuntimeMigrationLocks(args: {
           pid: process.pid,
           token,
           startedAt: new Date().toISOString(),
+          processStartedAt: processStartIdentity(process.pid),
           operation: "project-enrollment-state-migration",
         })}\n`
       );

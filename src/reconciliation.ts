@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   type FileHandle,
   mkdir,
@@ -6,6 +6,8 @@ import {
   readFile,
   rename,
   rm,
+  stat,
+  utimes,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { WritebackDisposition } from "./ai";
@@ -15,6 +17,7 @@ import {
   facultAiReconciliationStatePath,
   projectRootFromAiRoot,
 } from "./paths";
+import { processStartIdentity } from "./process-identity";
 import {
   gitDefaultBranchContainment,
   reconciliationAdapterFor,
@@ -27,6 +30,7 @@ import type {
   AdapterScanResult,
   CorrelatedSignal,
   ExtractionDecision,
+  LinkedWorkStatusObservation,
   ReconciledEvidence,
   ReconciliationConfig,
   ReconciliationFreshness,
@@ -55,6 +59,7 @@ const NON_ALPHANUMERIC_RE = /[^a-z0-9]+/g;
 const WHITESPACE_RE = /\s+/g;
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const REVIEW_ID_RE = /^RV-[a-f0-9]{16}$/;
+const RECONCILIATION_LOCK_LEASE_MS = 15 * 60 * 1000;
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -76,6 +81,7 @@ function emptyState(): ReconciliationState {
     decisions: {},
     families: {},
     resolutionProofs: {},
+    linkedWorkStatuses: {},
     reviews: {},
   };
 }
@@ -92,6 +98,8 @@ function parseState(value: unknown): ReconciliationState {
       (value.families === undefined || isPlainObject(value.families)) &&
       (value.resolutionProofs === undefined ||
         isPlainObject(value.resolutionProofs)) &&
+      (value.linkedWorkStatuses === undefined ||
+        isPlainObject(value.linkedWorkStatuses)) &&
       isPlainObject(value.reviews)
     )
   ) {
@@ -108,6 +116,11 @@ function parseState(value: unknown): ReconciliationState {
     resolutionProofs: isPlainObject(value.resolutionProofs)
       ? (value.resolutionProofs as NonNullable<
           ReconciliationState["resolutionProofs"]
+        >)
+      : {},
+    linkedWorkStatuses: isPlainObject(value.linkedWorkStatuses)
+      ? (value.linkedWorkStatuses as NonNullable<
+          ReconciliationState["linkedWorkStatuses"]
         >)
       : {},
     reviews: value.reviews as ReconciliationState["reviews"],
@@ -140,18 +153,142 @@ async function withStateLock<T>(
   onLockAcquired?: () => void | Promise<void>
 ): Promise<T> {
   await mkdir(dirname(lockPath), { recursive: true });
+  const ownerToken = randomUUID();
   let handle: FileHandle;
   try {
     handle = await open(lockPath, "wx");
-  } catch {
-    throw new Error(`Another reconciliation is already updating ${lockPath}`);
+  } catch (error) {
+    if (
+      !(error instanceof Error && "code" in error) ||
+      (error as NodeJS.ErrnoException).code !== "EEXIST"
+    ) {
+      throw error;
+    }
+    const takeoverPath = `${lockPath}.takeover`;
+    let takeover: FileHandle;
+    try {
+      takeover = await open(takeoverPath, "wx");
+    } catch (takeoverError) {
+      if (
+        !(takeoverError instanceof Error && "code" in takeoverError) ||
+        (takeoverError as NodeJS.ErrnoException).code !== "EEXIST"
+      ) {
+        throw takeoverError;
+      }
+      throw new Error(
+        `Another reconciliation is recovering ${lockPath} using ${takeoverPath}`
+      );
+    }
+    try {
+      await takeover.writeFile(
+        `${JSON.stringify({
+          pid: process.pid,
+          token: ownerToken,
+          startedAt: new Date().toISOString(),
+          processStartedAt: processStartIdentity(process.pid),
+        })}\n`
+      );
+      const info = await stat(lockPath).catch(() => null);
+      const ageMs = info ? Date.now() - info.mtime.getTime() : 0;
+      if (!(info && ageMs > RECONCILIATION_LOCK_LEASE_MS)) {
+        throw new Error(
+          `Another reconciliation is already updating ${lockPath}`
+        );
+      }
+      let ownerAlive = false;
+      let ownerPid: number | undefined;
+      let recordedProcessStartedAt: string | undefined;
+      try {
+        const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
+          pid?: unknown;
+          processStartedAt?: unknown;
+        };
+        if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid)) {
+          ownerPid = owner.pid;
+          recordedProcessStartedAt =
+            typeof owner.processStartedAt === "string"
+              ? owner.processStartedAt
+              : undefined;
+          try {
+            process.kill(owner.pid, 0);
+            ownerAlive = true;
+          } catch (ownerError) {
+            ownerAlive =
+              ownerError instanceof Error && "code" in ownerError
+                ? (ownerError as NodeJS.ErrnoException).code !== "ESRCH"
+                : false;
+          }
+        }
+      } catch {
+        ownerAlive = false;
+      }
+      if (ownerAlive) {
+        const observedProcessStartedAt =
+          recordedProcessStartedAt && ownerPid
+            ? processStartIdentity(ownerPid)
+            : undefined;
+        if (
+          !(recordedProcessStartedAt && observedProcessStartedAt) ||
+          recordedProcessStartedAt === observedProcessStartedAt
+        ) {
+          throw new Error(
+            `A live reconciliation owner still holds ${lockPath}`
+          );
+        }
+      }
+      await rename(lockPath, `${lockPath}.stale-${Date.now()}-${ownerToken}`);
+      handle = await open(lockPath, "wx");
+    } finally {
+      await takeover.close();
+      const owner = await readFile(takeoverPath, "utf8").catch(() => "");
+      if (owner.includes(`"token":"${ownerToken}"`)) {
+        await rm(takeoverPath, { force: true });
+      }
+    }
   }
+  await handle.writeFile(
+    `${JSON.stringify({
+      pid: process.pid,
+      token: ownerToken,
+      startedAt: new Date().toISOString(),
+      processStartedAt: processStartIdentity(process.pid),
+    })}\n`
+  );
+  await handle.sync();
+  const stillOwnsPath = async (): Promise<boolean> => {
+    try {
+      const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
+        token?: unknown;
+      };
+      return owner.token === ownerToken;
+    } catch {
+      return false;
+    }
+  };
+  const heartbeat = setInterval(
+    () => {
+      stillOwnsPath()
+        .then((ownsPath) => {
+          if (ownsPath) {
+            const heartbeatAt = new Date();
+            return utimes(lockPath, heartbeatAt, heartbeatAt);
+          }
+          return undefined;
+        })
+        .catch(() => undefined);
+    },
+    Math.min(30_000, RECONCILIATION_LOCK_LEASE_MS / 3)
+  );
+  heartbeat.unref();
   try {
     await onLockAcquired?.();
     return await fn();
   } finally {
+    clearInterval(heartbeat);
     await handle.close();
-    await rm(lockPath, { force: true });
+    if (await stillOwnsPath()) {
+      await rm(lockPath, { force: true });
+    }
   }
 }
 
@@ -798,8 +935,47 @@ function normalizeReviewFreshness(
     coverage,
     freshness: review.freshness ?? reconciliationFreshness(coverage),
     resolutionProofs: review.resolutionProofs ?? [],
+    linkedWorkStatuses: review.linkedWorkStatuses ?? [],
     resolvedSignalFamilies: review.resolvedSignalFamilies ?? [],
   };
+}
+
+function linkedWorkStatusObservations(
+  records: SourceRecord[]
+): LinkedWorkStatusObservation[] {
+  return records.flatMap((record) => {
+    if (typeof record.provenance.terminal !== "boolean") {
+      return [];
+    }
+    return record.issueRefs.map((issueRef) => ({
+      issueRef,
+      observedAt: record.observedAt,
+      terminal: record.provenance.terminal as boolean,
+      sourceId: record.sourceId,
+      sourceRecordId: record.recordId,
+      ...(typeof record.provenance.status === "string"
+        ? { status: record.provenance.status }
+        : {}),
+    }));
+  });
+}
+
+function latestLinkedWorkStatuses(args: {
+  state: ReconciliationState;
+  observations: LinkedWorkStatusObservation[];
+}): Map<string, LinkedWorkStatusObservation> {
+  const latest = new Map(Object.entries(args.state.linkedWorkStatuses ?? {}));
+  for (const observation of args.observations) {
+    const prior = latest.get(observation.issueRef);
+    const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
+    const priorKey = prior
+      ? `${prior.observedAt}\n${prior.sourceRecordId}`
+      : undefined;
+    if (!(priorKey && priorKey > observationKey)) {
+      latest.set(observation.issueRef, observation);
+    }
+  }
+  return latest;
 }
 
 function resolutionProofs(records: SourceRecord[]): ResolutionProof[] {
@@ -828,22 +1004,20 @@ function resolvedSignalFamilies(args: {
   state: ReconciliationState;
   proofs: ResolutionProof[];
   signals: CorrelatedSignal[];
+  linkedWorkStatuses: LinkedWorkStatusObservation[];
 }): string[] {
-  const proofs = [
-    ...Object.values(args.state.resolutionProofs ?? {}).map(
-      (entry) => entry.proof
-    ),
-    ...args.proofs,
-  ];
   const terminalIssueKeys = new Set(
-    proofs
-      .filter((proof) => proof.kind === "linked_work_terminal")
-      .flatMap((proof) =>
-        proof.issueRefs.map((issueRef) => `issue:${issueRef}`)
-      )
+    [
+      ...latestLinkedWorkStatuses({
+        state: args.state,
+        observations: args.linkedWorkStatuses,
+      }).entries(),
+    ]
+      .filter(([, observation]) => observation.terminal)
+      .map(([issueRef]) => `issue:${issueRef}`)
   );
   const defaultBranchEvidenceKeys = new Set(
-    proofs
+    args.proofs
       .filter((proof) => proof.kind === "default_branch_containment")
       .map((proof) => proof.evidenceKey)
   );
@@ -1052,6 +1226,18 @@ function updateState(args: {
   }
   const resolutionProofState = next.resolutionProofs ?? {};
   next.resolutionProofs = resolutionProofState;
+  const linkedWorkStatusState = next.linkedWorkStatuses ?? {};
+  next.linkedWorkStatuses = linkedWorkStatusState;
+  for (const observation of args.review.linkedWorkStatuses ?? []) {
+    const prior = linkedWorkStatusState[observation.issueRef];
+    const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
+    const priorKey = prior
+      ? `${prior.observedAt}\n${prior.sourceRecordId}`
+      : undefined;
+    if (!(priorKey && priorKey > observationKey)) {
+      linkedWorkStatusState[observation.issueRef] = observation;
+    }
+  }
   for (const proof of args.review.resolutionProofs) {
     const key = sha256(
       `${proof.kind}\n${proof.sourceId}\n${proof.sourceRecordId}\n${proof.evidenceKey}`
@@ -1270,14 +1456,10 @@ export async function reconcileSources(args: {
       if (source.type === "git" && projectRoot) {
         const pendingCommits = Object.entries(state.evidence).flatMap(
           ([evidenceKey, evidence]) =>
-            (evidence.sourceRecordIds?.[source.id] ?? [])
-              .filter(
-                (recordId) =>
-                  !evidence.defaultBranchContainment?.[source.id]?.includes(
-                    recordId
-                  )
-              )
-              .map((recordId) => ({ evidenceKey, recordId }))
+            (evidence.sourceRecordIds?.[source.id] ?? []).map((recordId) => ({
+              evidenceKey,
+              recordId,
+            }))
         );
         for (const pending of pendingCommits) {
           const containment = await gitDefaultBranchContainment({
@@ -1389,6 +1571,7 @@ export async function reconcileSources(args: {
             ? "Zero signals discovered after every configured source was checked for this review window."
             : "No signals are reported, but configured coverage is degraded; this is not a proven empty review.";
     const proofs = [...resolutionProofs(records), ...recheckedResolutionProofs];
+    const linkedWorkStatuses = linkedWorkStatusObservations(records);
     const review: ReconciliationReview = {
       version: 1,
       reviewId: window.id,
@@ -1403,10 +1586,12 @@ export async function reconcileSources(args: {
       evidence: correlated.evidence,
       signals: correlated.signals,
       resolutionProofs: proofs,
+      linkedWorkStatuses,
       resolvedSignalFamilies: resolvedSignalFamilies({
         state,
         proofs,
         signals: correlated.signals,
+        linkedWorkStatuses,
       }),
       resolvedEvidenceKeys: unique(
         records

@@ -173,6 +173,15 @@ export interface ResolutionProof {
   provenance: SourceRecord["provenance"];
 }
 
+export interface LinkedWorkStatusObservation {
+  issueRef: string;
+  observedAt: string;
+  terminal: boolean;
+  sourceId: string;
+  sourceRecordId: string;
+  status?: string;
+}
+
 export interface ExtractionDecision {
   id: string;
   sourceId: string;
@@ -234,6 +243,7 @@ export interface ReconciliationReview {
   evidence: ReconciledEvidence[];
   signals: CorrelatedSignal[];
   resolutionProofs: ResolutionProof[];
+  linkedWorkStatuses?: LinkedWorkStatusObservation[];
   resolvedSignalFamilies: string[];
   resolvedEvidenceKeys: string[];
   unresolvedSignals: string[];
@@ -300,6 +310,7 @@ export interface ReconciliationState {
       proof: ResolutionProof;
     }
   >;
+  linkedWorkStatuses?: Record<string, LinkedWorkStatusObservation>;
   reviews: Record<
     string,
     {
