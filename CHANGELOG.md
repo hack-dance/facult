@@ -1,3 +1,9 @@
+## [2.29.0](https://github.com/hack-dance/fclt/compare/v2.28.0...v2.29.0) (2026-07-29)
+
+### Features
+
+* add safe guided project onboarding ([#73](https://github.com/hack-dance/fclt/issues/73)) ([7b13e2f](https://github.com/hack-dance/fclt/commit/7b13e2f0487044530cfccbe9dda211f2e7f0aaf1))
+
 ## [2.28.0](https://github.com/hack-dance/fclt/compare/v2.27.2...v2.28.0) (2026-07-15)
 
 ### Features
