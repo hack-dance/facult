@@ -162,7 +162,16 @@ function safeMachineStateDirExists(pathValue: string): boolean {
         `Refusing unsafe machine-local project state directory: ${pathValue}`
       );
     }
-    return true;
+    const containsFile = (directory: string): boolean =>
+      readdirSync(directory, { withFileTypes: true }).some((entry) => {
+        const childPath = join(directory, entry.name);
+        const child = lstatSync(childPath);
+        if (child.isDirectory()) {
+          return containsFile(childPath);
+        }
+        return true;
+      });
+    return containsFile(pathValue);
   } catch (error) {
     const code =
       error && typeof error === "object" && "code" in error

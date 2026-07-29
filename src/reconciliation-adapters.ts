@@ -62,6 +62,7 @@ const MAX_FILE_BYTES = 1_000_000;
 const MAX_FILES = 500;
 const MAX_BODY_CHARS = 4000;
 const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+const GIT_OBJECT_ID_RE = /^[0-9a-f]{40,64}$/i;
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -534,11 +535,58 @@ export async function gitDefaultBranchContainment(args: {
   };
 }
 
+export async function gitDefaultBranchContainments(args: {
+  commits: string[];
+  config: GitSourceConfig;
+  projectRoot: string;
+}): Promise<{
+  defaultBranch: string;
+  onDefaultBranch: Record<string, boolean>;
+}> {
+  const defaultBranch = await configuredDefaultBranch({
+    config: args.config,
+    projectRoot: args.projectRoot,
+  });
+  const candidates = unique(
+    args.commits.filter((commit) => GIT_OBJECT_ID_RE.test(commit))
+  );
+  const reachable = new Set(
+    (await runGit(["rev-list", defaultBranch.ref], args.projectRoot))
+      .split(LINE_SPLIT_RE)
+      .filter(Boolean)
+  );
+  return {
+    defaultBranch: defaultBranch.display,
+    onDefaultBranch: Object.fromEntries(
+      candidates.map((commit) => [commit, reachable.has(commit)])
+    ),
+  };
+}
+
 async function gitIsAncestor(args: {
   commit: string;
   ancestorOf: string;
   projectRoot: string;
 }): Promise<boolean> {
+  if (!GIT_OBJECT_ID_RE.test(args.commit)) {
+    return false;
+  }
+  const verify = Bun.spawn({
+    cmd: [
+      Bun.which("git") ?? "/usr/bin/git",
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${args.commit}^{commit}`,
+    ],
+    cwd: args.projectRoot,
+    env: safeGitEnvironment(args.projectRoot),
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if ((await verify.exited) !== 0) {
+    return false;
+  }
   const proc = Bun.spawn({
     cmd: [
       Bun.which("git") ?? "/usr/bin/git",

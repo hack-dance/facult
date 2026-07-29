@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
@@ -36,6 +35,10 @@ import {
   projectRootFromAiRoot,
   withFacultRootScope,
 } from "./paths";
+import {
+  processStartIdentity,
+  processStartIdentityMatches,
+} from "./process-identity";
 import { reconcileSources, reconciliationStatus } from "./reconciliation";
 import { DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS } from "./reconciliation-config";
 import type {
@@ -1502,29 +1505,6 @@ function renderReport(report: EvolutionLoopReport): string {
   ].join("\n");
 }
 
-function processStartIdentity(pid: number): string | undefined {
-  const result =
-    process.platform === "win32"
-      ? spawnSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
-          ],
-          { encoding: "utf8" }
-        )
-      : spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-          encoding: "utf8",
-        });
-  if (result.status !== 0 || typeof result.stdout !== "string") {
-    return undefined;
-  }
-  const startedAt = result.stdout.trim();
-  return startedAt ? `${process.platform}:${startedAt}` : undefined;
-}
-
 async function withLoopLock<T>(args: {
   path: string;
   leaseMinutes: number;
@@ -1615,7 +1595,10 @@ async function withLoopLock<T>(args: {
             : undefined;
         if (
           !(recordedProcessStartedAt && observedProcessStartedAt) ||
-          recordedProcessStartedAt === observedProcessStartedAt
+          processStartIdentityMatches(
+            recordedProcessStartedAt,
+            observedProcessStartedAt
+          )
         ) {
           throw new Error(
             `A live evolution loop owner still holds ${args.path}. If process identity is unavailable and the lease is known to be abandoned, inspect the owner record and remove this one lock file explicitly.`

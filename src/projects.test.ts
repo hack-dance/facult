@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   realpath,
@@ -21,6 +22,7 @@ import { dirname, join } from "node:path";
 import { runFixtureGit } from "../test/git-fixture";
 import { enableEvolutionLoop, runEvolutionLoop } from "./evolution-loop";
 import {
+  executionMachineStateProjectKey,
   facultAiEvolutionLoopLockPath,
   facultAiEvolutionReviewDir,
   facultAiGraphPath,
@@ -2358,7 +2360,15 @@ describe("project enrollment lifecycle", () => {
         expectedPlanSha256: refreshed.planSha256,
         homeDir: home,
       });
-      expect(await pathEntryExists(legacyDir)).toBe(false);
+      expect(await pathEntryExists(legacyDir)).toBe(true);
+      expect(
+        (
+          await planProjectEnrollment({
+            projectRoot: repo,
+            homeDir: home,
+          })
+        ).stateMigrations
+      ).toEqual([]);
       expect(
         await Bun.file(
           join(facultMachineStateDir(home, aiRoot), "journal", "events.jsonl")
@@ -2395,6 +2405,131 @@ describe("project enrollment lifecycle", () => {
       })
     ).rejects.toThrow("Refusing to migrate active project runtime state");
     expect(await Bun.file(oldLockPath).exists()).toBe(true);
+  });
+
+  it("rejects legacy reconciliation takeover files before planning a migration", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const oldLockPath = join(
+      legacyDir,
+      "ai",
+      "project",
+      "reconciliation",
+      "state.json.lock.takeover"
+    );
+    await mkdir(dirname(oldLockPath), { recursive: true });
+    await writeFile(oldLockPath, '{"pid":123}\n', "utf8");
+
+    await expect(
+      planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      })
+    ).rejects.toThrow("Refusing to migrate active project runtime state");
+    expect(await Bun.file(oldLockPath).exists()).toBe(true);
+  });
+
+  it("rejects selected runtime lock files before planning a migration", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const selectedDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      executionMachineStateProjectKey(aiRoot, home)
+    );
+    await mkdir(join(legacyDir, "journal"), { recursive: true });
+    await writeFile(
+      join(legacyDir, "journal", "events.jsonl"),
+      '{"legacy":true}\n',
+      "utf8"
+    );
+    const oldLockPath = join(
+      selectedDir,
+      "ai",
+      "project",
+      "evolution",
+      "loop",
+      "state.json.lock"
+    );
+    await mkdir(dirname(oldLockPath), { recursive: true });
+    await writeFile(oldLockPath, '{"pid":123}\n', "utf8");
+
+    await expect(
+      planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+      })
+    ).rejects.toThrow("Refusing to migrate active project runtime state");
+    expect(await Bun.file(oldLockPath).exists()).toBe(true);
+    expect(await pathEntryExists(legacyDir)).toBe(true);
+  });
+
+  it("revalidates selected runtime lock files before applying a migration", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const selectedDir = join(
+      facultLocalStateRoot(home),
+      "projects",
+      executionMachineStateProjectKey(aiRoot, home)
+    );
+    await mkdir(join(legacyDir, "journal"), { recursive: true });
+    await writeFile(
+      join(legacyDir, "journal", "events.jsonl"),
+      '{"legacy":true}\n',
+      "utf8"
+    );
+    await mkdir(join(selectedDir, "ai", "project", "writeback"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(selectedDir, "ai", "project", "writeback", "queue.jsonl"),
+      '{"selected":true}\n',
+      "utf8"
+    );
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const oldLockPath = join(
+      selectedDir,
+      "ai",
+      "project",
+      "reconciliation",
+      "state.json.lock.takeover"
+    );
+    await mkdir(dirname(oldLockPath), { recursive: true });
+    await writeFile(oldLockPath, '{"pid":123}\n', "utf8");
+
+    await expect(
+      applyProjectEnrollment({
+        plan,
+        expectedPlanSha256: plan.planSha256,
+        homeDir: home,
+      })
+    ).rejects.toThrow("Refusing to migrate active project runtime state");
+    expect(await Bun.file(oldLockPath).exists()).toBe(true);
+    expect(await pathEntryExists(legacyDir)).toBe(true);
   });
 
   it("migrates a legacy key created through an equivalent symlink spelling", async () => {
@@ -2593,7 +2728,7 @@ describe("project enrollment lifecycle", () => {
       homeDir: home,
       afterLegacyStateQuarantine: async ({ quarantine, source }) => {
         quarantinePath = quarantine;
-        expect(await pathEntryExists(source)).toBe(false);
+        expect((await lstat(source)).isDirectory()).toBe(true);
         expect((await lstat(quarantine)).isDirectory()).toBe(true);
       },
     });
@@ -2820,6 +2955,212 @@ describe("project enrollment lifecycle", () => {
     expect(
       await Bun.file(plan.machineLocalWrites[0]?.path ?? "").exists()
     ).toBe(false);
+  });
+
+  it("holds legacy runtime writer locks through the final state rename", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const legacyLock = join(
+      legacyState,
+      "ai/project/reconciliation/state.json.lock"
+    );
+    await mkdir(dirname(legacyLock), { recursive: true });
+    await writeFile(
+      join(legacyState, "ai/project/reconciliation/state.json"),
+      "{}\n",
+      "utf8"
+    );
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    let competingWriterBlocked = false;
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      afterGeneratedWrites: async () => {
+        try {
+          const competitor = await open(legacyLock, "wx");
+          await competitor.close();
+        } catch (error) {
+          competingWriterBlocked =
+            error instanceof Error &&
+            "code" in error &&
+            (error as NodeJS.ErrnoException).code === "EEXIST";
+        }
+      },
+    });
+
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    expect(competingWriterBlocked).toBe(true);
+    expect((await lstat(legacyState)).isDirectory()).toBe(true);
+    expect(
+      await Bun.file(
+        join(legacyState, "ai/project/reconciliation/state.json")
+      ).exists()
+    ).toBe(false);
+    expect(
+      await Bun.file(
+        join(selectedState, "ai/project/reconciliation/state.json")
+      ).exists()
+    ).toBe(true);
+    expect(
+      await Bun.file(
+        join(selectedState, "ai/project/reconciliation/state.json.lock")
+      ).exists()
+    ).toBe(false);
+    expect(
+      (
+        await planProjectEnrollment({
+          projectRoot: repo,
+          homeDir: home,
+        })
+      ).stateMigrations
+    ).toEqual([]);
+  });
+
+  it("creates both legacy runtime lock barriers when their directories are absent", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const legacyJournal = join(legacyState, "journal", "events.jsonl");
+    const legacyEvolutionLock = join(
+      legacyState,
+      "ai/project/evolution/loop/state.json.lock"
+    );
+    const legacyReconciliationLock = join(
+      legacyState,
+      "ai/project/reconciliation/state.json.lock"
+    );
+    await mkdir(dirname(legacyJournal), { recursive: true });
+    await writeFile(legacyJournal, "legacy journal\n", "utf8");
+    expect(await pathEntryExists(dirname(legacyEvolutionLock))).toBe(false);
+    expect(await pathEntryExists(dirname(legacyReconciliationLock))).toBe(
+      false
+    );
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const blockedLocks = new Set<string>();
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      afterGeneratedWrites: async () => {
+        for (const pathValue of [
+          legacyEvolutionLock,
+          legacyReconciliationLock,
+        ]) {
+          try {
+            const competitor = await open(pathValue, "wx");
+            await competitor.close();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              (error as NodeJS.ErrnoException).code === "EEXIST"
+            ) {
+              blockedLocks.add(pathValue);
+            }
+          }
+        }
+      },
+    });
+
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    expect(blockedLocks).toEqual(
+      new Set([legacyEvolutionLock, legacyReconciliationLock])
+    );
+    expect(await pathEntryExists(legacyState)).toBe(false);
+    expect(await Bun.file(legacyJournal).exists()).toBe(false);
+    expect(
+      await Bun.file(join(selectedState, "journal", "events.jsonl")).text()
+    ).toBe("legacy journal\n");
+    expect(await Bun.file(legacyEvolutionLock).exists()).toBe(false);
+    expect(await Bun.file(legacyReconciliationLock).exists()).toBe(false);
+    expect(
+      (
+        await planProjectEnrollment({
+          projectRoot: repo,
+          homeDir: home,
+        })
+      ).stateMigrations
+    ).toEqual([]);
+  });
+
+  it("retains both original legacy writer guards through quarantine cleanup", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const aiRoot = join(repo, ".ai");
+    const legacyState = join(
+      facultLocalStateRoot(home),
+      "projects",
+      legacyMachineStateProjectKey(aiRoot, home)
+    );
+    const selectedState = facultMachineStateDir(home, aiRoot);
+    const legacyJournal = join(legacyState, "journal", "events.jsonl");
+    const selectedQueue = join(selectedState, "review", "queue.jsonl");
+    const legacyLocks = [
+      join(legacyState, "ai/project/evolution/loop/state.json.lock"),
+      join(legacyState, "ai/project/reconciliation/state.json.lock"),
+    ];
+    await mkdir(dirname(legacyJournal), { recursive: true });
+    await writeFile(legacyJournal, "legacy journal\n", "utf8");
+    await mkdir(dirname(selectedQueue), { recursive: true });
+    await writeFile(selectedQueue, "selected queue\n", "utf8");
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const blockedLocks = new Set<string>();
+
+    await applyProjectEnrollment({
+      plan,
+      expectedPlanSha256: plan.planSha256,
+      homeDir: home,
+      afterLegacyStateQuarantine: async ({ source }) => {
+        expect(source).toBe(legacyState);
+        for (const pathValue of legacyLocks) {
+          try {
+            const competitor = await open(pathValue, "wx");
+            await competitor.close();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              (error as NodeJS.ErrnoException).code === "EEXIST"
+            ) {
+              blockedLocks.add(pathValue);
+            }
+          }
+        }
+      },
+    });
+
+    expect(blockedLocks).toEqual(new Set(legacyLocks));
+    expect(await pathEntryExists(legacyState)).toBe(false);
+    expect(await Bun.file(legacyJournal).exists()).toBe(false);
+    expect(
+      await Bun.file(join(selectedState, "journal", "events.jsonl")).text()
+    ).toBe("legacy journal\n");
   });
 
   it("compensates a legacy source reappearance after quarantine", async () => {

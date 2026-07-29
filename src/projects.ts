@@ -43,6 +43,7 @@ import {
   pathsPhysicallyEquivalent,
   preferredGlobalAiRoot,
 } from "./paths";
+import { processStartIdentity } from "./process-identity";
 import {
   type RepositoryExecutionIdentity,
   type RepositoryIdentity,
@@ -68,11 +69,17 @@ const DISCOVERY_IGNORES = new Set([
 ]);
 const PROJECT_SOURCES = new Set(["git", "guidance", "writebacks"]);
 const PROJECT_CADENCES = new Set(["on-demand", "weekly", "daily"]);
+const PATH_SEPARATOR_RUN_RE = /[\\/]+/;
 const MIGRATING_RUNTIME_LOCK_PATHS = new Set([
   "ai/project/evolution/loop/state.json.lock",
   "ai/project/evolution/loop/state.json.lock.takeover",
   "ai/project/reconciliation/state.json.lock",
+  "ai/project/reconciliation/state.json.lock.takeover",
 ]);
+const LEGACY_RUNTIME_PRIMARY_LOCK_PATHS = [
+  "ai/project/evolution/loop/state.json.lock",
+  "ai/project/reconciliation/state.json.lock",
+] as const;
 const PROJECT_CONFIG_KEYS = [
   "cadence",
   "guidance",
@@ -1727,6 +1734,16 @@ interface ProjectStateMigration {
   restore: () => Promise<void>;
 }
 
+interface LegacyProjectRuntimeMigrationLocks {
+  ignoredEntriesBySource: ReadonlyMap<
+    string,
+    ReadonlyMap<string, { dev: number; ino: number }>
+  >;
+  relocate: (source: string, currentRoot: string) => void;
+  releaseSource: (source: string) => Promise<void>;
+  release: () => Promise<void>;
+}
+
 interface ProjectStateTreeEntry {
   path: string;
   type: "directory" | "file";
@@ -1772,7 +1789,8 @@ async function hashProjectStateFile(
 }
 
 async function inspectProjectStateTree(
-  root: string
+  root: string,
+  ignoredEntries: ReadonlyMap<string, { dev: number; ino: number }> = new Map()
 ): Promise<ProjectStateTree> {
   const entries: ProjectStateTreeEntry[] = [];
   let totalBytes = 0;
@@ -1781,11 +1799,14 @@ async function inspectProjectStateTree(
     if (before.isSymbolicLink() || !before.isDirectory()) {
       throw new Error(`Refusing unsafe project state directory: ${directory}`);
     }
-    entries.push({
-      path: relativePath || ".",
-      type: "directory",
-      mode: permissionMode(before.mode),
-    });
+    const normalizedRelativePath = relativePath || ".";
+    if (!ignoredEntries.has(normalizedRelativePath)) {
+      entries.push({
+        path: normalizedRelativePath,
+        type: "directory",
+        mode: permissionMode(before.mode),
+      });
+    }
     const children = (await readdir(directory, { withFileTypes: true })).sort(
       (left, right) => left.name.localeCompare(right.name)
     );
@@ -1800,6 +1821,17 @@ async function inspectProjectStateTree(
         ? `${relativePath}/${child.name}`
         : child.name;
       const metadata = await lstat(childPath);
+      const ignoredIdentity = ignoredEntries.get(childRelative);
+      if (
+        ignoredIdentity &&
+        (metadata.isSymbolicLink() ||
+          metadata.dev !== ignoredIdentity.dev ||
+          metadata.ino !== ignoredIdentity.ino)
+      ) {
+        throw new Error(
+          `Owned project migration lock changed while inspecting: ${childPath}`
+        );
+      }
       if (metadata.isSymbolicLink()) {
         throw new Error(`Refusing symlinked project state: ${childPath}`);
       }
@@ -1809,6 +1841,9 @@ async function inspectProjectStateTree(
       }
       if (!metadata.isFile() || metadata.nlink !== 1) {
         throw new Error(`Refusing unsafe project state file: ${childPath}`);
+      }
+      if (ignoredIdentity) {
+        continue;
       }
       totalBytes += metadata.size;
       if (totalBytes > PROJECT_STATE_TREE_MAX_BYTES) {
@@ -1985,6 +2020,14 @@ async function planLegacyProjectStateMigrations(args: {
         `Refusing unsafe legacy project state: ${candidate.source}`
       );
     }
+    const sourceTree = await inspectProjectStateTree(candidate.source);
+    assertNoMigratingRuntimeLocks({
+      path: candidate.source,
+      tree: sourceTree,
+    });
+    if (!sourceTree.entries.some((entry) => entry.type === "file")) {
+      continue;
+    }
     const claimedSource = claimedDestinations.get(candidate.destination);
     if (claimedSource) {
       throw new Error(
@@ -1992,11 +2035,6 @@ async function planLegacyProjectStateMigrations(args: {
       );
     }
     claimedDestinations.set(candidate.destination, candidate.source);
-    const sourceTree = await inspectProjectStateTree(candidate.source);
-    assertNoMigratingRuntimeLocks({
-      path: candidate.source,
-      tree: sourceTree,
-    });
     const destination = await lstatIfExists(candidate.destination);
     if (!destination) {
       planned.push({
@@ -2026,6 +2064,10 @@ async function planLegacyProjectStateMigrations(args: {
     const destinationTree = await inspectProjectStateTree(
       candidate.destination
     );
+    assertNoMigratingRuntimeLocks({
+      path: candidate.destination,
+      tree: destinationTree,
+    });
     const rebuildableOverlaps = assertDisjointProjectStateTrees({
       allowRebuildableOverlaps: candidate.allowRebuildableOverlaps,
       source: sourceTree,
@@ -2068,7 +2110,12 @@ async function migrateLegacyProjectState(args: {
     index: number;
     source: string;
   }) => Promise<void>;
+  runtimeLocks?: LegacyProjectRuntimeMigrationLocks;
 }): Promise<ProjectStateMigration | null> {
+  const ignoredEntriesFor = (
+    source: string
+  ): ReadonlyMap<string, { dev: number; ino: number }> =>
+    args.runtimeLocks?.ignoredEntriesBySource.get(source) ?? new Map();
   const planned: Array<
     ProjectStateMigrationPlanEntry & {
       destinationDev: number | null;
@@ -2086,7 +2133,10 @@ async function migrateLegacyProjectState(args: {
         `Reviewed legacy project state migration is stale: ${candidate.source}`
       );
     }
-    const sourceTree = await inspectProjectStateTree(candidate.source);
+    const sourceTree = await inspectProjectStateTree(
+      candidate.source,
+      ignoredEntriesFor(candidate.source)
+    );
     assertNoMigratingRuntimeLocks({
       path: candidate.source,
       tree: sourceTree,
@@ -2117,6 +2167,10 @@ async function migrateLegacyProjectState(args: {
         ? await inspectProjectStateTree(candidate.destination)
         : null;
     if (destinationTree) {
+      assertNoMigratingRuntimeLocks({
+        path: candidate.destination,
+        tree: destinationTree,
+      });
       if (destinationTree.sha256 !== candidate.destinationTreeSha256) {
         throw new Error(
           `Reviewed legacy project state migration is stale: ${candidate.destination}`
@@ -2169,18 +2223,51 @@ async function migrateLegacyProjectState(args: {
     path: string;
   };
   type CompletedMigration = (typeof planned)[number] & {
+    guardedContentMove: boolean;
     movedPaths: MovedPath[];
     quarantine: QuarantinedSource | null;
   };
   const completed: CompletedMigration[] = [];
   let commitStarted = false;
 
+  const assertGuardedSourceRemainder = async (
+    entry: CompletedMigration
+  ): Promise<void> => {
+    const ignoredPaths = [...ignoredEntriesFor(entry.source).keys()];
+    const allowedDirectories = new Set<string>(["."]);
+    for (const pathValue of ignoredPaths) {
+      let parent = dirname(pathValue);
+      while (parent !== ".") {
+        allowedDirectories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    const remaining = await inspectProjectStateTree(
+      entry.source,
+      ignoredEntriesFor(entry.source)
+    );
+    if (
+      remaining.entries.some(
+        (item) =>
+          item.type !== "directory" || !allowedDirectories.has(item.path)
+      )
+    ) {
+      throw new Error(
+        `Legacy project state changed before commit: ${entry.source}`
+      );
+    }
+  };
+
   const mergeDisjoint = async (
     source: string,
     destination: string,
     relativePath: string,
     movedPaths: MovedPath[],
-    rebuildableOverlaps: Set<string>
+    rebuildableOverlaps: Set<string>,
+    ignoredEntries: ReadonlyMap<
+      string,
+      { dev: number; ino: number }
+    > = new Map()
   ): Promise<void> => {
     const entries = (await readdir(source, { withFileTypes: true })).sort(
       (left, right) => left.name.localeCompare(right.name)
@@ -2193,6 +2280,46 @@ async function migrateLegacyProjectState(args: {
         : entry.name;
       const sourceMetadata = await lstat(sourcePath);
       const destinationMetadata = await lstatIfExists(destinationPath);
+      const ignoredIdentity = ignoredEntries.get(childRelative);
+      if (
+        ignoredIdentity &&
+        (sourceMetadata.dev !== ignoredIdentity.dev ||
+          sourceMetadata.ino !== ignoredIdentity.ino)
+      ) {
+        throw new Error(
+          `Owned project migration lock changed during merge: ${sourcePath}`
+        );
+      }
+      if (
+        ignoredIdentity &&
+        (sourceMetadata.isFile() ||
+          (sourceMetadata.isDirectory() && !sourceMetadata.isSymbolicLink()))
+      ) {
+        continue;
+      }
+      const containsIgnoredEntry = [...ignoredEntries.keys()].some(
+        (pathValue) => pathValue.startsWith(`${childRelative}/`)
+      );
+      if (
+        !destinationMetadata &&
+        sourceMetadata.isDirectory() &&
+        !sourceMetadata.isSymbolicLink() &&
+        containsIgnoredEntry
+      ) {
+        await mkdir(destinationPath, {
+          mode: permissionMode(sourceMetadata.mode),
+        });
+        await chmod(destinationPath, permissionMode(sourceMetadata.mode));
+        await mergeDisjoint(
+          sourcePath,
+          destinationPath,
+          childRelative,
+          movedPaths,
+          rebuildableOverlaps,
+          ignoredEntries
+        );
+        continue;
+      }
       if (!destinationMetadata) {
         await rename(sourcePath, destinationPath);
         movedPaths.push({
@@ -2213,7 +2340,8 @@ async function migrateLegacyProjectState(args: {
           destinationPath,
           childRelative,
           movedPaths,
-          rebuildableOverlaps
+          rebuildableOverlaps,
+          ignoredEntries
         );
         continue;
       }
@@ -2323,6 +2451,103 @@ async function migrateLegacyProjectState(args: {
     await rmdir(root);
   };
 
+  const quarantineExpectedDirectories = (
+    files: RebuildableFileBackup[]
+  ): Set<string> => {
+    const directories = new Set<string>(["."]);
+    for (const file of files) {
+      let parent = dirname(file.relativePath);
+      while (parent !== ".") {
+        directories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    return directories;
+  };
+
+  const assertQuarantinedFiles = async (
+    quarantine: QuarantinedSource,
+    requireAll: boolean
+  ): Promise<void> => {
+    const metadata = await lstatIfExists(quarantine.path);
+    if (
+      !metadata ||
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      metadata.dev !== quarantine.dev ||
+      metadata.ino !== quarantine.ino
+    ) {
+      throw new Error(
+        `Quarantined legacy project state binding changed: ${quarantine.path}`
+      );
+    }
+    const expectedFiles = new Map(
+      quarantine.files.map((file) => [file.relativePath, file])
+    );
+    const expectedDirectories = quarantineExpectedDirectories(quarantine.files);
+    const tree = await inspectProjectStateTree(quarantine.path);
+    for (const entry of tree.entries) {
+      if (
+        (entry.type === "file" && !expectedFiles.has(entry.path)) ||
+        (entry.type === "directory" && !expectedDirectories.has(entry.path))
+      ) {
+        throw new Error(
+          `Quarantined legacy project state changed: ${quarantine.path}`
+        );
+      }
+    }
+    const actualFiles = tree.entries.filter((entry) => entry.type === "file");
+    if (requireAll && actualFiles.length !== quarantine.files.length) {
+      throw new Error(
+        `Quarantined legacy project state changed: ${quarantine.path}`
+      );
+    }
+    for (const entry of actualFiles) {
+      const expected = expectedFiles.get(entry.path);
+      if (
+        !expected ||
+        entry.sha256 !== expected.sha256 ||
+        entry.mode !== expected.mode
+      ) {
+        throw new Error(
+          `Quarantined legacy project state changed: ${join(quarantine.path, entry.path)}`
+        );
+      }
+    }
+  };
+
+  const removeEmptyUnguardedSourceDirectories = async (
+    entry: CompletedMigration
+  ): Promise<void> => {
+    const ignoredPaths = [...ignoredEntriesFor(entry.source).keys()];
+    const guardedDirectories = new Set<string>(["."]);
+    for (const pathValue of ignoredPaths) {
+      let parent = dirname(pathValue);
+      while (parent !== ".") {
+        guardedDirectories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    const tree = await inspectProjectStateTree(
+      entry.source,
+      ignoredEntriesFor(entry.source)
+    );
+    for (const directory of tree.entries
+      .filter(
+        (item) =>
+          item.type === "directory" &&
+          item.path !== "." &&
+          !guardedDirectories.has(item.path)
+      )
+      .sort(
+        (left, right) =>
+          right.path.split("/").length - left.path.split("/").length ||
+          right.path.localeCompare(left.path)
+      )) {
+      await rmdir(join(entry.source, directory.path));
+    }
+  };
+
   const treeContainsReviewedEntries = (
     tree: ProjectStateTree,
     reviewed: ProjectStateTreeEntry[],
@@ -2352,23 +2577,35 @@ async function migrateLegacyProjectState(args: {
     const quarantined = await lstatIfExists(quarantine.path);
     if (quarantined) {
       if (
-        quarantined.isSymbolicLink() ||
-        !quarantined.isDirectory() ||
-        quarantined.dev !== quarantine.dev ||
-        quarantined.ino !== quarantine.ino
+        !source ||
+        source.dev !== entry.sourceDev ||
+        source.ino !== entry.sourceIno
       ) {
         throw new Error(
-          `Quarantined legacy project state changed before compensation: ${quarantine.path}`
+          `Legacy project state path changed before compensation: ${entry.source}`
         );
       }
-      if (source) {
-        await mergeDisjoint(quarantine.path, entry.source, "", [], new Set());
-        await removeEmptyStateTree(quarantine.path);
-      } else {
-        await rename(quarantine.path, entry.source);
+      await assertQuarantinedFiles(quarantine, false);
+      for (const file of quarantine.files) {
+        const quarantineFile = join(quarantine.path, file.relativePath);
+        const sourceFile = join(entry.source, file.relativePath);
+        const quarantinedFile = await lstatIfExists(quarantineFile);
+        if (!quarantinedFile) {
+          continue;
+        }
+        if (await lstatIfExists(sourceFile)) {
+          throw new Error(
+            `Legacy rebuildable state was recreated during compensation: ${sourceFile}`
+          );
+        }
+        await mkdir(dirname(sourceFile), { recursive: true, mode: 0o700 });
+        await rename(quarantineFile, sourceFile);
       }
+      await removeEmptyStateTree(quarantine.path);
     } else if (!source) {
-      await mkdir(entry.source, { recursive: true, mode: 0o700 });
+      throw new Error(
+        `Legacy project state path disappeared before compensation: ${entry.source}`
+      );
     }
   };
 
@@ -2386,8 +2623,13 @@ async function migrateLegacyProjectState(args: {
           destination.isSymbolicLink() ||
           !destination.isDirectory() ||
           (entry.strategy === "rename" &&
+            !entry.guardedContentMove &&
             (destination.dev !== entry.sourceDev ||
               destination.ino !== entry.sourceIno)) ||
+          (entry.strategy === "rename" &&
+            entry.guardedContentMove &&
+            (destination.dev !== entry.destinationDev ||
+              destination.ino !== entry.destinationIno)) ||
           (entry.strategy === "merge-disjoint" &&
             (destination.dev !== entry.destinationDev ||
               destination.ino !== entry.destinationIno))
@@ -2395,6 +2637,65 @@ async function migrateLegacyProjectState(args: {
           throw new Error(
             `Migrated project state destination changed before compensation: ${entry.destination}`
           );
+        }
+        if (entry.guardedContentMove) {
+          const source = await lstatIfExists(entry.source);
+          if (
+            !source ||
+            source.isSymbolicLink() ||
+            !source.isDirectory() ||
+            source.dev !== entry.sourceDev ||
+            source.ino !== entry.sourceIno
+          ) {
+            throw new Error(
+              `Legacy project state path changed before compensation: ${entry.source}`
+            );
+          }
+          const sourceTree = await inspectProjectStateTree(
+            entry.source,
+            ignoredEntriesFor(entry.source)
+          );
+          await removeUnreviewedEmptyStateDirectories(
+            entry.destination,
+            entry.sourceEntries
+          );
+          const destinationTree = await inspectProjectStateTree(
+            entry.destination
+          );
+          assertDisjointProjectStateTrees({
+            allowRebuildableOverlaps: false,
+            source: destinationTree,
+            sourcePath: entry.destination,
+            destination: sourceTree,
+            destinationPath: entry.source,
+          });
+          if (destinationTree.sha256 !== entry.sourceTreeSha256) {
+            throw new Error(
+              `Migrated project state destination changed before compensation: ${entry.destination}`
+            );
+          }
+          await mergeDisjoint(
+            entry.destination,
+            entry.source,
+            "",
+            [],
+            new Set()
+          );
+          await removeEmptyStateTree(entry.destination);
+          if (
+            !treeContainsReviewedEntries(
+              await inspectProjectStateTree(
+                entry.source,
+                ignoredEntriesFor(entry.source)
+              ),
+              entry.sourceEntries
+            )
+          ) {
+            throw new Error(
+              `Legacy project state changed during compensation: ${entry.source}`
+            );
+          }
+          continue;
         }
         if (entry.strategy === "rename") {
           const source = await lstatIfExists(entry.source);
@@ -2406,7 +2707,8 @@ async function migrateLegacyProjectState(args: {
             }
             const sourceTree = await inspectProjectStateTree(entry.source);
             const destinationTree = await inspectProjectStateTree(
-              entry.destination
+              entry.destination,
+              ignoredEntriesFor(entry.source)
             );
             assertDisjointProjectStateTrees({
               allowRebuildableOverlaps: false,
@@ -2420,8 +2722,10 @@ async function migrateLegacyProjectState(args: {
               entry.source,
               "",
               [],
-              new Set()
+              new Set(),
+              ignoredEntriesFor(entry.source)
             );
+            await args.runtimeLocks?.releaseSource(entry.source);
             await removeEmptyStateTree(entry.destination);
             if (
               !treeContainsReviewedEntries(
@@ -2439,14 +2743,19 @@ async function migrateLegacyProjectState(args: {
               entry.sourceEntries
             );
             if (
-              (await inspectProjectStateTree(entry.destination)).sha256 !==
-              entry.sourceTreeSha256
+              (
+                await inspectProjectStateTree(
+                  entry.destination,
+                  ignoredEntriesFor(entry.source)
+                )
+              ).sha256 !== entry.sourceTreeSha256
             ) {
               throw new Error(
                 `Migrated project state destination changed before compensation: ${entry.destination}`
               );
             }
             await rename(entry.destination, entry.source);
+            args.runtimeLocks?.relocate(entry.source, entry.source);
           }
           continue;
         }
@@ -2574,7 +2883,10 @@ async function migrateLegacyProjectState(args: {
       await args.beforeRename?.({ ...entry, index });
       const source = await lstatIfExists(entry.source);
       const sourceTree = source
-        ? await inspectProjectStateTree(entry.source)
+        ? await inspectProjectStateTree(
+            entry.source,
+            ignoredEntriesFor(entry.source)
+          )
         : null;
       const destination = await lstatIfExists(entry.destination);
       if (
@@ -2595,8 +2907,41 @@ async function migrateLegacyProjectState(args: {
             `Project state changed during legacy migration: ${entry.destination}`
           );
         }
+        const ignoredEntries = ignoredEntriesFor(entry.source);
+        if (ignoredEntries.size > 0) {
+          const rootMode =
+            entry.sourceEntries.find((item) => item.path === ".")?.mode ??
+            0o700;
+          await mkdir(entry.destination, { mode: rootMode });
+          await chmod(entry.destination, rootMode);
+          const createdDestination = await lstat(entry.destination);
+          const migration: CompletedMigration = {
+            ...entry,
+            destinationDev: createdDestination.dev,
+            destinationIno: createdDestination.ino,
+            guardedContentMove: true,
+            movedPaths: [],
+            quarantine: null,
+          };
+          completed.push(migration);
+          await mergeDisjoint(
+            entry.source,
+            entry.destination,
+            "",
+            migration.movedPaths,
+            new Set(entry.rebuildableOverlaps),
+            ignoredEntries
+          );
+          continue;
+        }
         await rename(entry.source, entry.destination);
-        completed.push({ ...entry, movedPaths: [], quarantine: null });
+        args.runtimeLocks?.relocate(entry.source, entry.destination);
+        completed.push({
+          ...entry,
+          guardedContentMove: false,
+          movedPaths: [],
+          quarantine: null,
+        });
         continue;
       }
       if (
@@ -2614,6 +2959,7 @@ async function migrateLegacyProjectState(args: {
       }
       const migration: CompletedMigration = {
         ...entry,
+        guardedContentMove: false,
         movedPaths: [],
         quarantine: null,
       };
@@ -2623,7 +2969,8 @@ async function migrateLegacyProjectState(args: {
         entry.destination,
         "",
         migration.movedPaths,
-        new Set(entry.rebuildableOverlaps)
+        new Set(entry.rebuildableOverlaps),
+        ignoredEntriesFor(entry.source)
       );
     }
   } catch (error) {
@@ -2638,6 +2985,36 @@ async function migrateLegacyProjectState(args: {
     throw error;
   }
   const commit = async () => {
+    const assertGuardedContentMoveBoundary = async (
+      entry: CompletedMigration
+    ): Promise<void> => {
+      const [source, destination] = await Promise.all([
+        lstatIfExists(entry.source),
+        lstatIfExists(entry.destination),
+      ]);
+      if (
+        !source ||
+        source.isSymbolicLink() ||
+        !source.isDirectory() ||
+        source.dev !== entry.sourceDev ||
+        source.ino !== entry.sourceIno ||
+        !destination ||
+        destination.isSymbolicLink() ||
+        !destination.isDirectory() ||
+        destination.dev !== entry.destinationDev ||
+        destination.ino !== entry.destinationIno ||
+        !treeContainsReviewedEntries(
+          await inspectProjectStateTree(entry.destination),
+          entry.sourceEntries,
+          new Set(entry.rebuildableOverlaps)
+        )
+      ) {
+        throw new Error(
+          `Legacy project state changed before commit: ${entry.source}`
+        );
+      }
+      await assertGuardedSourceRemainder(entry);
+    };
     const assertRenameCommitBoundary = async (
       entry: CompletedMigration
     ): Promise<void> => {
@@ -2650,7 +3027,10 @@ async function migrateLegacyProjectState(args: {
         destination.dev !== entry.sourceDev ||
         destination.ino !== entry.sourceIno ||
         !treeContainsReviewedEntries(
-          await inspectProjectStateTree(entry.destination),
+          await inspectProjectStateTree(
+            entry.destination,
+            ignoredEntriesFor(entry.source)
+          ),
           entry.sourceEntries,
           new Set(entry.rebuildableOverlaps)
         )
@@ -2662,6 +3042,13 @@ async function migrateLegacyProjectState(args: {
     };
     const pending = await Promise.all(
       completed.map(async (entry) => {
+        if (entry.guardedContentMove) {
+          await assertGuardedContentMoveBoundary(entry);
+          return {
+            entry,
+            kind: "guarded-content-move" as const,
+          };
+        }
         if (entry.strategy === "rename") {
           await assertRenameCommitBoundary(entry);
           return {
@@ -2669,7 +3056,10 @@ async function migrateLegacyProjectState(args: {
             kind: "rename" as const,
           };
         }
-        const remaining = await inspectProjectStateTree(entry.source);
+        const remaining = await inspectProjectStateTree(
+          entry.source,
+          ignoredEntriesFor(entry.source)
+        );
         assertReviewedMergeRemainder(entry, remaining);
         return {
           entry,
@@ -2681,6 +3071,10 @@ async function migrateLegacyProjectState(args: {
     );
     commitStarted = true;
     for (const [index, candidate] of pending.entries()) {
+      if (candidate.kind === "guarded-content-move") {
+        await assertGuardedContentMoveBoundary(candidate.entry);
+        continue;
+      }
       if (candidate.kind === "rename") {
         await assertRenameCommitBoundary(candidate.entry);
         continue;
@@ -2700,72 +3094,58 @@ async function migrateLegacyProjectState(args: {
         !source.isDirectory() ||
         source.dev !== entry.sourceDev ||
         source.ino !== entry.sourceIno ||
-        (await inspectProjectStateTree(entry.source)).sha256 !==
-          remaining.sha256 ||
+        (
+          await inspectProjectStateTree(
+            entry.source,
+            ignoredEntriesFor(entry.source)
+          )
+        ).sha256 !== remaining.sha256 ||
         (await lstatIfExists(quarantinePath))
       ) {
         throw new Error(
           `Legacy project state changed before quarantine: ${entry.source}`
         );
       }
-      await rename(entry.source, quarantinePath);
+      const rootMode =
+        remaining.entries.find((item) => item.path === ".")?.mode ?? 0o700;
+      await mkdir(quarantinePath, { mode: rootMode });
+      const quarantineRoot = await lstat(quarantinePath);
       entry.quarantine = {
-        dev: entry.sourceDev,
+        dev: quarantineRoot.dev,
         files,
-        ino: entry.sourceIno,
+        ino: quarantineRoot.ino,
         path: quarantinePath,
       };
-      const quarantined = await lstatIfExists(quarantinePath);
-      if (
-        !quarantined ||
-        quarantined.isSymbolicLink() ||
-        !quarantined.isDirectory() ||
-        quarantined.dev !== entry.sourceDev ||
-        quarantined.ino !== entry.sourceIno ||
-        (await inspectProjectStateTree(quarantinePath)).sha256 !==
-          remaining.sha256 ||
-        (await lstatIfExists(entry.source))
-      ) {
-        throw new Error(
-          `Legacy project state changed at quarantine boundary: ${entry.source}`
-        );
+      await chmod(quarantinePath, rootMode);
+      for (const file of files) {
+        const sourceFile = join(entry.source, file.relativePath);
+        const quarantineFile = join(quarantinePath, file.relativePath);
+        await mkdir(dirname(quarantineFile), {
+          recursive: true,
+          mode: 0o700,
+        });
+        await rename(sourceFile, quarantineFile);
       }
+      await removeEmptyUnguardedSourceDirectories(entry);
+      await assertGuardedSourceRemainder(entry);
+      await assertQuarantinedFiles(entry.quarantine, true);
       await args.afterQuarantine?.({
         destination: entry.destination,
         index,
         quarantine: quarantinePath,
         source: entry.source,
       });
-      if (
-        (await lstatIfExists(entry.source)) ||
-        (await inspectProjectStateTree(quarantinePath)).sha256 !==
-          remaining.sha256
-      ) {
+      try {
+        await assertGuardedSourceRemainder(entry);
+        await assertQuarantinedFiles(entry.quarantine, true);
+      } catch {
         throw new Error(
           `Legacy project state changed after quarantine: ${entry.source}`
         );
       }
-      const assertQuarantineBinding = async (): Promise<void> => {
-        const current = await lstatIfExists(quarantinePath);
-        if (
-          !current ||
-          current.isSymbolicLink() ||
-          !current.isDirectory() ||
-          current.dev !== entry.sourceDev ||
-          current.ino !== entry.sourceIno
-        ) {
-          throw new Error(
-            `Quarantined legacy project state binding changed: ${quarantinePath}`
-          );
-        }
-      };
       for (const file of files) {
-        if (await lstatIfExists(entry.source)) {
-          throw new Error(
-            `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-          );
-        }
-        await assertQuarantineBinding();
+        await assertGuardedSourceRemainder(entry);
+        await assertQuarantinedFiles(entry.quarantine, false);
         await unlinkVerifiedFileAt({
           directoryPath: dirname(join(quarantinePath, file.relativePath)),
           expectedSha256: file.sha256,
@@ -2782,28 +3162,22 @@ async function migrateLegacyProjectState(args: {
             right.path.localeCompare(left.path)
         );
       for (const directory of directories) {
-        if (await lstatIfExists(entry.source)) {
-          throw new Error(
-            `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-          );
+        const pathValue = join(quarantinePath, directory.path);
+        if (await lstatIfExists(pathValue)) {
+          await assertGuardedSourceRemainder(entry);
+          await rmdir(pathValue);
         }
-        await assertQuarantineBinding();
-        await rmdir(join(quarantinePath, directory.path));
       }
-      if (await lstatIfExists(entry.source)) {
-        throw new Error(
-          `Legacy project state path reappeared during quarantine cleanup: ${entry.source}`
-        );
-      }
-      await assertQuarantineBinding();
+      await assertGuardedSourceRemainder(entry);
       await rmdir(quarantinePath);
-      if (await lstatIfExists(entry.source)) {
-        throw new Error(
-          `Legacy project state path reappeared after quarantine cleanup: ${entry.source}`
-        );
-      }
+      await assertGuardedSourceRemainder(entry);
+      await args.runtimeLocks?.releaseSource(entry.source);
     }
     for (const candidate of pending) {
+      if (candidate.kind === "guarded-content-move") {
+        await assertGuardedContentMoveBoundary(candidate.entry);
+        continue;
+      }
       if (candidate.kind === "rename") {
         await assertRenameCommitBoundary(candidate.entry);
       }
@@ -4330,6 +4704,7 @@ async function acquireProjectRuntimeMigrationLocks(args: {
           pid: process.pid,
           token,
           startedAt: new Date().toISOString(),
+          processStartedAt: processStartIdentity(process.pid),
           operation: "project-enrollment-state-migration",
         })}\n`
       );
@@ -4339,6 +4714,238 @@ async function acquireProjectRuntimeMigrationLocks(args: {
     throw error;
   }
   return release;
+}
+
+async function acquireLegacyProjectRuntimeMigrationLocks(args: {
+  migration?: ProjectStateMigrationPlanEntry;
+}): Promise<LegacyProjectRuntimeMigrationLocks> {
+  type LeaseEntry = {
+    createdDirectories: Array<{
+      dev: number;
+      ino: number;
+      relativePath: string;
+    }>;
+    currentRoot: string;
+    locks: Array<{
+      dev: number;
+      handle: FileHandle;
+      ino: number;
+      relativePath: string;
+    }>;
+    released: boolean;
+  };
+  const token = randomUUID();
+  const entries = new Map<string, LeaseEntry>();
+  const ignoredEntriesBySource = new Map<
+    string,
+    ReadonlyMap<string, { dev: number; ino: number }>
+  >();
+
+  const releaseSource = async (source: string): Promise<void> => {
+    const entry = entries.get(source);
+    if (!entry || entry.released) {
+      return;
+    }
+    const failures: unknown[] = [];
+    for (const lock of entry.locks) {
+      await lock.handle.close().catch((error) => failures.push(error));
+      const pathValue = join(entry.currentRoot, lock.relativePath);
+      try {
+        const metadata = await lstatIfExists(pathValue);
+        if (
+          !metadata ||
+          metadata.isSymbolicLink() ||
+          !metadata.isFile() ||
+          metadata.dev !== lock.dev ||
+          metadata.ino !== lock.ino
+        ) {
+          throw new Error(
+            `Legacy project runtime migration lock changed: ${pathValue}`
+          );
+        }
+        const owner = JSON.parse(await readFile(pathValue, "utf8")) as {
+          token?: unknown;
+        };
+        if (owner.token !== token) {
+          throw new Error(
+            `Legacy project runtime migration lock ownership changed: ${pathValue}`
+          );
+        }
+        await rm(pathValue);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const directory of [...entry.createdDirectories].sort(
+      (left, right) =>
+        right.relativePath.split("/").length -
+          left.relativePath.split("/").length ||
+        right.relativePath.localeCompare(left.relativePath)
+    )) {
+      const pathValue = join(entry.currentRoot, directory.relativePath);
+      try {
+        const metadata = await lstatIfExists(pathValue);
+        if (
+          !metadata ||
+          metadata.isSymbolicLink() ||
+          !metadata.isDirectory() ||
+          metadata.dev !== directory.dev ||
+          metadata.ino !== directory.ino
+        ) {
+          throw new Error(
+            `Legacy project runtime migration lock directory changed: ${pathValue}`
+          );
+        }
+        await rmdir(pathValue);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (entry.currentRoot === source && entry.createdDirectories.length > 0) {
+      try {
+        await rmdir(source);
+      } catch (error) {
+        if (
+          !(
+            error instanceof Error &&
+            "code" in error &&
+            ["ENOENT", "ENOTEMPTY"].includes(
+              String((error as NodeJS.ErrnoException).code)
+            )
+          )
+        ) {
+          failures.push(error);
+        }
+      }
+    }
+    entry.released = true;
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Legacy project runtime migration lock cleanup failed for ${source}`
+      );
+    }
+  };
+  const release = async (): Promise<void> => {
+    const failures: unknown[] = [];
+    for (const source of entries.keys()) {
+      await releaseSource(source).catch((error) => failures.push(error));
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Legacy project runtime migration lock cleanup failed"
+      );
+    }
+  };
+
+  const migration = args.migration;
+  if (!migration) {
+    return {
+      ignoredEntriesBySource,
+      relocate: () => undefined,
+      releaseSource,
+      release,
+    };
+  }
+  const lease: LeaseEntry = {
+    createdDirectories: [],
+    currentRoot: migration.source,
+    locks: [],
+    released: false,
+  };
+  entries.set(migration.source, lease);
+  try {
+    const ignoredEntries = new Map<string, { dev: number; ino: number }>();
+    const ensureLockParent = async (pathValue: string): Promise<void> => {
+      const parentPath = dirname(pathValue);
+      const parentRelative = relative(migration.source, parentPath);
+      let currentPath = migration.source;
+      let currentRelative = "";
+      for (const segment of parentRelative
+        .split(PATH_SEPARATOR_RUN_RE)
+        .filter(Boolean)) {
+        currentPath = join(currentPath, segment);
+        currentRelative = currentRelative
+          ? `${currentRelative}/${segment}`
+          : segment;
+        let metadata = await lstatIfExists(currentPath);
+        if (!metadata) {
+          await mkdir(currentPath, { mode: 0o700 });
+          metadata = await lstat(currentPath);
+          ignoredEntries.set(currentRelative, {
+            dev: metadata.dev,
+            ino: metadata.ino,
+          });
+          lease.createdDirectories.push({
+            dev: metadata.dev,
+            ino: metadata.ino,
+            relativePath: currentRelative,
+          });
+        }
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          throw new Error(
+            `Refusing unsafe legacy project runtime lock directory: ${currentPath}`
+          );
+        }
+      }
+    };
+    for (const relativePath of LEGACY_RUNTIME_PRIMARY_LOCK_PATHS) {
+      const pathValue = join(migration.source, relativePath);
+      await ensureLockParent(pathValue);
+      let handle: FileHandle;
+      try {
+        handle = await open(pathValue, "wx");
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          (error as NodeJS.ErrnoException).code === "EEXIST"
+        ) {
+          throw new Error(
+            `Project enrollment cannot migrate legacy runtime state while another writer holds ${pathValue}`
+          );
+        }
+        throw error;
+      }
+      await handle.writeFile(
+        `${JSON.stringify({
+          pid: process.pid,
+          token,
+          startedAt: new Date().toISOString(),
+          processStartedAt: processStartIdentity(process.pid),
+          operation: "project-enrollment-legacy-state-migration",
+        })}\n`
+      );
+      const metadata = await handle.stat();
+      lease.locks.push({
+        dev: metadata.dev,
+        handle,
+        ino: metadata.ino,
+        relativePath,
+      });
+      ignoredEntries.set(relativePath, {
+        dev: metadata.dev,
+        ino: metadata.ino,
+      });
+    }
+    ignoredEntriesBySource.set(migration.source, ignoredEntries);
+  } catch (error) {
+    await release();
+    throw error;
+  }
+
+  return {
+    ignoredEntriesBySource,
+    relocate: (source, currentRoot) => {
+      const entry = entries.get(source);
+      if (entry && !entry.released) {
+        entry.currentRoot = currentRoot;
+      }
+    },
+    releaseSource,
+    release,
+  };
 }
 
 export async function applyProjectEnrollment(args: {
@@ -4415,6 +5022,7 @@ export async function applyProjectEnrollment(args: {
     enabled: args.plan.stateMigrations.length > 0,
     homeDir,
   });
+  let legacyRuntimeLocks = await acquireLegacyProjectRuntimeMigrationLocks({});
   return await withProjectsMutationLock(
     homeDir,
     async () => {
@@ -4457,6 +5065,11 @@ export async function applyProjectEnrollment(args: {
           "Enrollment plan is stale because project state migrations changed"
         );
       }
+      legacyRuntimeLocks = await acquireLegacyProjectRuntimeMigrationLocks({
+        migration: currentStateMigrations.find(
+          (migration) => migration.destination === executionStateDir
+        ),
+      });
       for (const pathValue of expectedGeneratedPaths) {
         await assertSafeDescendantPath({
           root: stateRoot,
@@ -4488,6 +5101,7 @@ export async function applyProjectEnrollment(args: {
         expected: args.plan.stateMigrations,
         beforeRename: args.beforeLegacyStateRename,
         beforeRestore: args.beforeLegacyStateRestore,
+        runtimeLocks: legacyRuntimeLocks,
       });
       try {
         for (const [index, write] of args.plan.canonicalWrites.entries()) {
@@ -4673,7 +5287,21 @@ export async function applyProjectEnrollment(args: {
       };
     },
     args.mutationLockAttempts
-  ).finally(releaseRuntimeLocks);
+  ).finally(async () => {
+    const results = await Promise.allSettled([
+      legacyRuntimeLocks.release(),
+      releaseRuntimeLocks(),
+    ]);
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Project enrollment runtime migration lock cleanup failed"
+      );
+    }
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
