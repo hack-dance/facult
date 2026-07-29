@@ -3220,20 +3220,16 @@ interface ProjectMutationLockObservation {
   owner: ProjectMutationLockOwner | null;
 }
 
-function projectMutationLockObservationRaced(
-  error: unknown,
-  lockPath: string
-): boolean {
-  if (!(error instanceof Error)) {
-    return false;
+class ProjectMutationLockObservationRaceError extends Error {
+  constructor(lockPath: string, options?: { cause?: unknown }) {
+    super(
+      `Project enrollment mutation lock changed during observation: ${lockPath}`,
+      {
+        cause: options?.cause,
+      }
+    );
+    this.name = "ProjectMutationLockObservationRaceError";
   }
-  const ownerPath = projectMutationLockOwnerPath(lockPath);
-  return (
-    error.message ===
-      `Project enrollment mutation lock changed while reading its owner: ${lockPath}` ||
-    (error.message.startsWith("Canonical project file changed ") &&
-      error.message.endsWith(`: ${ownerPath}`))
-  );
 }
 
 async function observeProjectMutationLock(
@@ -3249,7 +3245,21 @@ async function observeProjectMutationLock(
     );
   }
   const ownerPath = projectMutationLockOwnerPath(lockPath);
-  const ownerSnapshot = await canonicalFileSnapshot(ownerPath);
+  let ownerSnapshot: CanonicalFileSnapshot | null;
+  try {
+    ownerSnapshot = await canonicalFileSnapshot(ownerPath);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.startsWith("Canonical project file changed ") ||
+        error.message.startsWith("Canonical project file parent changed "))
+    ) {
+      throw new ProjectMutationLockObservationRaceError(lockPath, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
   const lockAfter = await lstatIfExists(lockPath);
   if (
     !lockAfter ||
@@ -3257,9 +3267,7 @@ async function observeProjectMutationLock(
     !lockAfter.isDirectory() ||
     !canonicalMetadataMatches(lock, lockAfter)
   ) {
-    throw new Error(
-      `Project enrollment mutation lock changed while reading its owner: ${lockPath}`
-    );
+    throw new ProjectMutationLockObservationRaceError(lockPath);
   }
   if (!ownerSnapshot) {
     return {
@@ -3309,7 +3317,15 @@ async function reclaimAbandonedProjectMutationLock(args: {
   }
   const quarantine = `${args.lockPath}.abandoned-${randomUUID()}`;
   try {
-    const current = await observeProjectMutationLock(args.lockPath);
+    let current: ProjectMutationLockObservation | null;
+    try {
+      current = await observeProjectMutationLock(args.lockPath);
+    } catch (error) {
+      if (error instanceof ProjectMutationLockObservationRaceError) {
+        return false;
+      }
+      throw error;
+    }
     if (
       !(
         current?.owner &&
@@ -3406,7 +3422,7 @@ async function withProjectsMutationLock<T>(
       try {
         observed = await observeProjectMutationLock(lockPath);
       } catch (error) {
-        if (projectMutationLockObservationRaced(error, lockPath)) {
+        if (error instanceof ProjectMutationLockObservationRaceError) {
           // The winner may be publishing or releasing its lock. Waiting is
           // safe; reclaiming or treating a transient observation as fatal is
           // not.

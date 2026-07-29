@@ -3745,6 +3745,58 @@ describe("project enrollment lifecycle", () => {
     expect(await Bun.file(lockPath).exists()).toBe(false);
   });
 
+  it("does not expose observation races during concurrent abandoned-lock recovery", async () => {
+    const { root, home } = await makeFixture();
+    const repo = join(root, "repo");
+    await createRepository({ path: repo, home });
+    const plan = await planProjectEnrollment({
+      projectRoot: repo,
+      homeDir: home,
+    });
+    const lockPath =
+      plan.machineLocalWrites.find((write) =>
+        write.path.endsWith("mutation.lock")
+      )?.path ?? "";
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({
+        version: 2,
+        endpoint: join(tmpdir(), "fclt-concurrent-abandoned-owner.sock"),
+        ownerId: "concurrent-abandoned-owner",
+        pid: 999_999,
+        acquiredAt: "2026-07-28T00:00:00.000Z",
+        transport: "ipc-socket",
+      })}\n`,
+      "utf8"
+    );
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 25 }, () =>
+        applyProjectEnrollment({
+          plan,
+          expectedPlanSha256: plan.planSha256,
+          homeDir: home,
+        })
+      )
+    );
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1);
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    expect(rejected).toHaveLength(24);
+    expect(
+      rejected.every(
+        (result) =>
+          result.reason instanceof Error &&
+          result.reason.message.includes("Enrollment plan is stale")
+      )
+    ).toBe(true);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+  });
+
   it("fails safe when a live owner is IPC-unresponsive or its PID was reused", async () => {
     if (process.platform === "win32") {
       return;
