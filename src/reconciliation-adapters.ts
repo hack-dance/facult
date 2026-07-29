@@ -535,6 +535,34 @@ export async function gitDefaultBranchContainment(args: {
   };
 }
 
+export async function gitDefaultBranchContainments(args: {
+  commits: string[];
+  config: GitSourceConfig;
+  projectRoot: string;
+}): Promise<{
+  defaultBranch: string;
+  onDefaultBranch: Record<string, boolean>;
+}> {
+  const defaultBranch = await configuredDefaultBranch({
+    config: args.config,
+    projectRoot: args.projectRoot,
+  });
+  const candidates = unique(
+    args.commits.filter((commit) => GIT_OBJECT_ID_RE.test(commit))
+  );
+  const reachable = new Set(
+    (await runGit(["rev-list", defaultBranch.ref], args.projectRoot))
+      .split(LINE_SPLIT_RE)
+      .filter(Boolean)
+  );
+  return {
+    defaultBranch: defaultBranch.display,
+    onDefaultBranch: Object.fromEntries(
+      candidates.map((commit) => [commit, reachable.has(commit)])
+    ),
+  };
+}
+
 async function gitIsAncestor(args: {
   commit: string;
   ancestorOf: string;

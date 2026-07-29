@@ -24,7 +24,7 @@ import {
   processStartIdentityMatches,
 } from "./process-identity";
 import {
-  gitDefaultBranchContainment,
+  gitDefaultBranchContainments,
   reconciliationAdapterFor,
 } from "./reconciliation-adapters";
 import {
@@ -1855,31 +1855,33 @@ export async function reconcileSources(args: {
         );
         const sourceRecheckedProofs: ResolutionProof[] = [];
         try {
-          for (const pending of pendingCommits) {
-            const containment = await gitDefaultBranchContainment({
-              commit: pending.recordId,
+          if (pendingCommits.length > 0) {
+            const containment = await gitDefaultBranchContainments({
+              commits: pendingCommits.map((pending) => pending.recordId),
               config: source,
               projectRoot,
             });
-            if (!containment.onDefaultBranch) {
-              continue;
+            for (const pending of pendingCommits) {
+              if (!containment.onDefaultBranch[pending.recordId]) {
+                continue;
+              }
+              sourceRecheckedProofs.push({
+                sourceId: source.id,
+                sourceType: "git",
+                sourceRecordId: pending.recordId,
+                kind: "default_branch_containment",
+                issueRefs: [],
+                evidenceKey: pending.evidenceKey,
+                provenance: {
+                  repository: projectRoot,
+                  commit: pending.recordId,
+                  defaultBranch: containment.defaultBranch,
+                  onDefaultBranch: true,
+                  terminal: true,
+                  rechecked: true,
+                },
+              });
             }
-            sourceRecheckedProofs.push({
-              sourceId: source.id,
-              sourceType: "git",
-              sourceRecordId: pending.recordId,
-              kind: "default_branch_containment",
-              issueRefs: [],
-              evidenceKey: pending.evidenceKey,
-              provenance: {
-                repository: projectRoot,
-                commit: pending.recordId,
-                defaultBranch: containment.defaultBranch,
-                onDefaultBranch: true,
-                terminal: true,
-                rechecked: true,
-              },
-            });
           }
           recheckedResolutionProofs.push(...sourceRecheckedProofs);
         } catch (error) {
