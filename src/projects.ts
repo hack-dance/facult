@@ -127,6 +127,8 @@ const PLAN_SHA_RE = /^[a-f0-9]{64}$/;
 const PROJECT_MUTATION_LOCK_ATTEMPTS = 500;
 const PROJECT_MUTATION_LOCK_RETRY_MS = 10;
 const PROJECT_CANONICAL_FILE_MAX_BYTES = 1024 * 1024;
+const PROJECT_GUIDANCE_FILE_MAX_BYTES = 1024 * 1024;
+const PROJECT_RECEIPT_FILE_MAX_BYTES = 24 * 1024 * 1024;
 const PROJECT_GENERATED_FILE_MAX_BYTES = 64 * 1024 * 1024;
 const PROJECT_STATE_TREE_MAX_BYTES = 256 * 1024 * 1024;
 const PROJECT_STATE_TREE_MAX_ENTRIES = 32_768;
@@ -673,7 +675,8 @@ function canonicalMetadataMatches(left: Stats, right: Stats): boolean {
 }
 
 async function canonicalFileSnapshot(
-  pathValue: string
+  pathValue: string,
+  maxBytes = PROJECT_CANONICAL_FILE_MAX_BYTES
 ): Promise<CanonicalFileSnapshot | null> {
   const parentPath = dirname(pathValue);
   const parentBefore = await lstatIfExists(parentPath);
@@ -714,7 +717,7 @@ async function canonicalFileSnapshot(
     pathMetadata.nlink !== 1 ||
     !Number.isSafeInteger(pathMetadata.size) ||
     pathMetadata.size < 0 ||
-    pathMetadata.size > PROJECT_CANONICAL_FILE_MAX_BYTES
+    pathMetadata.size > maxBytes
   ) {
     throw new Error(`Refusing unsafe canonical file: ${pathValue}`);
   }
@@ -1587,13 +1590,40 @@ async function previewGuidance(args: {
         opened.isSymbolicLink() ||
         opened.nlink !== 1 ||
         opened.dev !== guidanceStat.dev ||
-        opened.ino !== guidanceStat.ino
+        opened.ino !== guidanceStat.ino ||
+        !Number.isSafeInteger(opened.size) ||
+        opened.size < 0 ||
+        opened.size > PROJECT_GUIDANCE_FILE_MAX_BYTES
       ) {
         throw new Error(
-          `Refusing guidance adoption from ${pathValue}: the source changed before read`
+          opened.size > PROJECT_GUIDANCE_FILE_MAX_BYTES
+            ? `Refusing guidance adoption from ${pathValue}: the source exceeds the 1 MiB preview limit`
+            : `Refusing guidance adoption from ${pathValue}: the source changed before read`
         );
       }
-      content = await handle.readFile("utf8");
+      const bytes = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const { bytesRead } = await handle.read(
+          bytes,
+          offset,
+          bytes.length - offset,
+          offset
+        );
+        if (bytesRead === 0) {
+          throw new Error(
+            `Refusing guidance adoption from ${pathValue}: the source changed while reading`
+          );
+        }
+        offset += bytesRead;
+      }
+      const trailing = Buffer.alloc(1);
+      if ((await handle.read(trailing, 0, 1, opened.size)).bytesRead !== 0) {
+        throw new Error(
+          `Refusing guidance adoption from ${pathValue}: the source changed while reading`
+        );
+      }
+      content = bytes.toString("utf8");
       const afterRead = await handle.stat();
       const rebound = await lstatIfExists(absolutePath);
       if (
@@ -4489,6 +4519,13 @@ export async function applyProjectEnrollment(args: {
           }),
         };
         const receiptContent = `${JSON.stringify(receipt, null, 2)}\n`;
+        if (
+          Buffer.byteLength(receiptContent) > PROJECT_RECEIPT_FILE_MAX_BYTES
+        ) {
+          throw new Error(
+            "Enrollment receipt exceeds the supported transaction size"
+          );
+        }
         const receiptArtifact = await captureArtifact({
           path: receiptPath,
           afterContent: receiptContent,
@@ -4631,7 +4668,10 @@ async function readReceipt(args: {
     projectReceiptsDir(args.homeDir),
     `${args.receiptId}.json`
   );
-  const snapshot = await canonicalFileSnapshot(pathValue);
+  const snapshot = await canonicalFileSnapshot(
+    pathValue,
+    PROJECT_RECEIPT_FILE_MAX_BYTES
+  );
   if (!snapshot) {
     throw new Error(`Invalid enrollment receipt: ${args.receiptId}`);
   }

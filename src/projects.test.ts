@@ -1680,6 +1680,7 @@ Read \\server\share\private.toml.
 ghs_APP_ID.${"a".repeat(240)}.${"b".repeat(240)}
 `,
         "docs/aws-token.md": "# Secret\n\nAKIAIOSFODNN7EXAMPLE\n",
+        "docs/oversized.md": `# Oversized\n\n${"a".repeat(1024 * 1024)}\n`,
       },
     });
     await mkdir(join(repo, ".ai"), { recursive: true });
@@ -1735,6 +1736,13 @@ ghs_APP_ID.${"a".repeat(240)}.${"b".repeat(240)}
         guidance: ["docs/secret.md"],
       })
     ).rejects.toThrow("secret-shaped content");
+    await expect(
+      planProjectEnrollment({
+        projectRoot: repo,
+        homeDir: home,
+        guidance: ["docs/oversized.md"],
+      })
+    ).rejects.toThrow("exceeds the 1 MiB preview limit");
     for (const guidance of [
       "docs/github-token.md",
       "docs/github-fine-grained-token.md",
@@ -4756,7 +4764,7 @@ describe("project enrollment lifecycle", () => {
 
     await rm(receiptPath);
     await writeFile(receiptPath, receipt, "utf8");
-    await truncate(receiptPath, 1024 * 1024 + 1);
+    await truncate(receiptPath, 24 * 1024 * 1024 + 1);
     await expect(
       rollbackProjectEnrollment({
         receiptId: applied.receiptId,
