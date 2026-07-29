@@ -2360,7 +2360,15 @@ describe("project enrollment lifecycle", () => {
         expectedPlanSha256: refreshed.planSha256,
         homeDir: home,
       });
-      expect(await pathEntryExists(legacyDir)).toBe(false);
+      expect(await pathEntryExists(legacyDir)).toBe(true);
+      expect(
+        (
+          await planProjectEnrollment({
+            projectRoot: repo,
+            homeDir: home,
+          })
+        ).stateMigrations
+      ).toEqual([]);
       expect(
         await Bun.file(
           join(facultMachineStateDir(home, aiRoot), "journal", "events.jsonl")
@@ -2979,10 +2987,7 @@ describe("project enrollment lifecycle", () => {
       plan,
       expectedPlanSha256: plan.planSha256,
       homeDir: home,
-      beforeLegacyStateRename: async ({ source }) => {
-        if (source !== legacyState) {
-          return;
-        }
+      afterGeneratedWrites: async () => {
         try {
           const competitor = await open(legacyLock, "wx");
           await competitor.close();
@@ -2997,7 +3002,12 @@ describe("project enrollment lifecycle", () => {
 
     const selectedState = facultMachineStateDir(home, aiRoot);
     expect(competingWriterBlocked).toBe(true);
-    expect(await Bun.file(legacyState).exists()).toBe(false);
+    expect((await lstat(legacyState)).isDirectory()).toBe(true);
+    expect(
+      await Bun.file(
+        join(legacyState, "ai/project/reconciliation/state.json")
+      ).exists()
+    ).toBe(false);
     expect(
       await Bun.file(
         join(selectedState, "ai/project/reconciliation/state.json")
@@ -3008,6 +3018,14 @@ describe("project enrollment lifecycle", () => {
         join(selectedState, "ai/project/reconciliation/state.json.lock")
       ).exists()
     ).toBe(false);
+    expect(
+      (
+        await planProjectEnrollment({
+          projectRoot: repo,
+          homeDir: home,
+        })
+      ).stateMigrations
+    ).toEqual([]);
   });
 
   it("compensates a legacy source reappearance after quarantine", async () => {

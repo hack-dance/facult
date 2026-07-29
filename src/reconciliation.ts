@@ -7,7 +7,6 @@ import {
   readFile,
   rename,
   rm,
-  stat,
   utimes,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -139,7 +138,8 @@ function migrateLinkedWorkStatuses(args: {
       }
       const observation: LinkedWorkStatusObservation = {
         issueRef,
-        observedAt: proof.observedAt ?? "1970-01-01T00:00:00.000Z",
+        ordering: proof.observedAt ? "known" : "unknown",
+        observedAt: proof.observedAt ?? entry.lastSeenAt,
         terminal: true,
         sourceId: proof.sourceId,
         sourceType: proof.sourceType,
@@ -292,6 +292,22 @@ async function acquireRecoveryClaim(args: {
     );
   }
   await args.onStaleClaimInspected?.();
+  const current = await lstat(args.takeoverPath).catch(() => null);
+  if (
+    !(
+      info &&
+      current &&
+      current.isFile() &&
+      !current.isSymbolicLink() &&
+      current.dev === info.dev &&
+      current.ino === info.ino &&
+      current.mtimeMs === info.mtimeMs
+    )
+  ) {
+    throw new Error(
+      `Another reconciliation is recovering ${args.lockPath} using ${args.takeoverPath}`
+    );
+  }
   try {
     await rename(
       args.takeoverPath,
@@ -349,9 +365,15 @@ async function withStateLock<T>(
         })}\n`
       );
       await takeover.sync();
-      const info = await stat(lockPath).catch(() => null);
+      const info = await lstat(lockPath).catch(() => null);
       const ageMs = info ? Date.now() - info.mtime.getTime() : 0;
-      if (!(info && ageMs > RECONCILIATION_LOCK_LEASE_MS)) {
+      if (
+        !(
+          info?.isFile() &&
+          !info.isSymbolicLink() &&
+          ageMs > RECONCILIATION_LOCK_LEASE_MS
+        )
+      ) {
         throw new Error(
           `Another reconciliation is already updating ${lockPath}`
         );
@@ -365,6 +387,20 @@ async function withStateLock<T>(
       if (takeoverOwner.token !== ownerToken) {
         throw new Error(
           `Reconciliation recovery ownership changed for ${takeoverPath}`
+        );
+      }
+      const currentLock = await lstat(lockPath).catch(() => null);
+      if (
+        !(
+          info &&
+          currentLock &&
+          currentLock.dev === info.dev &&
+          currentLock.ino === info.ino &&
+          currentLock.mtimeMs === info.mtimeMs
+        )
+      ) {
+        throw new Error(
+          `Reconciliation lock ownership changed during recovery for ${lockPath}`
         );
       }
       await rename(lockPath, `${lockPath}.stale-${Date.now()}-${ownerToken}`);
@@ -1103,8 +1139,22 @@ function latestLinkedWorkStatuses(args: {
   observations: LinkedWorkStatusObservation[];
 }): Map<string, LinkedWorkStatusObservation> {
   const latest = new Map(Object.entries(args.state.linkedWorkStatuses ?? {}));
-  for (const observation of args.observations) {
+  const observations = [...args.observations].sort((left, right) =>
+    `${left.observedAt}\n${left.sourceRecordId}`.localeCompare(
+      `${right.observedAt}\n${right.sourceRecordId}`
+    )
+  );
+  for (const observation of observations) {
     const prior = latest.get(observation.issueRef);
+    if (prior?.ordering === "unknown") {
+      if (
+        observation.sourceId === prior.sourceId &&
+        observation.sourceRecordId === prior.sourceRecordId
+      ) {
+        latest.set(observation.issueRef, observation);
+      }
+      continue;
+    }
     const observationKey = `${observation.observedAt}\n${observation.sourceRecordId}`;
     const priorKey = prior
       ? `${prior.observedAt}\n${prior.sourceRecordId}`
@@ -1145,13 +1195,15 @@ function resolvedSignalFamilies(args: {
   signals: CorrelatedSignal[];
   linkedWorkStatuses: LinkedWorkStatusObservation[];
 }): string[] {
+  const latestStatuses = latestLinkedWorkStatuses({
+    state: args.state,
+    observations: args.linkedWorkStatuses,
+  });
+  const linkedWorkStatusKeys = new Set(
+    [...latestStatuses.keys()].map((issueRef) => `issue:${issueRef}`)
+  );
   const terminalIssueKeys = new Set(
-    [
-      ...latestLinkedWorkStatuses({
-        state: args.state,
-        observations: args.linkedWorkStatuses,
-      }).entries(),
-    ]
+    [...latestStatuses.entries()]
       .filter(([, observation]) => observation.terminal)
       .map(([issueRef]) => `issue:${issueRef}`)
   );
@@ -1185,10 +1237,12 @@ function resolvedSignalFamilies(args: {
         ...family.evidenceKeys,
         ...currentSignals.flatMap((signal) => signal.evidenceKeys),
       ].some((key) => defaultBranchEvidenceKeys.has(key));
-      const exactEvidenceTerminal = [
-        ...family.evidenceKeys,
-        ...currentSignals.flatMap((signal) => signal.evidenceKeys),
-      ].some((key) => terminalEvidenceKeys.has(key));
+      const exactEvidenceTerminal =
+        [
+          ...family.evidenceKeys,
+          ...currentSignals.flatMap((signal) => signal.evidenceKeys),
+        ].some((key) => terminalEvidenceKeys.has(key)) &&
+        !linkedIssues.some((key) => linkedWorkStatusKeys.has(key));
       return allLinkedWorkTerminal ||
         exactEvidenceOnDefaultBranch ||
         exactEvidenceTerminal

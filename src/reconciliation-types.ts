@@ -176,6 +176,7 @@ export interface ResolutionProof {
 
 export interface LinkedWorkStatusObservation {
   issueRef: string;
+  ordering?: "known" | "unknown";
   observedAt: string;
   terminal: boolean;
   sourceId: string;

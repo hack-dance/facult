@@ -1633,6 +1633,29 @@ describe("source reconciliation", () => {
       JSON.stringify(
         evidenceExport([
           {
+            id: "older-open",
+            kind: "status-change",
+            observedAt: "2026-07-05T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "done",
+            kind: "status-change",
+            observedAt: "2026-07-06T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "done",
+          },
+          {
             id: "reopened",
             kind: "status-change",
             observedAt: "2026-07-07T10:00:00Z",

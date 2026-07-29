@@ -2019,6 +2019,14 @@ async function planLegacyProjectStateMigrations(args: {
         `Refusing unsafe legacy project state: ${candidate.source}`
       );
     }
+    const sourceTree = await inspectProjectStateTree(candidate.source);
+    assertNoMigratingRuntimeLocks({
+      path: candidate.source,
+      tree: sourceTree,
+    });
+    if (!sourceTree.entries.some((entry) => entry.type === "file")) {
+      continue;
+    }
     const claimedSource = claimedDestinations.get(candidate.destination);
     if (claimedSource) {
       throw new Error(
@@ -2026,11 +2034,6 @@ async function planLegacyProjectStateMigrations(args: {
       );
     }
     claimedDestinations.set(candidate.destination, candidate.source);
-    const sourceTree = await inspectProjectStateTree(candidate.source);
-    assertNoMigratingRuntimeLocks({
-      path: candidate.source,
-      tree: sourceTree,
-    });
     const destination = await lstatIfExists(candidate.destination);
     if (!destination) {
       planned.push({
@@ -2219,11 +2222,40 @@ async function migrateLegacyProjectState(args: {
     path: string;
   };
   type CompletedMigration = (typeof planned)[number] & {
+    guardedContentMove: boolean;
     movedPaths: MovedPath[];
     quarantine: QuarantinedSource | null;
   };
   const completed: CompletedMigration[] = [];
   let commitStarted = false;
+
+  const assertGuardedSourceRemainder = async (
+    entry: CompletedMigration
+  ): Promise<void> => {
+    const ignoredPaths = [...ignoredEntriesFor(entry.source).keys()];
+    const allowedDirectories = new Set<string>(["."]);
+    for (const pathValue of ignoredPaths) {
+      let parent = dirname(pathValue);
+      while (parent !== ".") {
+        allowedDirectories.add(parent);
+        parent = dirname(parent);
+      }
+    }
+    const remaining = await inspectProjectStateTree(
+      entry.source,
+      ignoredEntriesFor(entry.source)
+    );
+    if (
+      remaining.entries.some(
+        (item) =>
+          item.type !== "directory" || !allowedDirectories.has(item.path)
+      )
+    ) {
+      throw new Error(
+        `Legacy project state changed before commit: ${entry.source}`
+      );
+    }
+  };
 
   const mergeDisjoint = async (
     source: string,
@@ -2479,8 +2511,13 @@ async function migrateLegacyProjectState(args: {
           destination.isSymbolicLink() ||
           !destination.isDirectory() ||
           (entry.strategy === "rename" &&
+            !entry.guardedContentMove &&
             (destination.dev !== entry.sourceDev ||
               destination.ino !== entry.sourceIno)) ||
+          (entry.strategy === "rename" &&
+            entry.guardedContentMove &&
+            (destination.dev !== entry.destinationDev ||
+              destination.ino !== entry.destinationIno)) ||
           (entry.strategy === "merge-disjoint" &&
             (destination.dev !== entry.destinationDev ||
               destination.ino !== entry.destinationIno))
@@ -2488,6 +2525,50 @@ async function migrateLegacyProjectState(args: {
           throw new Error(
             `Migrated project state destination changed before compensation: ${entry.destination}`
           );
+        }
+        if (entry.guardedContentMove) {
+          const source = await lstatIfExists(entry.source);
+          if (
+            !source ||
+            source.isSymbolicLink() ||
+            !source.isDirectory() ||
+            source.dev !== entry.sourceDev ||
+            source.ino !== entry.sourceIno
+          ) {
+            throw new Error(
+              `Legacy project state path changed before compensation: ${entry.source}`
+            );
+          }
+          await assertGuardedSourceRemainder(entry);
+          if (
+            (await inspectProjectStateTree(entry.destination)).sha256 !==
+            entry.sourceTreeSha256
+          ) {
+            throw new Error(
+              `Migrated project state destination changed before compensation: ${entry.destination}`
+            );
+          }
+          await mergeDisjoint(
+            entry.destination,
+            entry.source,
+            "",
+            [],
+            new Set()
+          );
+          await removeEmptyStateTree(entry.destination);
+          if (
+            (
+              await inspectProjectStateTree(
+                entry.source,
+                ignoredEntriesFor(entry.source)
+              )
+            ).sha256 !== entry.sourceTreeSha256
+          ) {
+            throw new Error(
+              `Legacy project state changed during compensation: ${entry.source}`
+            );
+          }
+          continue;
         }
         if (entry.strategy === "rename") {
           const source = await lstatIfExists(entry.source);
@@ -2699,9 +2780,41 @@ async function migrateLegacyProjectState(args: {
             `Project state changed during legacy migration: ${entry.destination}`
           );
         }
+        const ignoredEntries = ignoredEntriesFor(entry.source);
+        if (ignoredEntries.size > 0) {
+          const rootMode =
+            entry.sourceEntries.find((item) => item.path === ".")?.mode ??
+            0o700;
+          await mkdir(entry.destination, { mode: rootMode });
+          await chmod(entry.destination, rootMode);
+          const createdDestination = await lstat(entry.destination);
+          const migration: CompletedMigration = {
+            ...entry,
+            destinationDev: createdDestination.dev,
+            destinationIno: createdDestination.ino,
+            guardedContentMove: true,
+            movedPaths: [],
+            quarantine: null,
+          };
+          completed.push(migration);
+          await mergeDisjoint(
+            entry.source,
+            entry.destination,
+            "",
+            migration.movedPaths,
+            new Set(entry.rebuildableOverlaps),
+            ignoredEntries
+          );
+          continue;
+        }
         await rename(entry.source, entry.destination);
         args.runtimeLocks?.relocate(entry.source, entry.destination);
-        completed.push({ ...entry, movedPaths: [], quarantine: null });
+        completed.push({
+          ...entry,
+          guardedContentMove: false,
+          movedPaths: [],
+          quarantine: null,
+        });
         continue;
       }
       if (
@@ -2719,6 +2832,7 @@ async function migrateLegacyProjectState(args: {
       }
       const migration: CompletedMigration = {
         ...entry,
+        guardedContentMove: false,
         movedPaths: [],
         quarantine: null,
       };
@@ -2744,6 +2858,36 @@ async function migrateLegacyProjectState(args: {
     throw error;
   }
   const commit = async () => {
+    const assertGuardedContentMoveBoundary = async (
+      entry: CompletedMigration
+    ): Promise<void> => {
+      const [source, destination] = await Promise.all([
+        lstatIfExists(entry.source),
+        lstatIfExists(entry.destination),
+      ]);
+      if (
+        !source ||
+        source.isSymbolicLink() ||
+        !source.isDirectory() ||
+        source.dev !== entry.sourceDev ||
+        source.ino !== entry.sourceIno ||
+        !destination ||
+        destination.isSymbolicLink() ||
+        !destination.isDirectory() ||
+        destination.dev !== entry.destinationDev ||
+        destination.ino !== entry.destinationIno ||
+        !treeContainsReviewedEntries(
+          await inspectProjectStateTree(entry.destination),
+          entry.sourceEntries,
+          new Set(entry.rebuildableOverlaps)
+        )
+      ) {
+        throw new Error(
+          `Legacy project state changed before commit: ${entry.source}`
+        );
+      }
+      await assertGuardedSourceRemainder(entry);
+    };
     const assertRenameCommitBoundary = async (
       entry: CompletedMigration
     ): Promise<void> => {
@@ -2771,6 +2915,13 @@ async function migrateLegacyProjectState(args: {
     };
     const pending = await Promise.all(
       completed.map(async (entry) => {
+        if (entry.guardedContentMove) {
+          await assertGuardedContentMoveBoundary(entry);
+          return {
+            entry,
+            kind: "guarded-content-move" as const,
+          };
+        }
         if (entry.strategy === "rename") {
           await assertRenameCommitBoundary(entry);
           return {
@@ -2793,6 +2944,10 @@ async function migrateLegacyProjectState(args: {
     );
     commitStarted = true;
     for (const [index, candidate] of pending.entries()) {
+      if (candidate.kind === "guarded-content-move") {
+        await assertGuardedContentMoveBoundary(candidate.entry);
+        continue;
+      }
       if (candidate.kind === "rename") {
         await assertRenameCommitBoundary(candidate.entry);
         continue;
@@ -2930,6 +3085,10 @@ async function migrateLegacyProjectState(args: {
       }
     }
     for (const candidate of pending) {
+      if (candidate.kind === "guarded-content-move") {
+        await assertGuardedContentMoveBoundary(candidate.entry);
+        continue;
+      }
       if (candidate.kind === "rename") {
         await assertRenameCommitBoundary(candidate.entry);
       }
