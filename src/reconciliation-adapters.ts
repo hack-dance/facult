@@ -193,14 +193,18 @@ function latestTimestamp(records: SourceRecord[]): string | undefined {
 
 function resultFromRecords(
   records: SourceRecord[],
-  staleReason?: string
+  latestSourceAt?: string
 ): AdapterScanResult {
+  const watermark = latestTimestamp(records);
   if (records.length > 0) {
-    return { state: "changed", records, watermark: latestTimestamp(records) };
+    return {
+      state: "changed",
+      records,
+      watermark,
+      latestSourceAt: latestSourceAt ?? watermark,
+    };
   }
-  return staleReason
-    ? { state: "stale", records, staleReason }
-    : { state: "checked", records };
+  return { state: "checked", records, latestSourceAt };
 }
 
 function record(args: {
@@ -445,6 +449,122 @@ async function runGit(args: string[], cwd: string): Promise<string> {
   return stdout;
 }
 
+async function gitRefExists(ref: string, cwd: string): Promise<boolean> {
+  const proc = Bun.spawn({
+    cmd: [
+      Bun.which("git") ?? "/usr/bin/git",
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${ref}^{commit}`,
+    ],
+    cwd,
+    env: safeGitEnvironment(cwd),
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  return (await proc.exited) === 0;
+}
+
+async function configuredDefaultBranch(args: {
+  config: GitSourceConfig;
+  projectRoot: string;
+}): Promise<{ display: string; ref: string }> {
+  if (args.config.defaultBranch) {
+    const candidates = args.config.defaultBranch.startsWith("refs/")
+      ? [args.config.defaultBranch]
+      : [
+          `refs/heads/${args.config.defaultBranch}`,
+          `refs/remotes/origin/${args.config.defaultBranch}`,
+        ];
+    for (const ref of unique(candidates)) {
+      if (await gitRefExists(ref, args.projectRoot)) {
+        return { display: args.config.defaultBranch, ref };
+      }
+    }
+    throw new Error(
+      `Configured default Git branch is unavailable: ${args.config.defaultBranch}`
+    );
+  }
+  for (const remote of ["origin", "upstream"]) {
+    try {
+      const ref = (
+        await runGit(
+          ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`],
+          args.projectRoot
+        )
+      ).trim();
+      if (ref && (await gitRefExists(ref, args.projectRoot))) {
+        return { display: ref, ref };
+      }
+    } catch {
+      // Fall through to bounded local defaults.
+    }
+  }
+  for (const branch of ["main", "master"]) {
+    const ref = `refs/heads/${branch}`;
+    if (await gitRefExists(ref, args.projectRoot)) {
+      return { display: branch, ref };
+    }
+  }
+  if (!(await gitRefExists("HEAD", args.projectRoot))) {
+    throw new Error("Git repository does not have any commits yet");
+  }
+  throw new Error(
+    "Git default branch is unavailable; configure defaultBranch or provide a proven remote HEAD, main, or master"
+  );
+}
+
+export async function gitDefaultBranchContainment(args: {
+  commit: string;
+  config: GitSourceConfig;
+  projectRoot: string;
+}): Promise<{ defaultBranch: string; onDefaultBranch: boolean }> {
+  const defaultBranch = await configuredDefaultBranch({
+    config: args.config,
+    projectRoot: args.projectRoot,
+  });
+  return {
+    defaultBranch: defaultBranch.display,
+    onDefaultBranch: await gitIsAncestor({
+      commit: args.commit,
+      ancestorOf: defaultBranch.ref,
+      projectRoot: args.projectRoot,
+    }),
+  };
+}
+
+async function gitIsAncestor(args: {
+  commit: string;
+  ancestorOf: string;
+  projectRoot: string;
+}): Promise<boolean> {
+  const proc = Bun.spawn({
+    cmd: [
+      Bun.which("git") ?? "/usr/bin/git",
+      "merge-base",
+      "--is-ancestor",
+      args.commit,
+      args.ancestorOf,
+    ],
+    cwd: args.projectRoot,
+    env: safeGitEnvironment(args.projectRoot),
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text(),
+  ]);
+  if (exitCode === 0) {
+    return true;
+  }
+  if (exitCode === 1) {
+    return false;
+  }
+  throw new Error(stderr.trim() || "git merge-base containment check failed");
+}
+
 function parseGitRecords(args: {
   context: ReconciliationAdapterContext;
   config: GitSourceConfig;
@@ -511,13 +631,30 @@ const gitAdapter: ReconciliationAdapter = {
       if (isRepo !== "true") {
         throw new Error("Configured project is not a Git worktree");
       }
+      const defaultBranch = await configuredDefaultBranch({
+        config,
+        projectRoot,
+      });
+      const latestDefaultBranch = (
+        await runGit(
+          [
+            "log",
+            "-1",
+            `--until=${context.window.until}`,
+            "--format=%H%x1f%cI",
+            defaultBranch.ref,
+          ],
+          projectRoot
+        )
+      ).trim();
+      const [, latestSourceAt] = latestDefaultBranch.split("\u001f");
       const pathArgs = config.paths?.length ? ["--", ...config.paths] : [];
       let output: string;
       try {
         output = await runGit(
           [
             "log",
-            ...(config.allBranches ? ["--all"] : []),
+            ...(config.allBranches ? ["--all"] : [defaultBranch.ref]),
             `--since=${context.window.since}`,
             `--until=${context.window.until}`,
             "--format=%x1e%H%x1f%cI%x1f%s%x1f%b%x00",
@@ -548,16 +685,33 @@ const gitAdapter: ReconciliationAdapter = {
           ],
           projectRoot
         );
+        const onDefaultBranch = await gitIsAncestor({
+          commit: entry.commit,
+          ancestorOf: defaultBranch.ref,
+          projectRoot,
+        });
         const { commit: _commit, ...base } = entry;
-        records.push({ ...base, dedupeKey: `git-patch:${sha256(patch)}` });
+        records.push({
+          ...base,
+          dedupeKey: `git-patch:${sha256(patch)}`,
+          provenance: {
+            ...base.provenance,
+            defaultBranch: defaultBranch.display,
+            onDefaultBranch,
+            terminal: onDefaultBranch,
+          },
+        });
       }
-      return resultFromRecords(records);
+      return resultFromRecords(records, latestSourceAt);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (UNBORN_GIT_RE.test(message)) {
+        return resultFromRecords([]);
+      }
       return {
         state: "unavailable",
         records: [],
-        unavailableReason:
-          error instanceof Error ? error.message : String(error),
+        unavailableReason: message,
       };
     }
   },
@@ -573,6 +727,7 @@ interface EvidenceExportEvent {
   body?: string;
   refs?: string[];
   terminal?: boolean;
+  status?: string;
   sourceUri?: string;
 }
 
@@ -596,6 +751,19 @@ const EVIDENCE_EVENT_KINDS = new Set<EvidenceEventKind>([
   "work-item",
   "comment",
   "status-change",
+]);
+const TERMINAL_EVIDENCE_STATUSES = new Set([
+  "done",
+  "completed",
+  "complete",
+  "canceled",
+  "cancelled",
+  "obsolete",
+  "duplicate",
+  "duplicated",
+  "resolved",
+  "closed",
+  "superseded",
 ]);
 
 function parseEvidenceExport(value: unknown): EvidenceExportEnvelope {
@@ -648,8 +816,17 @@ function parseEvidenceExport(value: unknown): EvidenceExportEnvelope {
     if (!isPlainObject(entry)) {
       throw new Error(`Evidence export event ${index + 1} must be an object`);
     }
-    const { id, kind, observedAt, title, body, refs, terminal, sourceUri } =
-      entry;
+    const {
+      id,
+      kind,
+      observedAt,
+      title,
+      body,
+      refs,
+      terminal,
+      status,
+      sourceUri,
+    } = entry;
     if (typeof id !== "string" || !id || id.length > 500 || seenIds.has(id)) {
       throw new Error(`Evidence export event ${index + 1} has an invalid id`);
     }
@@ -669,6 +846,7 @@ function parseEvidenceExport(value: unknown): EvidenceExportEnvelope {
     for (const [field, fieldValue] of [
       ["title", title],
       ["body", body],
+      ["status", status],
       ["sourceUri", sourceUri],
     ] as const) {
       if (
@@ -698,6 +876,7 @@ function parseEvidenceExport(value: unknown): EvidenceExportEnvelope {
       body: body as string | undefined,
       refs: refs as string[] | undefined,
       terminal: terminal as boolean | undefined,
+      status: status as string | undefined,
       sourceUri: sourceUri as string | undefined,
     };
   });
@@ -742,7 +921,7 @@ async function loadEvidenceExport(args: {
 function evidenceClassification(
   event: EvidenceExportEvent
 ): SignalClassification {
-  if (event.terminal) {
+  if (isTerminalEvidenceEvent(event)) {
     return "outcome-proof";
   }
   const text = `${event.title ?? ""} ${event.body ?? ""}`.toLowerCase();
@@ -753,6 +932,14 @@ function evidenceClassification(
     return "outcome-proof";
   }
   return "implementation-only";
+}
+
+function isTerminalEvidenceEvent(event: EvidenceExportEvent): boolean {
+  return (
+    event.terminal === true ||
+    (typeof event.status === "string" &&
+      TERMINAL_EVIDENCE_STATUSES.has(event.status.trim().toLowerCase()))
+  );
 }
 
 const evidenceExportAdapter: ReconciliationAdapter = {
@@ -783,6 +970,8 @@ const evidenceExportAdapter: ReconciliationAdapter = {
               producer: envelope.producer,
               generatedAt: envelope.generatedAt,
               kind: event.kind,
+              status: event.status ?? null,
+              terminal: isTerminalEvidenceEvent(event),
               sourceUri: safeEvidenceSourceUri(event.sourceUri),
             },
             extraRefs: event.refs ?? [],
@@ -1024,11 +1213,9 @@ function fileAdapter(type: "automation" | "markdown"): ReconciliationAdapter {
             );
           }
         }
-        const staleReason =
-          paths.size > 0 &&
-          Math.max(latestMtime, latestObserved) <
-            Date.parse(context.window.since)
-            ? "Configured files exist but none changed in the review window"
+        const latestSourceAt =
+          Math.max(latestMtime, latestObserved) > 0
+            ? new Date(Math.max(latestMtime, latestObserved)).toISOString()
             : undefined;
         const cursor = sha256(contentDigests.sort().join("\n"));
         if (missingTimestamps > 0) {
@@ -1045,6 +1232,7 @@ function fileAdapter(type: "automation" | "markdown"): ReconciliationAdapter {
             records,
             cursor,
             staleReason: `File scan truncated at the ${MAX_FILES}-file safety cap`,
+            latestSourceAt,
           };
         }
         if (skippedFiles > 0) {
@@ -1055,7 +1243,7 @@ function fileAdapter(type: "automation" | "markdown"): ReconciliationAdapter {
             unavailableReason: `${skippedFiles} configured file(s) could not be safely extracted`,
           };
         }
-        return { ...resultFromRecords(records, staleReason), cursor };
+        return { ...resultFromRecords(records, latestSourceAt), cursor };
       } catch (error) {
         return {
           state: "unavailable",

@@ -14,6 +14,9 @@ import type {
 
 const SOURCE_ID_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 const PATH_SEGMENT_RE = /[\\/]/;
+const GIT_BRANCH_RE = /^[a-z0-9][a-z0-9._/-]*$/i;
+export const DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS = 168;
+const MAX_SOURCE_FRESHNESS_THRESHOLD_HOURS = 24 * 365;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -50,6 +53,26 @@ function stringArray(value: unknown, field: string): string[] {
   return value.map((entry) => String(entry).trim());
 }
 
+function parseFreshnessThreshold(
+  value: unknown,
+  sourceId: string
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > MAX_SOURCE_FRESHNESS_THRESHOLD_HOURS
+  ) {
+    throw new Error(
+      `Reconciliation source ${sourceId} freshnessThresholdHours must be an integer between 1 and ${MAX_SOURCE_FRESHNESS_THRESHOLD_HOURS}`
+    );
+  }
+  return value;
+}
+
 function parseSource(value: unknown): ReconciliationSourceConfig {
   if (!isPlainObject(value)) {
     throw new Error("Reconciliation sources must be objects");
@@ -59,10 +82,14 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
     throw new Error(`Reconciliation source ${id} enabled must be boolean`);
   }
   const enabled = value.enabled !== false;
+  const freshnessThresholdHours = parseFreshnessThreshold(
+    value.freshnessThresholdHours,
+    id
+  );
   if (value.type === "writebacks") {
     assertKnownFields(
       value,
-      ["id", "type", "enabled", "scope"],
+      ["id", "type", "enabled", "scope", "freshnessThresholdHours"],
       `Writeback source ${id}`
     );
     if (
@@ -77,15 +104,30 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
       type: "writebacks",
       enabled,
       scope: value.scope ?? "context",
+      freshnessThresholdHours,
     };
   }
   if (value.type === "git") {
     assertKnownFields(
       value,
-      ["id", "type", "enabled", "repository", "paths", "allBranches"],
+      [
+        "id",
+        "type",
+        "enabled",
+        "repository",
+        "paths",
+        "allBranches",
+        "defaultBranch",
+        "freshnessThresholdHours",
+      ],
       `Git source ${id}`
     );
-    const source: GitSourceConfig = { id, type: "git", enabled };
+    const source: GitSourceConfig = {
+      id,
+      type: "git",
+      enabled,
+      freshnessThresholdHours,
+    };
     if (value.repository !== undefined && value.repository !== "project") {
       throw new Error(`Git source ${id} repository must be project`);
     }
@@ -109,12 +151,27 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
       }
       source.allBranches = value.allBranches;
     }
+    if (value.defaultBranch !== undefined) {
+      if (
+        typeof value.defaultBranch !== "string" ||
+        !GIT_BRANCH_RE.test(value.defaultBranch) ||
+        value.defaultBranch.includes("..") ||
+        value.defaultBranch.includes("@{") ||
+        value.defaultBranch.endsWith("/") ||
+        value.defaultBranch.includes("//")
+      ) {
+        throw new Error(
+          `Git source ${id} defaultBranch must be a safe Git branch or ref`
+        );
+      }
+      source.defaultBranch = value.defaultBranch;
+    }
     return source;
   }
   if (value.type === "evidence-export") {
     assertKnownFields(
       value,
-      ["id", "type", "enabled", "path"],
+      ["id", "type", "enabled", "path", "freshnessThresholdHours"],
       `Evidence export source ${id}`
     );
     if (typeof value.path !== "string" || !value.path.trim()) {
@@ -127,6 +184,7 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
       type: "evidence-export",
       enabled,
       path: value.path.trim(),
+      freshnessThresholdHours,
     };
     if (
       isAbsolute(source.path) ||
@@ -142,7 +200,7 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
   if (value.type === "automation" || value.type === "markdown") {
     assertKnownFields(
       value,
-      ["id", "type", "enabled", "root", "paths"],
+      ["id", "type", "enabled", "root", "paths", "freshnessThresholdHours"],
       `${value.type} source ${id}`
     );
     const root =
@@ -158,6 +216,7 @@ function parseSource(value: unknown): ReconciliationSourceConfig {
       enabled,
       root,
       paths: stringArray(value.paths, `${value.type} source ${id} paths`),
+      freshnessThresholdHours,
     };
     for (const path of source.paths) {
       if (

@@ -178,10 +178,12 @@ export interface ActivityFeed {
     complete: boolean;
     checked: number;
     degraded: number;
+    freshness?: EvolutionLoopReport["freshness"];
     sources: Array<{
       id: string;
       label: string;
       state: SourceCoverage["state"];
+      freshness?: SourceCoverage["freshness"];
       detail?: string;
     }>;
   };
@@ -883,10 +885,12 @@ export function buildActivityFeed(args: {
       complete: args.report.coverageComplete,
       checked: args.report.coverage.length - degradedSources.length,
       degraded: degradedSources.length,
+      freshness: args.report.freshness,
       sources: args.report.coverage.map((entry) => ({
         id: redactPortableActivityText(entry.sourceId),
         label: redactPortableActivityText(sourceLabel(entry.sourceId)),
         state: entry.state,
+        freshness: entry.freshness,
         detail: entry.unavailableReason
           ? redactPortableActivityText(entry.unavailableReason)
           : entry.staleReason
@@ -963,6 +967,9 @@ export function renderActivityFeed(feed: ActivityFeed): string {
     `Activity — ${label}`,
     `Last review: ${feed.generatedAt} · ${feed.run.status}`,
     `Coverage: ${feed.coverage.checked}/${feed.coverage.sources.length} sources checked${feed.coverage.complete ? "" : " · incomplete"}`,
+    ...(feed.coverage.freshness
+      ? [`Freshness: ${feed.coverage.freshness.state}`]
+      : []),
     `Changes: ${feed.counts.new} new · ${feed.counts.changed} changed · ${feed.counts.resolved} resolved · ${feed.counts.unchangedSuppressed} unchanged suppressed`,
     "",
     ...(degraded.length
@@ -1056,6 +1063,36 @@ function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 0;
 }
 
+function isReconciliationFreshness(
+  value: unknown
+): value is EvolutionLoopReport["freshness"] {
+  return (
+    isRecord(value) &&
+    (value.state === "current" ||
+      value.state === "stale" ||
+      value.state === "unknown") &&
+    isStringArray(value.staleSourceIds) &&
+    isStringArray(value.unknownSourceIds) &&
+    isStringArray(value.alertSourceIds)
+  );
+}
+
+function isSourceFreshness(
+  value: unknown
+): value is SourceCoverage["freshness"] {
+  return (
+    isRecord(value) &&
+    (value.state === "current" ||
+      value.state === "stale" ||
+      value.state === "unknown" ||
+      value.state === "not_applicable") &&
+    typeof value.reason === "string" &&
+    typeof value.checkedAt === "string" &&
+    typeof value.thresholdHours === "number" &&
+    typeof value.alert === "boolean"
+  );
+}
+
 function isActivityItem(value: unknown): value is ActivityItem {
   if (!isRecord(value)) {
     return false;
@@ -1140,13 +1177,16 @@ export function isActivityFeed(value: unknown): value is ActivityFeed {
     typeof value.coverage.complete === "boolean" &&
     isNonNegativeInteger(value.coverage.checked) &&
     isNonNegativeInteger(value.coverage.degraded) &&
+    (value.coverage.freshness === undefined ||
+      isReconciliationFreshness(value.coverage.freshness)) &&
     Array.isArray(value.coverage.sources) &&
     value.coverage.sources.every(
       (entry) =>
         isRecord(entry) &&
         typeof entry.id === "string" &&
         typeof entry.label === "string" &&
-        typeof entry.state === "string"
+        typeof entry.state === "string" &&
+        (entry.freshness === undefined || isSourceFreshness(entry.freshness))
     ) &&
     isRecord(value.counts) &&
     isNonNegativeInteger(value.counts.total) &&

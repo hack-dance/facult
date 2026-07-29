@@ -10,23 +10,33 @@ import {
 import { dirname, join } from "node:path";
 import type { WritebackDisposition } from "./ai";
 import {
+  facultAiReconciliationLockPath,
   facultAiReconciliationReviewDir,
   facultAiReconciliationStatePath,
   projectRootFromAiRoot,
 } from "./paths";
-import { reconciliationAdapterFor } from "./reconciliation-adapters";
-import { loadReconciliationConfig } from "./reconciliation-config";
+import {
+  gitDefaultBranchContainment,
+  reconciliationAdapterFor,
+} from "./reconciliation-adapters";
+import {
+  DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS,
+  loadReconciliationConfig,
+} from "./reconciliation-config";
 import type {
   AdapterScanResult,
   CorrelatedSignal,
   ExtractionDecision,
   ReconciledEvidence,
   ReconciliationConfig,
+  ReconciliationFreshness,
   ReconciliationReview,
   ReconciliationState,
   ReconciliationWindow,
+  ResolutionProof,
   SignalClassification,
   SourceCoverage,
+  SourceFreshness,
   SourceRecord,
 } from "./reconciliation-types";
 
@@ -38,7 +48,7 @@ const CAPABILITY_RE =
   /\b(?:capability|writeback|evolution|instruction|skill|agent|runbook|reconciliation|feedback loop|verification)\b/i;
 const NOISE_RE =
   /\b(?:chore|format|typo|timestamp|heartbeat unchanged|no-op)\b/i;
-const RECONCILIATION_ENGINE_VERSION = 5;
+const RECONCILIATION_ENGINE_VERSION = 6;
 const STOP_WORD_RE =
   /\b(?:the|and|for|with|from|this|that|into|was|were|are|has|have)\b/g;
 const NON_ALPHANUMERIC_RE = /[^a-z0-9]+/g;
@@ -65,6 +75,7 @@ function emptyState(): ReconciliationState {
     evidence: {},
     decisions: {},
     families: {},
+    resolutionProofs: {},
     reviews: {},
   };
 }
@@ -79,6 +90,8 @@ function parseState(value: unknown): ReconciliationState {
       isPlainObject(value.evidence) &&
       isPlainObject(value.decisions) &&
       (value.families === undefined || isPlainObject(value.families)) &&
+      (value.resolutionProofs === undefined ||
+        isPlainObject(value.resolutionProofs)) &&
       isPlainObject(value.reviews)
     )
   ) {
@@ -91,6 +104,11 @@ function parseState(value: unknown): ReconciliationState {
     decisions: value.decisions as ReconciliationState["decisions"],
     families: isPlainObject(value.families)
       ? (value.families as NonNullable<ReconciliationState["families"]>)
+      : {},
+    resolutionProofs: isPlainObject(value.resolutionProofs)
+      ? (value.resolutionProofs as NonNullable<
+          ReconciliationState["resolutionProofs"]
+        >)
       : {},
     reviews: value.reviews as ReconciliationState["reviews"],
   };
@@ -117,18 +135,19 @@ async function atomicWrite(path: string, value: string): Promise<void> {
 }
 
 async function withStateLock<T>(
-  statePath: string,
-  fn: () => Promise<T>
+  lockPath: string,
+  fn: () => Promise<T>,
+  onLockAcquired?: () => void | Promise<void>
 ): Promise<T> {
-  const lockPath = `${statePath}.lock`;
   await mkdir(dirname(lockPath), { recursive: true });
   let handle: FileHandle;
   try {
     handle = await open(lockPath, "wx");
   } catch {
-    throw new Error(`Another reconciliation is already updating ${statePath}`);
+    throw new Error(`Another reconciliation is already updating ${lockPath}`);
   }
   try {
+    await onLockAcquired?.();
     return await fn();
   } finally {
     await handle.close();
@@ -318,6 +337,44 @@ function dispositionFor(args: {
         "Preserved the explicit disposition from the latest writeback state",
     };
   }
+  const exactImplementationOnDefaultBranch = args.records.some(
+    (record) =>
+      record.sourceType === "git" && record.provenance.onDefaultBranch === true
+  );
+  const terminalIssueRefs = new Set(
+    args.records
+      .filter(
+        (record) =>
+          record.provenance.terminal === true &&
+          !(
+            record.sourceType === "git" &&
+            record.provenance.onDefaultBranch === true
+          )
+      )
+      .flatMap((record) => record.issueRefs)
+  );
+  const hasTerminalLinkedWork = terminalIssueRefs.size > 0;
+  const allLinkedWorkTerminal =
+    args.issueRefs.length > 0 &&
+    args.issueRefs.every((issueRef) => terminalIssueRefs.has(issueRef));
+  if (exactImplementationOnDefaultBranch || allLinkedWorkTerminal) {
+    return {
+      disposition: "resolve-watch",
+      target: args.issueRefs[0] ?? args.assetRefs[0],
+      rationale:
+        "Bounded current-source evidence proves the linked work is terminal or the exact implementation is on the default branch",
+    };
+  }
+  if (hasTerminalLinkedWork) {
+    return {
+      disposition: "task",
+      target: args.issueRefs.find(
+        (issueRef) => !terminalIssueRefs.has(issueRef)
+      ),
+      rationale:
+        "Some linked work is terminal, but the full prior and current linked-work family is not terminal",
+    };
+  }
   if (args.classifications.includes("capability-implementation")) {
     return OUTCOME_RE.test(args.records.map((record) => record.body).join(" "))
       ? {
@@ -479,6 +536,17 @@ function correlate(args: {
       ]);
     }
   }
+  for (const item of evidence) {
+    const matchingFamilyIds = Object.entries(args.state.families ?? {})
+      .filter(([, family]) =>
+        family.subjectKeys.some((key) => item.correlationKeys.includes(key))
+      )
+      .map(([familyId]) => familyId);
+    item.correlationKeys = unique([
+      ...item.correlationKeys,
+      ...matchingFamilyIds.map((familyId) => `family:${familyId}`),
+    ]);
+  }
 
   const set = new DisjointSet(evidence.length);
   const keyOwner = new Map<string, number>();
@@ -504,15 +572,8 @@ function correlate(args: {
       )
       .map((entry) => entry.record);
     const assetRefs = unique(items.flatMap((item) => item.assetRefs));
-    const issueRefs = unique(items.flatMap((item) => item.issueRefs));
     const writebackRefs = unique(items.flatMap((item) => item.writebackRefs));
     const classifications = unique(items.map((item) => item.classification));
-    const disposition = dispositionFor({
-      records,
-      classifications,
-      assetRefs,
-      issueRefs,
-    });
     const id = `SG-${sha256(
       items
         .map((item) => item.dedupeKey)
@@ -530,6 +591,20 @@ function correlate(args: {
           leftId.localeCompare(rightId)
       );
     const priorFamily = matchingFamilies[0]?.[0];
+    const issueRefs = unique([
+      ...items.flatMap((item) => item.issueRefs),
+      ...matchingFamilies.flatMap(([, family]) =>
+        family.subjectKeys
+          .filter((key) => key.startsWith("issue:"))
+          .map((key) => key.slice("issue:".length))
+      ),
+    ]);
+    const disposition = dispositionFor({
+      records,
+      classifications,
+      assetRefs,
+      issueRefs,
+    });
     const familySeed =
       subjectKeys[0] ?? items.map((item) => item.dedupeKey).sort()[0] ?? id;
     const familyId = priorFamily ?? `SF-${sha256(familySeed).slice(0, 16)}`;
@@ -583,10 +658,243 @@ function dispositionCounts(
   return counts;
 }
 
+function latestTimestampValue(
+  left: string | undefined,
+  right: string | undefined
+): string | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return Date.parse(left) >= Date.parse(right) ? left : right;
+}
+
+function sourceFreshness(args: {
+  checkedAt: string;
+  until: string;
+  coverageState: SourceCoverage["state"];
+  thresholdHours?: number;
+  priorWatermark?: string;
+  result: AdapterScanResult;
+}): SourceFreshness {
+  const thresholdHours =
+    args.thresholdHours ?? DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS;
+  if (args.coverageState === "unavailable") {
+    return {
+      state: "unknown",
+      reason: "source_unavailable",
+      checkedAt: args.checkedAt,
+      thresholdHours,
+      alert: false,
+    };
+  }
+  const cursorAt = latestTimestampValue(
+    args.priorWatermark,
+    args.result.watermark
+  );
+  const latestSourceAt = args.result.latestSourceAt;
+  if (
+    latestSourceAt &&
+    Date.parse(latestSourceAt) <= Date.parse(args.until) &&
+    (!cursorAt || Date.parse(latestSourceAt) > Date.parse(cursorAt))
+  ) {
+    return {
+      state: "stale",
+      reason: "newer_repository_activity",
+      checkedAt: args.checkedAt,
+      thresholdHours,
+      alert: true,
+      cursorAt,
+      latestSourceAt,
+    };
+  }
+  if (!cursorAt) {
+    return {
+      state: "not_applicable",
+      reason: "no_cursor",
+      checkedAt: args.checkedAt,
+      thresholdHours,
+      alert: false,
+      latestSourceAt,
+    };
+  }
+  const cursorAgeHours =
+    (Date.parse(args.until) - Date.parse(cursorAt)) / (60 * 60 * 1000);
+  if (cursorAgeHours > thresholdHours) {
+    return {
+      state: "stale",
+      reason: "threshold_exceeded",
+      checkedAt: args.checkedAt,
+      thresholdHours,
+      alert: true,
+      cursorAt,
+      latestSourceAt,
+    };
+  }
+  const resultWatermark = args.result.watermark;
+  const cursorAdvanced =
+    Boolean(resultWatermark) &&
+    (!args.priorWatermark ||
+      Date.parse(resultWatermark as string) > Date.parse(args.priorWatermark));
+  return {
+    state: "current",
+    reason: cursorAdvanced ? "cursor_advanced" : "within_threshold",
+    checkedAt: args.checkedAt,
+    thresholdHours,
+    alert: false,
+    cursorAt,
+    latestSourceAt,
+  };
+}
+
+function reconciliationFreshness(
+  coverage: SourceCoverage[]
+): ReconciliationFreshness {
+  const staleSourceIds = coverage
+    .filter((entry) => entry.freshness.state === "stale")
+    .map((entry) => entry.sourceId)
+    .sort();
+  const unknownSourceIds = coverage
+    .filter((entry) => entry.freshness.state === "unknown")
+    .map((entry) => entry.sourceId)
+    .sort();
+  return {
+    state:
+      staleSourceIds.length > 0
+        ? "stale"
+        : unknownSourceIds.length > 0
+          ? "unknown"
+          : "current",
+    staleSourceIds,
+    unknownSourceIds,
+    alertSourceIds: coverage
+      .filter((entry) => entry.freshness.alert)
+      .map((entry) => entry.sourceId)
+      .sort(),
+  };
+}
+
+function normalizeReviewFreshness(
+  review: ReconciliationReview
+): ReconciliationReview {
+  const coverage = review.coverage.map((entry) =>
+    entry.freshness
+      ? entry
+      : {
+          ...entry,
+          freshness: {
+            state: "unknown" as const,
+            reason: "legacy_report" as const,
+            checkedAt: entry.checkedAt ?? review.generatedAt,
+            thresholdHours: DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS,
+            alert: false,
+          },
+        }
+  );
+  return {
+    ...review,
+    coverage,
+    freshness: review.freshness ?? reconciliationFreshness(coverage),
+    resolutionProofs: review.resolutionProofs ?? [],
+    resolvedSignalFamilies: review.resolvedSignalFamilies ?? [],
+  };
+}
+
+function resolutionProofs(records: SourceRecord[]): ResolutionProof[] {
+  return records
+    .filter((record) => record.provenance.terminal === true)
+    .map((record) => ({
+      sourceId: record.sourceId,
+      sourceType: record.sourceType,
+      sourceRecordId: record.recordId,
+      kind:
+        record.sourceType === "git" &&
+        record.provenance.onDefaultBranch === true
+          ? ("default_branch_containment" as const)
+          : ("linked_work_terminal" as const),
+      issueRefs: record.issueRefs,
+      evidenceKey: record.dedupeKey,
+      status:
+        typeof record.provenance.status === "string"
+          ? record.provenance.status
+          : undefined,
+      provenance: record.provenance,
+    }));
+}
+
+function resolvedSignalFamilies(args: {
+  state: ReconciliationState;
+  proofs: ResolutionProof[];
+  signals: CorrelatedSignal[];
+}): string[] {
+  const proofs = [
+    ...Object.values(args.state.resolutionProofs ?? {}).map(
+      (entry) => entry.proof
+    ),
+    ...args.proofs,
+  ];
+  const terminalIssueKeys = new Set(
+    proofs
+      .filter((proof) => proof.kind === "linked_work_terminal")
+      .flatMap((proof) =>
+        proof.issueRefs.map((issueRef) => `issue:${issueRef}`)
+      )
+  );
+  const defaultBranchEvidenceKeys = new Set(
+    proofs
+      .filter((proof) => proof.kind === "default_branch_containment")
+      .map((proof) => proof.evidenceKey)
+  );
+  return Object.entries(args.state.families ?? {})
+    .flatMap(([familyId, family]) => {
+      const currentSignals = args.signals.filter(
+        (signal) =>
+          signal.familyId === familyId ||
+          signal.familyAliases?.includes(familyId)
+      );
+      const linkedIssues = unique([
+        ...family.subjectKeys.filter((key) => key.startsWith("issue:")),
+        ...currentSignals.flatMap((signal) =>
+          signal.issueRefs.map((issueRef) => `issue:${issueRef}`)
+        ),
+      ]);
+      const allLinkedWorkTerminal =
+        linkedIssues.length > 0 &&
+        linkedIssues.every((key) => terminalIssueKeys.has(key));
+      const exactEvidenceOnDefaultBranch = [
+        ...family.evidenceKeys,
+        ...currentSignals.flatMap((signal) => signal.evidenceKeys),
+      ].some((key) => defaultBranchEvidenceKeys.has(key));
+      return allLinkedWorkTerminal || exactEvidenceOnDefaultBranch
+        ? [familyId]
+        : [];
+    })
+    .sort();
+}
+
+function isNewDefaultBranchContainment(args: {
+  record: SourceRecord;
+  state: ReconciliationState;
+}): boolean {
+  if (
+    args.record.sourceType !== "git" ||
+    args.record.provenance.onDefaultBranch !== true
+  ) {
+    return false;
+  }
+  return !args.state.evidence[
+    args.record.dedupeKey
+  ]?.defaultBranchContainment?.[args.record.sourceId]?.includes(
+    args.record.recordId
+  );
+}
+
 function renderReview(review: ReconciliationReview): string {
   const coverage = review.coverage.map(
     (entry) =>
-      `| ${entry.sourceId} | ${entry.sourceType} | ${entry.state} | ${entry.recordsScanned} | ${entry.signalsDiscovered} | ${entry.unavailableReason ?? entry.staleReason ?? ""} |`
+      `| ${entry.sourceId} | ${entry.sourceType} | ${entry.state} | ${entry.freshness.state} | ${entry.freshness.reason} | ${entry.recordsScanned} | ${entry.signalsDiscovered} | ${entry.unavailableReason ?? entry.staleReason ?? ""} |`
   );
   const signals = review.signals.flatMap((signal) => [
     `### ${signal.id} — ${signal.title}`,
@@ -618,6 +926,7 @@ function renderReview(review: ReconciliationReview): string {
     `since: "${review.window.since}"`,
     `until: "${review.window.until}"`,
     `coverageComplete: ${review.coverageComplete}`,
+    `freshness: "${review.freshness.state}"`,
     `degraded: ${review.degraded}`,
     "---",
     "",
@@ -628,8 +937,8 @@ function renderReview(review: ReconciliationReview): string {
     "",
     "## Source coverage",
     "",
-    "| Source | Type | State | Records | Signals | Detail |",
-    "| --- | --- | --- | ---: | ---: | --- |",
+    "| Source | Type | Coverage | Freshness | Freshness reason | Records | Signals | Detail |",
+    "| --- | --- | --- | --- | --- | ---: | ---: | --- |",
     ...coverage,
     "",
     "## Signals and dispositions",
@@ -664,7 +973,8 @@ function updateState(args: {
     if (!source) {
       continue;
     }
-    const advances = coverage.state !== "unavailable";
+    const advances =
+      coverage.state === "checked" || coverage.state === "changed";
     const resultWatermark = result?.watermark;
     const keepsPriorWatermark = Boolean(
       advances &&
@@ -696,16 +1006,75 @@ function updateState(args: {
       coverageState: keepsPriorCoverage
         ? (prior?.coverageState ?? coverage.state)
         : coverage.state,
+      freshnessState: coverage.freshness.state,
     };
   }
   for (const item of args.review.evidence) {
     const prior = next.evidence[item.dedupeKey];
+    const sourceRecordIds = structuredClone(prior?.sourceRecordIds ?? {});
+    for (const sourceId of item.sourceIds) {
+      sourceRecordIds[sourceId] = unique([
+        ...(sourceRecordIds[sourceId] ?? []),
+        ...args.review.decisions
+          .filter(
+            (decision) =>
+              decision.dedupeKey === item.dedupeKey &&
+              decision.sourceId === sourceId
+          )
+          .map((decision) => decision.sourceRecordId),
+      ]);
+    }
+    const defaultBranchContainment = structuredClone(
+      prior?.defaultBranchContainment ?? {}
+    );
+    for (const proof of args.review.resolutionProofs) {
+      if (
+        proof.evidenceKey !== item.dedupeKey ||
+        proof.kind !== "default_branch_containment"
+      ) {
+        continue;
+      }
+      defaultBranchContainment[proof.sourceId] = unique([
+        ...(defaultBranchContainment[proof.sourceId] ?? []),
+        proof.sourceRecordId,
+      ]);
+    }
     next.evidence[item.dedupeKey] = {
       firstSeenAt: prior?.firstSeenAt ?? args.review.generatedAt,
       lastSeenAt: args.review.generatedAt,
       sourceIds: unique([...(prior?.sourceIds ?? []), ...item.sourceIds]),
+      sourceRecordIds,
       reviewIds: unique([...(prior?.reviewIds ?? []), args.review.reviewId]),
+      ...(Object.keys(defaultBranchContainment).length > 0
+        ? { defaultBranchContainment }
+        : {}),
     };
+  }
+  const resolutionProofState = next.resolutionProofs ?? {};
+  next.resolutionProofs = resolutionProofState;
+  for (const proof of args.review.resolutionProofs) {
+    const key = sha256(
+      `${proof.kind}\n${proof.sourceId}\n${proof.sourceRecordId}\n${proof.evidenceKey}`
+    );
+    const prior = resolutionProofState[key];
+    resolutionProofState[key] = {
+      firstSeenAt: prior?.firstSeenAt ?? args.review.generatedAt,
+      lastSeenAt: args.review.generatedAt,
+      reviewIds: unique([...(prior?.reviewIds ?? []), args.review.reviewId]),
+      proof,
+    };
+    if (proof.kind !== "default_branch_containment") {
+      continue;
+    }
+    const evidence = next.evidence[proof.evidenceKey];
+    if (!evidence) {
+      continue;
+    }
+    evidence.defaultBranchContainment ??= {};
+    evidence.defaultBranchContainment[proof.sourceId] = unique([
+      ...(evidence.defaultBranchContainment[proof.sourceId] ?? []),
+      proof.sourceRecordId,
+    ]);
   }
   for (const decision of args.review.decisions) {
     next.decisions[decision.id] = {
@@ -763,6 +1132,7 @@ function updateState(args: {
     generatedAt: args.review.generatedAt,
     artifactPath: args.review.artifactPath,
     coverageComplete: args.review.coverageComplete,
+    freshnessState: args.review.freshness.state,
     evidenceKeys: args.review.evidence.map((item) => item.dedupeKey),
     signalIds: args.review.signals.map((signal) => signal.id),
     signalFamilyIds: unique(
@@ -790,6 +1160,8 @@ export async function reconcileSources(args: {
   sourceIds?: string[];
   incremental?: boolean;
   persist?: boolean;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  onLockAcquired?: () => void | Promise<void>;
 }): Promise<ReconciliationReview> {
   const { config } = await loadReconciliationConfig(args);
   const enabledSources = config.sources.filter(
@@ -854,6 +1226,7 @@ export async function reconcileSources(args: {
     const checkedAt = new Date().toISOString();
     const coverage: SourceCoverage[] = [];
     const records: SourceRecord[] = [];
+    const recheckedResolutionProofs: ResolutionProof[] = [];
     const adapterResults = new Map<string, AdapterScanResult>();
     for (const source of selectedConfig.sources) {
       const priorState = state.sources[source.id];
@@ -894,28 +1267,85 @@ export async function reconcileSources(args: {
           : result.watermark;
       }
       adapterResults.set(source.id, result);
+      if (source.type === "git" && projectRoot) {
+        const pendingCommits = Object.entries(state.evidence).flatMap(
+          ([evidenceKey, evidence]) =>
+            (evidence.sourceRecordIds?.[source.id] ?? [])
+              .filter(
+                (recordId) =>
+                  !evidence.defaultBranchContainment?.[source.id]?.includes(
+                    recordId
+                  )
+              )
+              .map((recordId) => ({ evidenceKey, recordId }))
+        );
+        for (const pending of pendingCommits) {
+          const containment = await gitDefaultBranchContainment({
+            commit: pending.recordId,
+            config: source,
+            projectRoot,
+          });
+          if (!containment.onDefaultBranch) {
+            continue;
+          }
+          recheckedResolutionProofs.push({
+            sourceId: source.id,
+            sourceType: "git",
+            sourceRecordId: pending.recordId,
+            kind: "default_branch_containment",
+            issueRefs: [],
+            evidenceKey: pending.evidenceKey,
+            provenance: {
+              repository: projectRoot,
+              commit: pending.recordId,
+              defaultBranch: containment.defaultBranch,
+              onDefaultBranch: true,
+              terminal: true,
+              rechecked: true,
+            },
+          });
+        }
+      }
       const reviewRecords = args.incremental
         ? result.records.filter(
             (record) =>
               !(
                 prior?.watermark &&
                 Date.parse(record.observedAt) <= Date.parse(prior.watermark) &&
-                state.evidence[record.dedupeKey]?.sourceIds.includes(source.id)
+                state.evidence[record.dedupeKey]?.sourceIds.includes(
+                  source.id
+                ) &&
+                !isNewDefaultBranchContainment({ record, state })
               )
           )
         : result.records;
       records.push(...reviewRecords);
+      const coverageState =
+        result.state === "changed" && reviewRecords.length === 0
+          ? "checked"
+          : result.state;
       coverage.push({
         sourceId: source.id,
         sourceType: source.type,
-        state: result.state,
+        state: coverageState,
         checkedAt,
         watermarkBefore: prior?.watermark,
-        watermarkAfter: result.watermark ?? prior?.watermark,
+        watermarkAfter: latestTimestampValue(
+          prior?.watermark,
+          result.watermark
+        ),
         cursorBefore: prior?.cursor,
         cursorAfter: result.cursor ?? prior?.cursor,
-        recordsScanned: result.records.length,
+        recordsScanned: reviewRecords.length,
         signalsDiscovered: 0,
+        freshness: sourceFreshness({
+          checkedAt,
+          until: requestedWindow.until,
+          coverageState,
+          thresholdHours: source.freshnessThresholdHours,
+          priorWatermark: prior?.watermark,
+          result,
+        }),
         unavailableReason: result.unavailableReason,
         staleReason: result.staleReason,
       });
@@ -944,6 +1374,7 @@ export async function reconcileSources(args: {
       coverage.some(
         (entry) => entry.state === "unavailable" || entry.state === "stale"
       );
+    const freshness = reconciliationFreshness(coverage);
     const reviewDir = facultAiReconciliationReviewDir(
       args.homeDir,
       args.rootDir
@@ -957,6 +1388,7 @@ export async function reconcileSources(args: {
           : coverageComplete
             ? "Zero signals discovered after every configured source was checked for this review window."
             : "No signals are reported, but configured coverage is degraded; this is not a proven empty review.";
+    const proofs = [...resolutionProofs(records), ...recheckedResolutionProofs];
     const review: ReconciliationReview = {
       version: 1,
       reviewId: window.id,
@@ -964,11 +1396,18 @@ export async function reconcileSources(args: {
       window,
       coverageComplete,
       degraded,
+      freshness,
       emptyReason,
       coverage,
       decisions,
       evidence: correlated.evidence,
       signals: correlated.signals,
+      resolutionProofs: proofs,
+      resolvedSignalFamilies: resolvedSignalFamilies({
+        state,
+        proofs,
+        signals: correlated.signals,
+      }),
       resolvedEvidenceKeys: unique(
         records
           .filter((record) => record.provenance.terminal === true)
@@ -1003,7 +1442,11 @@ export async function reconcileSources(args: {
   };
   return args.persist === false
     ? await execute()
-    : await withStateLock(statePath, execute);
+    : await withStateLock(
+        facultAiReconciliationLockPath(args.homeDir, args.rootDir),
+        execute,
+        args.onLockAcquired
+      );
 }
 
 export async function reconciliationStatus(args: {
@@ -1019,6 +1462,7 @@ export async function reconciliationStatus(args: {
   sourceCount: number;
   lastReviewId?: string;
   coverageState?: "complete" | "degraded";
+  freshnessState?: ReconciliationFreshness["state"];
 }> {
   const statePath = facultAiReconciliationStatePath(args.homeDir, args.rootDir);
   const configPath = join(args.rootDir, "reconciliation.json");
@@ -1083,6 +1527,7 @@ export async function reconciliationStatus(args: {
           : lastReview
             ? "complete"
             : undefined,
+      freshnessState: lastReview?.[1].freshnessState,
     };
   } catch (error) {
     return {
@@ -1126,9 +1571,9 @@ export async function reconciliationReviewById(args: {
     `${args.reviewId}.json`
   );
   try {
-    return JSON.parse(
-      await readFile(windowPath, "utf8")
-    ) as ReconciliationReview;
+    return normalizeReviewFreshness(
+      JSON.parse(await readFile(windowPath, "utf8")) as ReconciliationReview
+    );
   } catch {
     return null;
   }

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, type Stats } from "node:fs";
 import {
   chmod,
+  type FileHandle,
   lstat,
   mkdir,
   open,
@@ -32,8 +33,10 @@ import { resolveCliContextRoot } from "./cli-context";
 import { buildIndexSnapshot } from "./index-builder";
 import {
   executionMachineStateProjectKey,
+  facultAiEvolutionLoopLockPath,
   facultAiGraphPath,
   facultAiIndexPath,
+  facultAiReconciliationLockPath,
   facultLocalStateRoot,
   legacyMachineStateProjectKey,
   pathsMayCollide,
@@ -65,6 +68,11 @@ const DISCOVERY_IGNORES = new Set([
 ]);
 const PROJECT_SOURCES = new Set(["git", "guidance", "writebacks"]);
 const PROJECT_CADENCES = new Set(["on-demand", "weekly", "daily"]);
+const MIGRATING_RUNTIME_LOCK_PATHS = new Set([
+  "ai/project/evolution/loop/state.json.lock",
+  "ai/project/evolution/loop/state.json.lock.takeover",
+  "ai/project/reconciliation/state.json.lock",
+]);
 const PROJECT_CONFIG_KEYS = [
   "cadence",
   "guidance",
@@ -126,6 +134,7 @@ const NON_DIGIT_RE = /[^0-9]/g;
 const PLAN_SHA_RE = /^[a-f0-9]{64}$/;
 const PROJECT_MUTATION_LOCK_ATTEMPTS = 500;
 const PROJECT_MUTATION_LOCK_RETRY_MS = 10;
+const UNIX_SOCKET_PATH_MAX_BYTES = 96;
 const PROJECT_CANONICAL_FILE_MAX_BYTES = 1024 * 1024;
 const PROJECT_GUIDANCE_FILE_MAX_BYTES = 1024 * 1024;
 const PROJECT_RECEIPT_FILE_MAX_BYTES = 24 * 1024 * 1024;
@@ -1731,6 +1740,20 @@ interface ProjectStateTree {
   sha256: string;
 }
 
+function assertNoMigratingRuntimeLocks(args: {
+  path: string;
+  tree: ProjectStateTree;
+}): void {
+  const activeLocks = args.tree.entries
+    .filter((entry) => MIGRATING_RUNTIME_LOCK_PATHS.has(entry.path))
+    .map((entry) => entry.path);
+  if (activeLocks.length > 0) {
+    throw new Error(
+      `Refusing to migrate active project runtime state at ${args.path}: ${activeLocks.join(", ")}`
+    );
+  }
+}
+
 async function hashProjectStateFile(
   pathValue: string,
   expectedSize: number
@@ -1970,6 +1993,10 @@ async function planLegacyProjectStateMigrations(args: {
     }
     claimedDestinations.set(candidate.destination, candidate.source);
     const sourceTree = await inspectProjectStateTree(candidate.source);
+    assertNoMigratingRuntimeLocks({
+      path: candidate.source,
+      tree: sourceTree,
+    });
     const destination = await lstatIfExists(candidate.destination);
     if (!destination) {
       planned.push({
@@ -2060,6 +2087,10 @@ async function migrateLegacyProjectState(args: {
       );
     }
     const sourceTree = await inspectProjectStateTree(candidate.source);
+    assertNoMigratingRuntimeLocks({
+      path: candidate.source,
+      tree: sourceTree,
+    });
     if (sourceTree.sha256 !== candidate.sourceTreeSha256) {
       throw new Error(
         `Reviewed legacy project state migration is stale: ${candidate.source}`
@@ -3185,9 +3216,14 @@ function processIsAlive(pid: number): boolean {
 }
 
 function projectMutationLockEndpoint(ownerId: string): string {
-  return process.platform === "win32"
-    ? `\\\\.\\pipe\\fclt-project-mutation-${ownerId}`
-    : join(tmpdir(), `fclt-project-mutation-${ownerId}.sock`);
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\fclt-project-mutation-${ownerId}`;
+  }
+  const socketName = `fclt-pm-${ownerId}.sock`;
+  const preferred = join(tmpdir(), socketName);
+  return Buffer.byteLength(preferred) <= UNIX_SOCKET_PATH_MAX_BYTES
+    ? preferred
+    : join("/tmp", socketName);
 }
 
 async function listenForProjectMutationLock(
@@ -4248,6 +4284,63 @@ async function upsertRegistryEntry(args: {
   return registryEntryBefore;
 }
 
+async function acquireProjectRuntimeMigrationLocks(args: {
+  aiRoot: string;
+  enabled: boolean;
+  homeDir: string;
+}): Promise<() => Promise<void>> {
+  if (!args.enabled) {
+    return () => Promise.resolve();
+  }
+  const token = randomUUID();
+  const acquired: Array<{ handle: FileHandle; path: string }> = [];
+  const release = async (): Promise<void> => {
+    for (const entry of acquired.reverse()) {
+      await entry.handle.close();
+      const owner = await readFile(entry.path, "utf8").catch(() => "");
+      if (owner.includes(`"token":"${token}"`)) {
+        await rm(entry.path, { force: true });
+      }
+    }
+  };
+  try {
+    for (const path of [
+      facultAiEvolutionLoopLockPath(args.homeDir, args.aiRoot),
+      facultAiReconciliationLockPath(args.homeDir, args.aiRoot),
+    ]) {
+      await mkdir(dirname(path), { recursive: true });
+      let handle: FileHandle;
+      try {
+        handle = await open(path, "wx");
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          (error as NodeJS.ErrnoException).code === "EEXIST"
+        ) {
+          throw new Error(
+            `Project enrollment cannot migrate runtime state while another writer holds ${path}`
+          );
+        }
+        throw error;
+      }
+      acquired.push({ handle, path });
+      await handle.writeFile(
+        `${JSON.stringify({
+          pid: process.pid,
+          token,
+          startedAt: new Date().toISOString(),
+          operation: "project-enrollment-state-migration",
+        })}\n`
+      );
+    }
+  } catch (error) {
+    await release();
+    throw error;
+  }
+  return release;
+}
+
 export async function applyProjectEnrollment(args: {
   plan: ProjectEnrollmentPlan;
   expectedPlanSha256: string;
@@ -4317,6 +4410,11 @@ export async function applyProjectEnrollment(args: {
   }
   assertProjectRegistryMutationSupported(args.platform ?? process.platform);
   const homeDir = resolve(args.homeDir ?? process.env.HOME ?? homedir());
+  const releaseRuntimeLocks = await acquireProjectRuntimeMigrationLocks({
+    aiRoot: args.plan.aiRoot,
+    enabled: args.plan.stateMigrations.length > 0,
+    homeDir,
+  });
   return await withProjectsMutationLock(
     homeDir,
     async () => {
@@ -4564,8 +4662,8 @@ export async function applyProjectEnrollment(args: {
         throw error;
       }
       return {
-        version: 1,
-        applied: true,
+        version: 1 as const,
+        applied: true as const,
         repositoryId: args.plan.identity.id,
         changedPaths: args.plan.canonicalWrites.map((write) => write.path),
         generatedPaths: expectedGeneratedPaths,
@@ -4575,7 +4673,7 @@ export async function applyProjectEnrollment(args: {
       };
     },
     args.mutationLockAttempts
-  );
+  ).finally(releaseRuntimeLocks);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -629,6 +629,49 @@ export function facultAiRuntimeScopeDir(
   );
 }
 
+export function facultAiRuntimeCoordinationDir(
+  home: string = defaultHomeDir(),
+  rootDir?: string
+): string {
+  const resolvedRoot = rootDir ?? facultRootDir(home);
+  return projectRootFromAiRoot(resolvedRoot, home)
+    ? join(
+        facultLocalStateRoot(home),
+        "projects",
+        "coordination",
+        executionMachineStateProjectKey(resolvedRoot, home)
+      )
+    : join(facultLocalStateRoot(home), "global", "coordination");
+}
+
+export function facultAiReconciliationLockPath(
+  home: string = defaultHomeDir(),
+  rootDir?: string
+): string {
+  const resolvedRoot = rootDir ?? facultRootDir(home);
+  if (!projectRootFromAiRoot(resolvedRoot, home)) {
+    return `${facultAiReconciliationStatePath(home, resolvedRoot)}.lock`;
+  }
+  return join(
+    facultAiRuntimeCoordinationDir(home, resolvedRoot),
+    "reconciliation.lock"
+  );
+}
+
+export function facultAiEvolutionLoopLockPath(
+  home: string = defaultHomeDir(),
+  rootDir?: string
+): string {
+  const resolvedRoot = rootDir ?? facultRootDir(home);
+  if (!projectRootFromAiRoot(resolvedRoot, home)) {
+    return `${facultAiEvolutionLoopStatePath(home, resolvedRoot)}.lock`;
+  }
+  return join(
+    facultAiRuntimeCoordinationDir(home, resolvedRoot),
+    "evolution-loop.lock"
+  );
+}
+
 export function facultAiJournalPath(
   home: string = defaultHomeDir(),
   rootDir?: string

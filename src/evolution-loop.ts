@@ -28,6 +28,7 @@ import {
 import {
   facultAiEvolutionLoopAuditPath,
   facultAiEvolutionLoopConfigPath,
+  facultAiEvolutionLoopLockPath,
   facultAiEvolutionLoopReportDir,
   facultAiEvolutionLoopStatePath,
   facultAiEvolutionReviewDir,
@@ -36,9 +37,12 @@ import {
   withFacultRootScope,
 } from "./paths";
 import { reconcileSources, reconciliationStatus } from "./reconciliation";
+import { DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS } from "./reconciliation-config";
 import type {
   CorrelatedSignal,
+  ReconciliationFreshness,
   ReconciliationReview,
+  ResolutionProof,
   SourceCoverage,
 } from "./reconciliation-types";
 import {
@@ -140,6 +144,7 @@ interface EvolutionLoopState {
   lastSuccessfulScheduledConfigGeneration?: number;
   lastRunStatus?: "complete" | "degraded" | "failed";
   lastCoverageComplete?: boolean;
+  lastFreshnessState?: ReconciliationFreshness["state"];
   lastSuccessfulCoverageUntil?: string;
   lastReviewId?: string;
   lastReportPath?: string;
@@ -176,6 +181,7 @@ export interface EvolutionLoopReport {
   reviewId?: string;
   coverage: SourceCoverage[];
   coverageComplete: boolean;
+  freshness: ReconciliationFreshness;
   queue: LoopQueueItem[];
   delta: {
     new: string[];
@@ -198,6 +204,12 @@ const ACTIVE_LOOP_PROPOSAL_STATUSES = new Set([
   "accepted",
   "applied",
 ]);
+const UNKNOWN_FRESHNESS: ReconciliationFreshness = {
+  state: "unknown",
+  staleSourceIds: [],
+  unknownSourceIds: [],
+  alertSourceIds: [],
+};
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -971,7 +983,32 @@ function rawQueue(args: {
         entry.unavailableReason ?? entry.staleReason ?? entry.state,
       ],
     }));
-  return [...signalItems, ...proposalItems, ...coverageItems];
+  const freshnessItems = args.review.coverage
+    .filter((entry) => entry.freshness.state === "stale")
+    .map((entry) => ({
+      id: `freshness:${entry.sourceId}`,
+      kind: "coverage" as const,
+      title: `${entry.sourceId} cursor freshness is stale`,
+      state: "blocked" as const,
+      linkedWork: [],
+      approvalRequired: false,
+      sourceIds: [entry.sourceId],
+      evidenceRefs: [
+        entry.freshness.reason,
+        ...(entry.freshness.cursorAt
+          ? [`cursor:${entry.freshness.cursorAt}`]
+          : []),
+        ...(entry.freshness.latestSourceAt
+          ? [`latest:${entry.freshness.latestSourceAt}`]
+          : []),
+      ],
+    }));
+  return [
+    ...signalItems,
+    ...proposalItems,
+    ...coverageItems,
+    ...freshnessItems,
+  ];
 }
 
 function queueFingerprint(
@@ -995,7 +1032,8 @@ function reconcileQueue(args: {
   prior: EvolutionLoopState;
   generatedAt: string;
   coverageComplete: boolean;
-  resolvedEvidenceKeys: string[];
+  resolutionProofs: ResolutionProof[];
+  resolvedSignalFamilies: string[];
 }): {
   queue: Record<string, LoopQueueItem>;
   fingerprints: Record<string, string>;
@@ -1006,7 +1044,12 @@ function reconcileQueue(args: {
   const newIds: string[] = [];
   const changedIds: string[] = [];
   const resolvedIds: string[] = [];
-  const resolvedEvidenceKeys = new Set(args.resolvedEvidenceKeys);
+  const containedEvidenceKeys = new Set(
+    args.resolutionProofs
+      .filter((proof) => proof.kind === "default_branch_containment")
+      .map((proof) => proof.evidenceKey)
+  );
+  const resolvedSignalFamilies = new Set(args.resolvedSignalFamilies);
   let unchangedSuppressed = 0;
   for (const raw of args.current) {
     const prior = args.prior.queue[raw.id];
@@ -1067,7 +1110,8 @@ function reconcileQueue(args: {
     }
     const signalHasResolutionProof =
       prior.kind === "signal" &&
-      prior.evidenceRefs.some((key) => resolvedEvidenceKeys.has(key));
+      (prior.evidenceRefs.some((key) => containedEvidenceKeys.has(key)) ||
+        Boolean(prior.familyId && resolvedSignalFamilies.has(prior.familyId)));
     if (
       !args.coverageComplete ||
       (prior.kind === "signal" && !signalHasResolutionProof)
@@ -1378,7 +1422,7 @@ function renderReport(report: EvolutionLoopReport): string {
   );
   const coverageRows = report.coverage.map(
     (entry) =>
-      `| ${markdownCell(entry.sourceId)} | ${markdownCell(entry.state)} | ${entry.recordsScanned} | ${entry.signalsDiscovered} | ${markdownCell(entry.unavailableReason ?? entry.staleReason ?? "")} |`
+      `| ${markdownCell(entry.sourceId)} | ${markdownCell(entry.state)} | ${markdownCell(entry.freshness.state)} | ${markdownCell(entry.freshness.reason)} | ${entry.recordsScanned} | ${entry.signalsDiscovered} | ${markdownCell(entry.unavailableReason ?? entry.staleReason ?? "")} |`
   );
   const attemptRows = report.attempts.map(
     (entry) =>
@@ -1399,6 +1443,7 @@ function renderReport(report: EvolutionLoopReport): string {
     `status: ${JSON.stringify(report.status)}`,
     `generatedAt: ${JSON.stringify(report.generatedAt)}`,
     `coverageComplete: ${report.coverageComplete}`,
+    `freshness: ${JSON.stringify(report.freshness.state)}`,
     "---",
     "",
     `# Evolution loop ${report.runId}`,
@@ -1407,6 +1452,7 @@ function renderReport(report: EvolutionLoopReport): string {
     "",
     `- Run status: ${report.status}`,
     `- Coverage: ${report.coverageComplete ? "complete" : "incomplete"} (${report.activity?.coverage.checked ?? 0}/${report.coverage.length} sources checked)`,
+    `- Freshness: ${report.freshness.state}${report.freshness.staleSourceIds.length > 0 ? ` (${report.freshness.staleSourceIds.join(", ")})` : ""}`,
     `- Changes: ${report.delta.new.length} new, ${report.delta.changed.length} changed, ${report.delta.resolved.length} resolved`,
     `- Needs attention: ${activityAttention.length}`,
     "",
@@ -1427,8 +1473,8 @@ function renderReport(report: EvolutionLoopReport): string {
     "",
     "## Source coverage",
     "",
-    "| Source | State | Records | Signals | Detail |",
-    "| --- | --- | ---: | ---: | --- |",
+    "| Source | Coverage | Freshness | Freshness reason | Records | Signals | Detail |",
+    "| --- | --- | --- | --- | ---: | ---: | --- |",
     ...coverageRows,
     "",
     "## Full current queue",
@@ -1805,9 +1851,37 @@ async function latestEvolutionLoopReportScoped(args: {
     return null;
   }
   try {
-    return JSON.parse(
+    const report = JSON.parse(
       await readFile(state.lastReportPath, "utf8")
     ) as EvolutionLoopReport;
+    const coverage = report.coverage.map((entry) =>
+      entry.freshness
+        ? entry
+        : {
+            ...entry,
+            freshness: {
+              state: "unknown" as const,
+              reason: "legacy_report" as const,
+              checkedAt: entry.checkedAt ?? report.generatedAt,
+              thresholdHours: DEFAULT_SOURCE_FRESHNESS_THRESHOLD_HOURS,
+              alert: false,
+            },
+          }
+    );
+    const unknownSourceIds = coverage
+      .filter((entry) => entry.freshness.state === "unknown")
+      .map((entry) => entry.sourceId)
+      .sort();
+    return {
+      ...report,
+      coverage,
+      freshness: report.freshness ?? {
+        state: "unknown",
+        staleSourceIds: [],
+        unknownSourceIds,
+        alertSourceIds: [],
+      },
+    };
   } catch {
     return null;
   }
@@ -1880,6 +1954,7 @@ async function persistFailedLoopRun(args: {
     reviewId: args.review?.reviewId,
     coverage: args.review?.coverage ?? [],
     coverageComplete: args.review?.coverageComplete ?? false,
+    freshness: args.review?.freshness ?? UNKNOWN_FRESHNESS,
     queue: Object.values(args.prior.queue).sort((left, right) =>
       left.id.localeCompare(right.id)
     ),
@@ -2000,7 +2075,7 @@ async function runEvolutionLoopScoped(args: {
     },
     updatedAt: now.toISOString(),
   };
-  const lockPath = `${facultAiEvolutionLoopStatePath(args.homeDir, args.rootDir)}.lock`;
+  const lockPath = facultAiEvolutionLoopLockPath(args.homeDir, args.rootDir);
   const execute = async (): Promise<EvolutionLoopReport> => {
     if (!args.dryRun) {
       const lockedConfig = await loadConfig(args);
@@ -2105,7 +2180,8 @@ async function runEvolutionLoopScoped(args: {
         prior,
         generatedAt,
         coverageComplete: review.coverageComplete,
-        resolvedEvidenceKeys: review.resolvedEvidenceKeys ?? [],
+        resolutionProofs: review.resolutionProofs ?? [],
+        resolvedSignalFamilies: review.resolvedSignalFamilies ?? [],
       });
       const generationAfter = prior.generation + (args.dryRun ? 0 : 1);
       const runId = `LR-${sha256(
@@ -2143,6 +2219,7 @@ async function runEvolutionLoopScoped(args: {
         reviewId: review.reviewId,
         coverage: review.coverage,
         coverageComplete: review.coverageComplete,
+        freshness: review.freshness,
         queue: Object.values(reconciledQueue.queue).sort((left, right) =>
           left.id.localeCompare(right.id)
         ),
@@ -2190,6 +2267,7 @@ async function runEvolutionLoopScoped(args: {
               : prior.lastSuccessfulScheduledConfigGeneration,
           lastRunStatus: review.coverageComplete ? "complete" : "degraded",
           lastCoverageComplete: review.coverageComplete,
+          lastFreshnessState: review.freshness.state,
           lastSuccessfulCoverageUntil: review.coverageComplete
             ? review.window.until
             : prior.lastSuccessfulCoverageUntil,
@@ -2270,6 +2348,7 @@ async function runEvolutionLoopScoped(args: {
                 ...nextState,
                 lastRunStatus: "failed",
                 lastCoverageComplete: false,
+                lastFreshnessState: "unknown",
                 lastSuccessfulScheduledRunAt:
                   prior.lastSuccessfulScheduledRunAt,
                 lastSuccessfulScheduledConfigGeneration:

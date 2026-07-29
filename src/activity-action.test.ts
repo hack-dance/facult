@@ -94,6 +94,12 @@ function report(args: {
     generationAfter: 3,
     coverage: [],
     coverageComplete: true,
+    freshness: {
+      state: "current",
+      staleSourceIds: [],
+      unknownSourceIds: [],
+      alertSourceIds: [],
+    },
     queue: [item],
     delta: {
       new: [item.id],

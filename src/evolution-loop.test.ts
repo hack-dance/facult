@@ -39,12 +39,15 @@ import {
   facultAiActivityHistoryManifestPath,
   facultAiEvolutionLoopAuditPath,
   facultAiEvolutionLoopConfigPath,
+  facultAiEvolutionLoopLockPath,
   facultAiEvolutionLoopStatePath,
   facultAiProposalDir,
+  facultAiReconciliationLockPath,
   facultAiReconciliationStatePath,
   facultAiWritebackQueuePath,
   withFacultRootScope,
 } from "./paths";
+import { reconcileSources } from "./reconciliation";
 
 const SIGNAL_FAMILY_ID_RE = /^SF-/;
 const COMPLETED_RUN_STATUS_RE = /^(complete|degraded)$/;
@@ -79,6 +82,142 @@ async function makeProject(): Promise<{
     "## 2026-01-02 Capability review\n\nThe capability review needs a durable verification loop.\n"
   );
   return { homeDir, projectRoot, rootDir };
+}
+
+async function runProjectGit(args: {
+  projectRoot: string;
+  argv: string[];
+  date?: string;
+}): Promise<void> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !name.startsWith("GIT_")) {
+      env[name] = value;
+    }
+  }
+  if (args.date) {
+    env.GIT_AUTHOR_DATE = args.date;
+    env.GIT_COMMITTER_DATE = args.date;
+  }
+  const proc = Bun.spawn({
+    cmd: [Bun.which("git") ?? "/usr/bin/git", ...args.argv],
+    cwd: args.projectRoot,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(stderr);
+  }
+}
+
+async function verifyPersistedGitContainmentTransition(
+  strategy: "fast-forward" | "merge-commit"
+) {
+  const project = await makeProject();
+  for (const argv of [
+    ["init", "--quiet", "--initial-branch=main"],
+    ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"],
+  ]) {
+    await runProjectGit({ projectRoot: project.projectRoot, argv });
+  }
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["commit", "--allow-empty", "--quiet", "-m", "chore: base"],
+    date: "2026-01-01T12:00:00.000Z",
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["switch", "--quiet", "-c", "feature"],
+  });
+  const capabilityPath = join(
+    project.rootDir,
+    "instructions",
+    "RECONCILIATION.md"
+  );
+  await mkdir(dirname(capabilityPath), { recursive: true });
+  await Bun.write(
+    capabilityPath,
+    "# Reconciliation\n\nCapability implementation linked to HACK-1033.\n"
+  );
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["add", ".ai/instructions"],
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["commit", "--quiet", "-m", "feat: add HACK-1033 reconciliation"],
+    date: "2026-01-02T12:00:00.000Z",
+  });
+  await Bun.write(
+    join(project.rootDir, "reconciliation.json"),
+    `${JSON.stringify({
+      version: 1,
+      sources: [
+        {
+          id: "git",
+          type: "git",
+          allBranches: true,
+          defaultBranch: "main",
+          paths: [".ai/instructions"],
+        },
+      ],
+    })}\n`
+  );
+  await enableEvolutionLoop({
+    ...project,
+    now: () => new Date("2026-01-03T00:00:00.000Z"),
+  });
+  const beforeMerge = await runEvolutionLoop({
+    ...project,
+    since: "2026-01-01T00:00:00.000Z",
+    until: "2026-01-03T00:00:00.000Z",
+    now: () => new Date("2026-01-03T00:00:00.000Z"),
+  });
+  const pending = beforeMerge.queue.find(
+    (item) => item.kind === "signal" && item.linkedWork.includes("HACK-1033")
+  );
+  if (!pending) {
+    throw new Error("Expected the feature commit to create a pending signal");
+  }
+
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv: ["switch", "--quiet", "main"],
+  });
+  await runProjectGit({
+    projectRoot: project.projectRoot,
+    argv:
+      strategy === "fast-forward"
+        ? ["merge", "--ff-only", "feature"]
+        : ["merge", "--no-ff", "--no-edit", "feature"],
+    date: "2026-01-04T12:00:00.000Z",
+  });
+  const afterMerge = await runEvolutionLoop({
+    ...project,
+    until: "2026-01-05T00:00:00.000Z",
+    now: () => new Date("2026-01-05T00:00:00.000Z"),
+  });
+  const resolved = afterMerge.queue.find((item) => item.id === pending.id);
+
+  const reconciliationState = JSON.parse(
+    await readFile(
+      facultAiReconciliationStatePath(project.homeDir, project.rootDir),
+      "utf8"
+    )
+  );
+
+  const quiet = await runEvolutionLoop({
+    ...project,
+    until: "2026-01-06T00:00:00.000Z",
+    now: () => new Date("2026-01-06T00:00:00.000Z"),
+  });
+  return { afterMerge, pending, quiet, reconciliationState, resolved };
 }
 
 afterEach(async () => {
@@ -524,6 +663,381 @@ describe("evolution loop", () => {
     expect(quiet.delta.notifiable).toHaveLength(0);
   });
 
+  for (const [strategy, label] of [
+    ["fast-forward", "fast-forward merge"],
+    ["merge-commit", "merge commit"],
+  ] as const) {
+    it(`resolves persisted feature evidence after a ${label}`, async () => {
+      const result = await verifyPersistedGitContainmentTransition(strategy);
+
+      expect(result.pending.state).not.toBe("resolved");
+      expect(result.resolved).toMatchObject({
+        state: "resolved",
+        linkedWork: expect.arrayContaining(["HACK-1033"]),
+      });
+      expect(result.afterMerge.delta.resolved).toContain(result.pending.id);
+      expect(
+        Object.values(result.reconciliationState.evidence).some(
+          (entry) =>
+            typeof entry === "object" &&
+            entry !== null &&
+            "defaultBranchContainment" in entry
+        )
+      ).toBe(true);
+      expect(
+        result.quiet.queue.find((item) => item.id === result.pending.id)?.state
+      ).toBe("resolved");
+      expect(result.quiet.delta.notifiable).not.toContain(result.pending.id);
+    });
+  }
+
+  it("keeps a multi-issue family open when only one linked issue is terminal", async () => {
+    const project = await makeProject();
+    const evidencePath = join(project.projectRoot, "evidence.json");
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "work-export",
+            type: "evidence-export",
+            path: "evidence.json",
+          },
+        ],
+      })}\n`
+    );
+    const writeEvidence = async (args: {
+      generatedAt: string;
+      until: string;
+      events: unknown[];
+    }): Promise<void> => {
+      await Bun.write(
+        evidencePath,
+        `${JSON.stringify({
+          version: 1,
+          producer: "multi-issue-fixture",
+          generatedAt: args.generatedAt,
+          coverage: {
+            since: "2026-01-01T00:00:00.000Z",
+            until: args.until,
+            complete: true,
+          },
+          events: args.events,
+        })}\n`
+      );
+    };
+    await writeEvidence({
+      generatedAt: "2026-01-03T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      events: [
+        {
+          id: "family-open",
+          kind: "work-item",
+          observedAt: "2026-01-02T00:00:00.000Z",
+          title: "Capability implementation remains open",
+          refs: ["HACK-1101", "HACK-1102"],
+        },
+      ],
+    });
+    await enableEvolutionLoop({
+      ...project,
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const first = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const family = first.queue.find(
+      (item) =>
+        item.kind === "signal" &&
+        item.linkedWork.includes("HACK-1101") &&
+        item.linkedWork.includes("HACK-1102")
+    );
+    expect(family).toMatchObject({ state: "open" });
+
+    await writeEvidence({
+      generatedAt: "2026-01-05T00:00:00.000Z",
+      until: "2026-01-04T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1101-done",
+          kind: "status-change",
+          observedAt: "2026-01-04T00:00:00.000Z",
+          title: "HACK-1101 is done",
+          refs: ["HACK-1101"],
+          status: "done",
+        },
+      ],
+    });
+    const partial = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-04T23:59:59.999Z",
+      now: () => new Date("2026-01-05T00:00:00.000Z"),
+    });
+    const partialFamily = partial.queue.find((item) => item.id === family?.id);
+    expect(partialFamily).toMatchObject({
+      state: "open",
+      linkedWork: ["HACK-1101", "HACK-1102"],
+    });
+    expect(partial.delta.resolved).not.toContain(family?.id);
+
+    await writeEvidence({
+      generatedAt: "2026-01-07T00:00:00.000Z",
+      until: "2026-01-06T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1101-confirmed",
+          kind: "status-change",
+          observedAt: "2026-01-06T00:00:00.000Z",
+          title: "HACK-1101 remains done",
+          refs: ["HACK-1101"],
+          status: "done",
+        },
+        {
+          id: "hack-1102-done",
+          kind: "status-change",
+          observedAt: "2026-01-06T01:00:00.000Z",
+          title: "HACK-1102 is done",
+          refs: ["HACK-1102"],
+          status: "done",
+        },
+      ],
+    });
+    const terminal = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-06T23:59:59.999Z",
+      now: () => new Date("2026-01-07T00:00:00.000Z"),
+    });
+    expect(terminal.queue.find((item) => item.id === family?.id)).toMatchObject(
+      {
+        state: "resolved",
+        linkedWork: ["HACK-1101", "HACK-1102"],
+      }
+    );
+  });
+
+  it("resolves a queued family from proof persisted before the loop commits", async () => {
+    const project = await makeProject();
+    const evidencePath = join(project.projectRoot, "evidence.json");
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "work-export",
+            type: "evidence-export",
+            path: "evidence.json",
+          },
+        ],
+      })}\n`
+    );
+    const writeEvidence = async (args: {
+      events: unknown[];
+      generatedAt: string;
+      since: string;
+      until: string;
+    }) =>
+      await Bun.write(
+        evidencePath,
+        `${JSON.stringify({
+          version: 1,
+          producer: "persisted-resolution-fixture",
+          generatedAt: args.generatedAt,
+          coverage: {
+            since: args.since,
+            until: args.until,
+            complete: true,
+          },
+          events: args.events,
+        })}\n`
+      );
+
+    await writeEvidence({
+      generatedAt: "2026-01-03T00:00:00.000Z",
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1033-open",
+          kind: "work-item",
+          observedAt: "2026-01-02T00:00:00.000Z",
+          title: "HACK-1033 reconciliation remains open",
+          refs: ["HACK-1033"],
+        },
+      ],
+    });
+    await enableEvolutionLoop({ ...project });
+    const first = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01",
+      until: "2026-01-02",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+    const pending = first.queue.find(
+      (item) => item.kind === "signal" && item.linkedWork.includes("HACK-1033")
+    );
+    if (!pending?.familyId) {
+      throw new Error("Expected HACK-1033 to create a queued signal family");
+    }
+    expect(pending.state).toBe("open");
+
+    await writeEvidence({
+      generatedAt: "2026-01-05T00:00:00.000Z",
+      since: "2026-01-03T00:00:00.000Z",
+      until: "2026-01-04T23:59:59.999Z",
+      events: [
+        {
+          id: "hack-1033-done",
+          kind: "status-change",
+          observedAt: "2026-01-04T00:00:00.000Z",
+          title: "HACK-1033 is done",
+          refs: ["HACK-1033"],
+          status: "done",
+          terminal: true,
+        },
+      ],
+    });
+    const directReview = await reconcileSources({
+      ...project,
+      since: "2026-01-03",
+      until: "2026-01-04",
+      incremental: true,
+    });
+    expect(directReview.resolvedSignalFamilies).toContain(pending.familyId);
+    const stateAfterDirectReview = JSON.parse(
+      await readFile(
+        facultAiReconciliationStatePath(project.homeDir, project.rootDir),
+        "utf8"
+      )
+    ) as { resolutionProofs?: Record<string, unknown> };
+    expect(
+      Object.keys(stateAfterDirectReview.resolutionProofs ?? {})
+    ).not.toHaveLength(0);
+
+    await writeEvidence({
+      generatedAt: "2026-01-06T00:00:00.000Z",
+      since: "2026-01-02T23:59:59.999Z",
+      until: "2026-01-05T23:59:59.999Z",
+      events: [],
+    });
+    const recoveryPreview = await reconcileSources({
+      ...project,
+      since: "2026-01-04T23:59:59.999Z",
+      until: "2026-01-05T23:59:59.999Z",
+      incremental: true,
+      persist: false,
+    });
+    expect(recoveryPreview.resolvedSignalFamilies).toContain(pending.familyId);
+    const recovered = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-05T23:59:59.999Z",
+      now: () => new Date("2026-01-06T00:00:00.000Z"),
+    });
+    expect(recovered.queue.find((item) => item.id === pending.id)?.state).toBe(
+      "resolved"
+    );
+    expect(recovered.delta.resolved).toContain(pending.id);
+
+    const quiet = await runEvolutionLoop({
+      ...project,
+      until: "2026-01-06T23:59:59.999Z",
+      now: () => new Date("2026-01-07T00:00:00.000Z"),
+    });
+    expect(quiet.delta.notifiable).not.toContain(pending.id);
+  });
+
+  it("alerts once for a stale cursor while keeping complete coverage", async () => {
+    const project = await makeProject();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runProjectGit({ projectRoot: project.projectRoot, argv });
+    }
+    await mkdir(join(project.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(project.projectRoot, "docs", "review.md"),
+      "Capability review cursor baseline.\n"
+    );
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: cursor baseline"],
+      date: "2026-07-23T18:12:45-04:00",
+    });
+    await Bun.write(
+      join(project.rootDir, "reconciliation.json"),
+      `${JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+            freshnessThresholdHours: 168,
+          },
+        ],
+      })}\n`
+    );
+    await enableEvolutionLoop({ ...project });
+    await runEvolutionLoop({
+      ...project,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-23T18:15:00-04:00",
+      now: () => new Date("2026-07-23T18:15:00-04:00"),
+    });
+
+    await Bun.write(join(project.projectRoot, "outside.txt"), "new activity\n");
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["add", "outside.txt"],
+    });
+    await runProjectGit({
+      projectRoot: project.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: newer activity"],
+      date: "2026-07-23T18:28:50-04:00",
+    });
+    const stale = await runEvolutionLoop({
+      ...project,
+      until: "2026-07-27T23:04:10Z",
+      now: () => new Date("2026-07-27T23:04:10Z"),
+    });
+    const freshnessItem = stale.queue.find(
+      (item) => item.id === "freshness:git"
+    );
+    expect(stale.coverageComplete).toBe(true);
+    expect(stale.status).toBe("complete");
+    expect(stale.freshness.state).toBe("stale");
+    expect(freshnessItem).toMatchObject({
+      kind: "coverage",
+      state: "blocked",
+      sourceIds: ["git"],
+    });
+    expect(stale.delta.notifiable).toContain("freshness:git");
+
+    const quiet = await runEvolutionLoop({
+      ...project,
+      until: "2026-07-28T00:04:10Z",
+      now: () => new Date("2026-07-28T00:04:10Z"),
+    });
+    expect(quiet.coverageComplete).toBe(true);
+    expect(quiet.freshness.state).toBe("stale");
+    expect(quiet.delta.notifiable).not.toContain("freshness:git");
+    expect(quiet.delta.unchangedSuppressed).toBeGreaterThan(0);
+    const artifact = await readFile(quiet.artifactPath, "utf8");
+    expect(artifact).toContain("Freshness: stale");
+    expect(artifact).toContain("newer_repository_activity");
+  });
+
   it("does not report an existing signal-family writeback as a new mutation", async () => {
     const project = await makeProject();
     await mkdir(join(project.rootDir, "instructions"), { recursive: true });
@@ -800,10 +1314,16 @@ describe("evolution loop", () => {
         await readdir(dirname(reconciliationStatePath), { recursive: true })
       ).sort()
     ).toEqual(reconciliationEntriesBefore);
-    expect(await Bun.file(`${reconciliationStatePath}.lock`).exists()).toBe(
-      false
-    );
-    expect(await Bun.file(`${statePath}.lock`).exists()).toBe(false);
+    expect(
+      await Bun.file(
+        facultAiReconciliationLockPath(project.homeDir, project.rootDir)
+      ).exists()
+    ).toBe(false);
+    expect(
+      await Bun.file(
+        facultAiEvolutionLoopLockPath(project.homeDir, project.rootDir)
+      ).exists()
+    ).toBe(false);
     expect(await Bun.file(preview.artifactPath).exists()).toBe(false);
   });
 
@@ -1304,11 +1824,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const statePath = facultAiEvolutionLoopStatePath(
+    const lockPath = facultAiEvolutionLoopLockPath(
       project.homeDir,
       project.rootDir
     );
-    const lockPath = `${statePath}.lock`;
     await Bun.write(
       lockPath,
       `${JSON.stringify({ pid: process.pid, startedAt: "2026-01-03T00:00:00.000Z" })}\n`
@@ -1368,7 +1887,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
     await Bun.write(
       lockPath,
       `${JSON.stringify({ pid: 2_147_483_647, startedAt: "2026-01-01T00:00:00.000Z" })}\n`
@@ -1497,7 +2019,10 @@ describe("evolution loop", () => {
       ...project,
       now: () => new Date("2026-01-03T00:00:00.000Z"),
     });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
     const takeoverPath = `${lockPath}.takeover`;
     const staleOwner = `${JSON.stringify({
       pid: 2_147_483_647,
@@ -1529,7 +2054,10 @@ describe("evolution loop", () => {
   it("does not reinterpret a non-file lock-path error as stale recovery", async () => {
     const project = await makeProject();
     await enableEvolutionLoop({ ...project });
-    const lockPath = `${facultAiEvolutionLoopStatePath(project.homeDir, project.rootDir)}.lock`;
+    const lockPath = facultAiEvolutionLoopLockPath(
+      project.homeDir,
+      project.rootDir
+    );
 
     await expect(
       runEvolutionLoop({
@@ -1988,6 +2516,52 @@ describe("evolution loop", () => {
     );
     expect(closedItem?.state).toBe("resolved");
     expect(closedItem?.requestedExternalAction).toBeUndefined();
+  });
+
+  it("rejects an obsolete duplicate proposal without applying its target edit", async () => {
+    const project = await makeProject();
+    const targetPath = join(project.rootDir, "instructions", "REVIEW.md");
+    await mkdir(dirname(targetPath), { recursive: true });
+    await Bun.write(
+      targetPath,
+      "# Review\n\nThe requested bounded review rule already exists.\n"
+    );
+    const writeback = await addWriteback({
+      ...project,
+      kind: "bad_default",
+      summary: "Add the bounded review rule that already exists.",
+      suggestedDestination: "@project/instructions/REVIEW.md",
+      evidence: [{ type: "test", ref: "duplicate-existing-rule" }],
+    });
+    const [proposal] = await proposeEvolution({
+      ...project,
+      writebackIds: [writeback.id],
+    });
+    await draftProposal(proposal!.id, project);
+    const targetBefore = await readFile(targetPath, "utf8");
+
+    const rejected = await rejectProposal(proposal!.id, {
+      ...project,
+      reason:
+        "Rejected as duplicate/obsolete after exact proposal and target readback.",
+    });
+    await enableEvolutionLoop({ ...project });
+    const report = await runEvolutionLoop({
+      ...project,
+      since: "2026-01-01",
+      until: "2026-01-03",
+      now: () => new Date("2026-01-03T00:00:00.000Z"),
+    });
+
+    expect(rejected.status).toBe("rejected");
+    expect(await readFile(targetPath, "utf8")).toBe(targetBefore);
+    expect(
+      report.queue.find((item) => item.proposalId === proposal!.id)
+    ).toMatchObject({
+      state: "resolved",
+      approvalRequired: false,
+    });
+    expect(report.mutations.every((mutation) => !mutation.applied)).toBe(true);
   });
 
   it("covers signal, proposal, explicit apply, regression reopen, and verified improvement end to end", async () => {
