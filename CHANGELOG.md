@@ -1,3 +1,9 @@
+## [2.29.1](https://github.com/hack-dance/fclt/compare/v2.29.0...v2.29.1) (2026-07-29)
+
+### Bug Fixes
+
+* make reconciliation recovery durable ([#74](https://github.com/hack-dance/fclt/issues/74)) ([d7c7feb](https://github.com/hack-dance/fclt/commit/d7c7feb3680080d13a486905a125b4bb3d146a1e))
+
 ## [2.29.0](https://github.com/hack-dance/fclt/compare/v2.28.0...v2.29.0) (2026-07-29)
 
 ### Features
