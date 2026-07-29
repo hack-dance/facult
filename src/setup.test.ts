@@ -186,6 +186,23 @@ async function runCli(args: {
   return { code, stdout, stderr };
 }
 
+async function snapshotFiles(root: string): Promise<[string, string][]> {
+  const entries: [string, string][] = [];
+  for await (const pathValue of new Bun.Glob("**/*").scan({
+    cwd: root,
+    dot: true,
+    onlyFiles: true,
+  })) {
+    entries.push([
+      pathValue,
+      Buffer.from(await Bun.file(join(root, pathValue)).arrayBuffer()).toString(
+        "base64"
+      ),
+    ]);
+  }
+  return entries.sort(([left], [right]) => left.localeCompare(right));
+}
+
 describe("zero-config setup", () => {
   it("dry-runs a fresh isolated home without writing or failing", async () => {
     const home = await tempHome("fclt-setup-dry-");
@@ -241,6 +258,158 @@ describe("zero-config setup", () => {
     ).toBe(true);
     expect(await readdir(projectAiRoot)).toEqual([]);
     expect(await Bun.file(join(home, ".ai")).exists()).toBe(false);
+  });
+
+  it("keeps every project mutation path zero-write under common --dry-run", async () => {
+    const home = await tempHome("fclt-project-dry-run-");
+    const repo = await initRepo(home);
+    const preview = await runCli({
+      home,
+      cwd: repo,
+      argv: ["project", "init", "--project-root", repo, "--json"],
+    });
+    expect(preview.code).toBe(0);
+    const plan = JSON.parse(preview.stdout) as { planSha256: string };
+
+    const initDryRun = await runCli({
+      home,
+      cwd: repo,
+      argv: [
+        "project",
+        "init",
+        "--project-root",
+        repo,
+        "--apply",
+        "--plan-sha",
+        plan.planSha256,
+        "--dry-run",
+        "--json",
+      ],
+    });
+    expect(initDryRun.code).toBe(0);
+    expect(
+      (JSON.parse(initDryRun.stdout) as { planSha256: string }).planSha256
+    ).toBe(plan.planSha256);
+    expect(await Bun.file(join(repo, ".ai")).exists()).toBe(false);
+    expect(await Bun.file(join(home, ".local-state")).exists()).toBe(false);
+
+    const applied = await runCli({
+      home,
+      cwd: repo,
+      argv: [
+        "project",
+        "init",
+        "--project-root",
+        repo,
+        "--apply",
+        "--plan-sha",
+        plan.planSha256,
+        "--json",
+      ],
+    });
+    expect(applied.code).toBe(0);
+    const receiptId = (JSON.parse(applied.stdout) as { receiptId: string })
+      .receiptId;
+    const before = await snapshotFiles(home);
+
+    const rollback = await runCli({
+      home,
+      cwd: repo,
+      argv: [
+        "project",
+        "rollback",
+        "--receipt",
+        receiptId,
+        "--apply",
+        "--dry-run",
+        "--json",
+      ],
+    });
+    expect(rollback.code).toBe(0);
+    expect((JSON.parse(rollback.stdout) as { applied: boolean }).applied).toBe(
+      false
+    );
+    const decisions = {
+      disable: "disabled",
+      ignore: "ignored",
+      inactive: "inactive",
+      remove: "removed",
+    } as const;
+    for (const [command, decision] of Object.entries(decisions)) {
+      const result = await runCli({
+        home,
+        cwd: repo,
+        argv: [
+          "project",
+          command,
+          "--project-root",
+          repo,
+          "--dry-run",
+          "--json",
+        ],
+      });
+      expect(result.code).toBe(0);
+      expect((JSON.parse(result.stdout) as { decision: string }).decision).toBe(
+        decision
+      );
+    }
+    expect(await snapshotFiles(home)).toEqual(before);
+  }, 20_000);
+
+  it("shell-quotes project repair paths as executable argv", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const home = await tempHome("fclt-setup-quote-");
+    const repo = join(home, "repo' ; touch INJECTED ; #");
+    await mkdir(repo, { recursive: true });
+    await runFixtureGit({
+      argv: ["init", "--quiet", repo],
+      repoDir: repo,
+      homeDir: join(home, ".git-home"),
+    });
+    const result = await bootstrapFclt({
+      homeDir: home,
+      cwd: repo,
+      includeProject: true,
+      installCodexPlugin: false,
+      dryRun: true,
+    });
+    const action = result.repairActions.find(
+      (candidate) =>
+        candidate.scope === "project" &&
+        candidate.command.includes("--plan-sha")
+    );
+    expect(action).toBeDefined();
+    const planSha256 = result.projectEnrollmentPlan?.planSha256;
+    expect(planSha256).toBeDefined();
+
+    const binDir = join(home, "bin");
+    const fakeFclt = join(binDir, "fclt");
+    await mkdir(binDir, { recursive: true });
+    await writeFile(fakeFclt, '#!/bin/sh\nprintf "%s\\n" "$@"\n', "utf8");
+    await chmod(fakeFclt, 0o755);
+    const proc = Bun.spawn(["/bin/sh", "-c", action?.command ?? ""], {
+      cwd: home,
+      env: { ...process.env, PATH: `${binDir}:/usr/bin:/bin` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim().split("\n")).toEqual([
+      "project",
+      "init",
+      "--project-root",
+      repo,
+      "--apply",
+      "--plan-sha",
+      planSha256 ?? "",
+    ]);
+    expect(await Bun.file(join(home, "INJECTED")).exists()).toBe(false);
   });
 
   it("preserves an invalid reconciliation config and reports repair", async () => {
@@ -345,6 +514,24 @@ describe("zero-config setup", () => {
       ])
     );
     expect(await Bun.file(join(repo, ".ai")).exists()).toBe(false);
+
+    const textPreview = await runCli({
+      home,
+      cwd: repo,
+      argv: ["setup", "--include-project", "--dry-run", "--no-codex-plugin"],
+    });
+    expect(textPreview.code).toBe(0);
+    const serializedPlan = JSON.stringify(
+      planned.projectEnrollmentPlan,
+      null,
+      2
+    );
+    const planOffset = textPreview.stdout.indexOf(serializedPlan);
+    const applyOffset = textPreview.stdout.indexOf(
+      "fclt project init --project-root"
+    );
+    expect(planOffset).toBeGreaterThanOrEqual(0);
+    expect(applyOffset).toBeGreaterThan(planOffset);
 
     const apply = await runCli({
       home,
@@ -491,7 +678,7 @@ describe("zero-config setup", () => {
         'import { dirname, join } from "node:path";',
         "const argv = process.argv.slice(2);",
         'const pluginId = "fclt@hack-local";',
-        'const version = "0.1.2";',
+        'const version = "0.1.3";',
         'const installedPath = join(process.env.HOME, ".codex", "plugins", "cache", "hack-local", "fclt", version);',
         'mkdirSync(join(process.env.HOME, ".codex"), { recursive: true });',
         'writeFileSync(join(process.env.HOME, ".codex", "config.toml"), `[plugins."` + pluginId + `"]\nenabled = true\n`);',

@@ -12,9 +12,16 @@ Discovery is read-only, bounded, and restricted to explicit roots:
 fclt projects discover --root ~/dev --since 30d --json
 ```
 
-The result groups duplicate clones and worktrees by a stable repository
+The result groups duplicate clones and worktrees by a stable portfolio
 identity, reports dirty state and existing `.ai` coverage, and says when a
-bound truncated the scan. Review and select repositories individually; the
+bound truncated the scan. A normalized remote is the portable repository
+discriminator when one exists, so an upstream repository and its fork are not
+merged merely because they share initial history. Root-commit and local Git
+common-directory aliases migrate earlier records, while the machine-local
+registry preserves the selected primary when remotes are later added, renamed,
+or removed. Each checkout/worktree also has a separate location-derived
+execution identity because its generated index and graph contain
+location-specific paths. Review and select repositories individually; the
 command never enrolls its results.
 
 ## Preview And Apply
@@ -25,9 +32,10 @@ Preview the exact plan before any write:
 fclt project init --project-root /path/to/repo --json
 ```
 
-The plan distinguishes canonical, generated, and machine-local writes and
-includes file preconditions, privacy findings, rollback behavior, and a plan
-hash. Minimal enrollment writes:
+The plan distinguishes canonical, generated, and machine-local writes, names
+the execution-specific index and graph paths, and includes file preconditions,
+privacy findings, rollback behavior, and a plan hash. Minimal enrollment
+writes:
 
 ```text
 <repo>/.ai/
@@ -46,9 +54,13 @@ fclt project init --project-root /path/to/repo \
   --apply --plan-sha <sha-from-preview> --json
 ```
 
-Apply refuses stale source hashes or changed destination preconditions. It does
-not install the operating pack, enable managed rendering, schedule a loop, or
-copy repository guidance.
+Apply refuses stale source hashes, changed destination preconditions, symlinked
+generated targets, or an execution identity mismatch. One machine-local
+transaction lock serializes canonical files, generated state, the portfolio
+registry, and the final receipt. A failed late stage restores only bytes still
+owned by that transaction, so a concurrent user edit is preserved. It does not
+install the operating pack, enable managed rendering, schedule a loop, or copy
+repository guidance.
 
 `fclt templates init project-ai` remains a preview-first compatibility alias.
 It has the same minimal contract and does not accept the old `--update` or
@@ -67,8 +79,10 @@ fclt project init --project-root /path/to/repo \
 ```
 
 The plan previews the complete content and SHA-256 hash. Adoption is
-reference-only and is refused when the source is untracked, modified, outside
-the repository, secret-shaped, or contains a machine-local absolute path.
+reference-only and is refused when the source is untracked, modified, marked
+`assume-unchanged` or `skip-worktree`, outside the repository, secret-shaped,
+or contains a machine-local absolute path. fclt compares the worktree, index,
+and `HEAD` blob identities directly rather than trusting porcelain status.
 Reviewing and applying a plan therefore cannot turn a dirty checkout or a
 machine-specific document into committed project capability.
 
@@ -114,8 +128,19 @@ fclt project rollback --receipt <receipt-id> --json
 fclt project rollback --receipt <receipt-id> --apply --json
 ```
 
-Rollback removes only files created by that receipt when their hashes still
-match. It refuses drift and preserves the receipt and review history.
+Rollback changes only files still matching the receipt and only when that
+receipt remains the active enrollment for its checkout. It refuses drift and
+older receipts, serializes against apply, and preserves the receipt and review
+history.
+
+On Linux and macOS, supported mutations are serialized and bind registry
+replacement to the captured contents, mode, and inode through a conditional
+exchange or no-replace commit. A non-cooperating writer at the final commit
+boundary is preserved and the fclt transaction fails closed. Windows supports
+read-only discovery, status, and rollback preview, but project enrollment,
+rollback apply, and registry decisions (`disable`, `ignore`, `inactive`, and
+`remove`) remain unavailable until Windows has an equivalent conditional
+replacement primitive.
 
 ## Scope And Verification
 

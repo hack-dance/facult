@@ -71,8 +71,9 @@ fclt projects discover --root ~/dev --since 30d --json
 ```
 
 Discovery is bounded and read-only. Review duplicate clone/worktree groups,
-dirty state, existing guidance, and repository identity before selecting a
-project. Never bulk-enroll the discovery result.
+dirty state, existing guidance, stable portfolio identity, and the separate
+checkout/worktree execution identity before selecting a project. Never
+bulk-enroll the discovery result.
 
 6. Preview the exact minimal project enrollment plan:
 
@@ -93,7 +94,9 @@ fclt project init --project-root /path/to/repo \
 ```
 
 Guidance adoption is reference-only. fclt previews the full content and hash,
-and refuses untracked, modified, secret-shaped, or machine-path-bearing input.
+and refuses untracked, modified, `assume-unchanged`, `skip-worktree`,
+secret-shaped, or machine-path-bearing input. Cleanliness requires identical
+worktree, index, and `HEAD` blobs.
 
 7. Apply only the unchanged reviewed plan:
 
@@ -103,7 +106,9 @@ fclt project init --project-root /path/to/repo \
 ```
 
 If options, source files, or preconditions change, discard the old hash and
-preview again.
+preview again. Apply serializes portfolio registry mutations, isolates
+location-bearing generated state per checkout/worktree, refuses symlinked
+generated targets, and publishes the receipt only after the registry commit.
 
 8. Inspect health, coverage, and lifecycle:
 

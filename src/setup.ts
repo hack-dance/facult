@@ -2,9 +2,12 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { refreshAiReviewArtifacts } from "./ai";
 import { resolveCliContextRoot } from "./cli-context";
-import { buildDoctorReport, type DoctorReport } from "./doctor";
+import { buildDoctorReport, type DoctorReport, shellQuote } from "./doctor";
 import { type SetupCodexPluginResult, setupCodexPlugin } from "./manage";
-import { facultAiReconciliationConfigPath } from "./paths";
+import {
+  facultAiReconciliationConfigPath,
+  pathsPhysicallyEquivalent,
+} from "./paths";
 import { type ProjectEnrollmentPlan, planProjectEnrollment } from "./projects";
 import { initializeReconciliationConfig } from "./reconciliation-config";
 import {
@@ -93,8 +96,9 @@ export async function bootstrapFclt(
   const includeProject = opts.includeProject ?? false;
   const projectCandidateRoot = resolve(detectedProject ?? cwd, ".ai");
   const projectTargetsGlobalRoot =
-    (detectedProject !== null && resolve(detectedProject) === globalRoot) ||
-    projectCandidateRoot === globalRoot;
+    (detectedProject !== null &&
+      pathsPhysicallyEquivalent(detectedProject, globalRoot)) ||
+    pathsPhysicallyEquivalent(projectCandidateRoot, globalRoot);
   const projectRoot =
     includeProject && !projectTargetsGlobalRoot ? projectCandidateRoot : null;
   const changedPaths: string[] = [];
@@ -180,7 +184,7 @@ export async function bootstrapFclt(
       ? [
           {
             scope: "project" as const,
-            command: `fclt project init --project-root '${projectEnrollmentPlan.projectRoot}' --apply --plan-sha ${projectEnrollmentPlan.planSha256}`,
+            command: `fclt project init --project-root ${shellQuote(projectEnrollmentPlan.projectRoot)} --apply --plan-sha ${projectEnrollmentPlan.planSha256}`,
             reason:
               "Review the project enrollment plan before applying its minimal canonical layer.",
           },
@@ -289,6 +293,10 @@ export async function setupCommand(argv: string[]): Promise<void> {
       console.log(`global: ${result.globalRoot}`);
       console.log(`project: ${result.projectRoot ?? "(none)"}`);
       console.log(`changed: ${result.changedPaths.length}`);
+      if (result.projectEnrollmentPlan) {
+        console.log("project enrollment plan:");
+        console.log(JSON.stringify(result.projectEnrollmentPlan, null, 2));
+      }
       if (result.repairActions.length > 0) {
         console.log("next actions:");
         for (const action of result.repairActions) {

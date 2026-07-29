@@ -852,7 +852,7 @@ const UNRESOLVED_REFS_TEMPLATE_RE = /\$\{refs\.([A-Za-z0-9_.-]+)\}/g;
 const FCLTY_BLOCK_RE =
   /<!--\s*fclty:([^>]+?)\s*-->([\s\S]*?)<!--\s*\/fclty:\1\s*-->/g;
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
@@ -1656,7 +1656,7 @@ export async function buildDoctorReport(opts?: {
         id: "init-project-ai",
         label: "Preview minimal project enrollment",
         command: projectAiInitCommand(rootDir),
-        risk: "canonical_write",
+        risk: "read_only",
       });
     }
 

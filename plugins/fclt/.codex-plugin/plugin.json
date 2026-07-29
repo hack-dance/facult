@@ -1,6 +1,6 @@
 {
   "name": "fclt",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Codex workflows and MCP tools for evidence reconciliation, writeback, evolution, and outcome review.",
   "author": {
     "name": "Hack Dance",

@@ -105,9 +105,9 @@ inherit the shell that contains Node, Bun, mise, or a package-manager shim.
 When the `codex` command is available, setup runs
 `codex plugin add fclt@<marketplace> --json`. Codex installs the plugin cache
 under `~/.codex/plugins/cache/<marketplace>/fclt/` using its own version
-directory. The read-only audit capability gate ships in plugin `0.1.2`; its
-version bump prevents Codex from selecting the pre-gate `0.1.1` cached wrapper
-after an upgrade. Setup fails closed unless Codex's install result, installed
+directory. The safe project-onboarding contract ships in plugin `0.1.3`; its
+version bump prevents Codex from selecting the pre-onboarding `0.1.2` cached
+wrapper after an upgrade. Setup fails closed unless Codex's install result, installed
 payload hash, and post-install plugin list all select the bundled version as
 installed and enabled.
 

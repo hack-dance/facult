@@ -1,20 +1,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import {
   basename,
   dirname,
   isAbsolute,
   join,
+  posix,
   relative,
   resolve,
   win32,
 } from "node:path";
+import { resolveRepositoryExecutionIdentitySync } from "./repository-identity";
 import { parseJsonLenient } from "./util/json";
 
 const WINDOWS_ABSOLUTE_PATH_RE = /^[A-Za-z]:[\\/]/;
-const PROJECT_REPOSITORY_ID_RE = /^repo_[a-f0-9]{24}$/;
 
 export interface FacultConfig {
   /**
@@ -76,11 +83,111 @@ function resolvePath(p: string, home: string): string {
   return expanded.startsWith("/") ? expanded : resolve(expanded);
 }
 
+function physicalPathComparisonKey(
+  pathValue: string,
+  platform: NodeJS.Platform
+): string {
+  const pathApi = platform === "win32" ? win32 : posix;
+  const resolved = pathApi.resolve(pathValue);
+
+  // Cross-platform callers use this only to exercise the platform's lexical
+  // comparison rule. Native callers additionally resolve every existing
+  // ancestor so symlink spellings converge.
+  if (platform !== process.platform) {
+    return platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  const missingParts: string[] = [];
+  let existingAncestor = resolved;
+  while (true) {
+    try {
+      const physicalAncestor = realpathSync.native(existingAncestor);
+      const comparisonPath = missingParts.reduce(
+        (current, part) => pathApi.join(current, part),
+        physicalAncestor
+      );
+      return platform === "win32"
+        ? comparisonPath.toLowerCase()
+        : comparisonPath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      const parent = pathApi.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        return platform === "win32" ? resolved.toLowerCase() : resolved;
+      }
+      missingParts.unshift(pathApi.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+export function pathsPhysicallyEquivalent(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  return (
+    physicalPathComparisonKey(left, platform) ===
+    physicalPathComparisonKey(right, platform)
+  );
+}
+
+export function pathsMayCollide(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  const leftKey = physicalPathComparisonKey(left, platform);
+  const rightKey = physicalPathComparisonKey(right, platform);
+  return (
+    leftKey === rightKey || leftKey.toLowerCase() === rightKey.toLowerCase()
+  );
+}
+
 function dirExists(p: string): boolean {
   try {
     return statSync(p).isDirectory();
   } catch {
     return false;
+  }
+}
+
+function safeMachineStateDirExists(pathValue: string): boolean {
+  try {
+    const metadata = lstatSync(pathValue);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(
+        `Refusing unsafe machine-local project state directory: ${pathValue}`
+      );
+    }
+    return true;
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? String(error.code)
+        : null;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function safePathEntryExists(pathValue: string): boolean {
+  try {
+    lstatSync(pathValue);
+    return true;
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? String(error.code)
+        : null;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -293,32 +400,55 @@ export function machineStateProjectKey(
   home: string = defaultHomeDir(),
   config?: FacultConfig | null
 ): string {
+  const executionKey = executionMachineStateProjectKey(rootDir, home, config);
+  const legacyKey = legacyMachineStateProjectKey(rootDir, home, config);
+  const projectsRoot = join(facultLocalStateRoot(home), "projects");
+  if (executionKey === legacyKey) {
+    safeMachineStateDirExists(join(projectsRoot, executionKey));
+    return executionKey;
+  }
+  const legacyExists = safeMachineStateDirExists(join(projectsRoot, legacyKey));
+  const executionExists = safeMachineStateDirExists(
+    join(projectsRoot, executionKey)
+  );
+  if (legacyExists && executionExists) {
+    throw new Error(
+      `Conflicting legacy and execution machine-local project state directories require enrollment reconciliation: ${join(projectsRoot, legacyKey)} and ${join(projectsRoot, executionKey)}`
+    );
+  }
+  if (legacyExists) {
+    return legacyKey;
+  }
+  return executionKey;
+}
+
+export function executionMachineStateProjectKey(
+  rootDir: string,
+  home: string = defaultHomeDir(),
+  config?: FacultConfig | null
+): string {
   const projectRoot = projectRootFromAiRoot(rootDir, home, config);
   if (projectRoot) {
-    const projectConfigPath = join(rootDir, "config.toml");
-    try {
-      const parsed = Bun.TOML.parse(readFileSync(projectConfigPath, "utf8"));
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        !Array.isArray(parsed) &&
-        "project" in parsed
-      ) {
-        const project = (parsed as Record<string, unknown>).project;
-        if (isPlainObject(project)) {
-          const repositoryId = project.repository_id;
-          if (
-            typeof repositoryId === "string" &&
-            PROJECT_REPOSITORY_ID_RE.test(repositoryId)
-          ) {
-            return repositoryId;
-          }
-        }
-      }
-    } catch {
-      // Fall back to the legacy path-derived key for unenrolled projects.
+    const executionIdentity =
+      resolveRepositoryExecutionIdentitySync(projectRoot);
+    if (executionIdentity) {
+      return executionIdentity.id;
+    }
+    if (safePathEntryExists(join(projectRoot, ".git"))) {
+      throw new Error(
+        `Unable to resolve machine-local execution identity for project state: ${projectRoot}`
+      );
     }
   }
+  return legacyMachineStateProjectKey(rootDir, home, config);
+}
+
+export function legacyMachineStateProjectKey(
+  rootDir: string,
+  home: string = defaultHomeDir(),
+  config?: FacultConfig | null
+): string {
+  const projectRoot = projectRootFromAiRoot(rootDir, home, config);
   const labelSource = projectRoot ?? rootDir;
   const label = basename(labelSource).trim().toLowerCase();
   const slug = label.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");

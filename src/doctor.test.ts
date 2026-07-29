@@ -1858,7 +1858,7 @@ test("doctor --json flags invalid canonical global guidance", async () => {
         canonicalTemplateRefsIssuePaths: string[];
       };
       issues: Array<{ code: string }>;
-      actions: Array<{ id: string; command: string }>;
+      actions: Array<{ id: string; command: string; risk: string }>;
     };
     expect(report.health.state).toBe("canonical_source_attention");
     expect(report.health.ok).toBe(false);
@@ -2348,6 +2348,7 @@ test("doctor --json flags generated-only project ai roots without exiting nonzer
       expect.objectContaining({
         id: "init-project-ai",
         command: `fclt project init --project-root '${projectRoot}'`,
+        risk: "read_only",
       })
     );
   } finally {

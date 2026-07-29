@@ -278,6 +278,9 @@ Minimal enrollment never copies `AGENTS.md` or `CLAUDE.md`. Use
 `--guidance AGENTS.md` only for an explicit, fully previewed reference to a
 tracked clean rulebook. Full operating-pack install remains a separate
 `fclt templates init operating-model --project` action.
+Project discovery, status, and rollback preview remain read-only on Windows;
+project enrollment and registry-mutating lifecycle actions currently require
+Linux or macOS conditional replacement support.
 
 Create individual capability units:
 

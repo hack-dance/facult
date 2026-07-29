@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   realpath,
@@ -20,6 +22,7 @@ import {
   resolve,
 } from "node:path";
 import { isCancel, multiselect, select, text } from "@clack/prompts";
+import { replaceVerifiedFileAt } from "./audit/safe-openat";
 import {
   builtinOperatingModelInstallRelPath,
   facultBuiltinPackRoot,
@@ -45,6 +48,7 @@ import {
 } from "./legacy-mutation-policy";
 import {
   facultRootDir,
+  pathsPhysicallyEquivalent,
   projectRootFromAiRoot,
   readFacultConfig,
   withFacultRootScope,
@@ -84,6 +88,8 @@ import { parseJsonLenient } from "./util/json";
 
 const REMOTE_STATE_VERSION = 1;
 const VERSION_TOKEN_RE = /[A-Za-z]+|[0-9]+/g;
+// biome-ignore lint/suspicious/noBitwiseOperators: secure open flags require OS bitmask composition.
+const NOFOLLOW_READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 const QUERY_SPLIT_RE = /\s+/;
 const MD_EXT_RE = /\.md$/i;
 const FILE_EXT_RE = /\.[A-Za-z0-9]+$/;
@@ -1593,18 +1599,128 @@ const PROJECT_AI_PROTECTIVE_IGNORE = `# fclt machine-local and generated state
 
 function appendProjectAiProtectiveIgnore(existing: string): string {
   const lines = existing.replace(/\r\n/g, "\n").split("\n");
-  while (lines.at(-1) === "") {
-    lines.pop();
+  const protections = PROJECT_AI_PROTECTIVE_IGNORE.trimEnd().split("\n");
+  const protectedLines = new Set(protections);
+  const out = lines.filter((line) => !protectedLines.has(line));
+  while (out.at(-1) === "") {
+    out.pop();
   }
-  for (const line of PROJECT_AI_PROTECTIVE_IGNORE.trimEnd().split("\n")) {
-    if (!lines.includes(line)) {
-      if (line.startsWith("#") && lines.length > 0 && lines.at(-1) !== "") {
-        lines.push("");
-      }
-      lines.push(line);
+  if (out.length > 0) {
+    out.push("");
+  }
+  out.push(...protections);
+  return `${out.join("\n")}\n`;
+}
+
+interface ProjectAiIgnoreSnapshot {
+  content: string;
+  identity: {
+    dev: number;
+    ino: number;
+  } | null;
+  mode: number | null;
+}
+
+function assertSafeProjectAiIgnoreEntry(
+  pathValue: string,
+  entry: Awaited<ReturnType<typeof lstat>>
+): void {
+  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) {
+    throw new Error(`Refusing unsafe project ignore file: ${pathValue}`);
+  }
+}
+
+async function assertSafeProjectAiIgnoreParent(
+  pathValue: string
+): Promise<void> {
+  const parent = dirname(pathValue);
+  const entry = await lstat(parent);
+  if (entry.isSymbolicLink() || !entry.isDirectory()) {
+    throw new Error(`Refusing unsafe project ignore directory: ${parent}`);
+  }
+  if (!pathsPhysicallyEquivalent(await realpath(parent), resolve(parent))) {
+    throw new Error(`Refusing unsafe project ignore directory: ${parent}`);
+  }
+}
+
+async function readProjectAiIgnore(
+  pathValue: string
+): Promise<ProjectAiIgnoreSnapshot> {
+  let entry: Awaited<ReturnType<typeof lstat>>;
+  try {
+    entry = await lstat(pathValue);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { content: "", identity: null, mode: null };
     }
+    throw error;
   }
-  return `${lines.join("\n")}\n`;
+  assertSafeProjectAiIgnoreEntry(pathValue, entry);
+  const handle = await open(pathValue, NOFOLLOW_READ_FLAGS);
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== entry.dev ||
+      opened.ino !== entry.ino
+    ) {
+      throw new Error(`Refusing unsafe project ignore file: ${pathValue}`);
+    }
+    return {
+      content: await handle.readFile("utf8"),
+      identity: { dev: opened.dev, ino: opened.ino },
+      mode: opened.mode % 0o1000,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameProjectAiIgnoreSnapshot(
+  left: ProjectAiIgnoreSnapshot,
+  right: ProjectAiIgnoreSnapshot
+): boolean {
+  return (
+    left.content === right.content &&
+    left.identity?.dev === right.identity?.dev &&
+    left.identity?.ino === right.identity?.ino &&
+    left.mode === right.mode
+  );
+}
+
+async function writeProjectAiIgnore(
+  pathValue: string,
+  content: string,
+  expected: ProjectAiIgnoreSnapshot,
+  beforeCommit: (() => Promise<void>) | undefined,
+  safeRoot: string
+): Promise<void> {
+  await assertSafeProjectAiIgnoreParent(pathValue);
+  const current = await readProjectAiIgnore(pathValue);
+  if (!sameProjectAiIgnoreSnapshot(current, expected)) {
+    throw new Error(`Project ignore file changed before commit: ${pathValue}`);
+  }
+  await replaceVerifiedFileAt({
+    beforeExchange: beforeCommit,
+    contents: content,
+    directoryPath: dirname(pathValue),
+    expected:
+      expected.identity === null
+        ? null
+        : {
+            contents: expected.content,
+            identity: expected.identity,
+            mode: expected.mode ?? 0o644,
+          },
+    fileName: basename(pathValue),
+    maxBytes: Math.max(
+      Buffer.byteLength(content),
+      Buffer.byteLength(expected.content)
+    ),
+    mode: expected.mode ?? 0o644,
+    safeRoot,
+  });
 }
 
 const OPERATING_MODEL_SNIPPET_FRAME = `## Working mode
@@ -1681,6 +1797,8 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
   force?: boolean;
   update?: boolean;
   installedAs?: string;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  beforeProjectIgnoreCommit?: () => Promise<void>;
 }): Promise<InstallResult> {
   const rootDir = resolve(args.rootDir);
   const packRoot = facultBuiltinPackRoot("facult-operating-model");
@@ -1695,15 +1813,21 @@ export async function scaffoldBuiltinOperatingModelPack(args: {
 
   if (projectRoot) {
     const ignorePath = join(rootDir, ".gitignore");
-    const existingIgnore = (await pathExists(ignorePath))
-      ? await Bun.file(ignorePath).text()
-      : "";
-    const protectiveIgnore = appendProjectAiProtectiveIgnore(existingIgnore);
-    if (protectiveIgnore !== existingIgnore) {
+    const existingIgnore = await readProjectAiIgnore(ignorePath);
+    const protectiveIgnore = appendProjectAiProtectiveIgnore(
+      existingIgnore.content
+    );
+    if (protectiveIgnore !== existingIgnore.content) {
       changedPaths.push(ignorePath);
       if (!args.dryRun) {
         await ensurePackDirectory(dirname(ignorePath));
-        await Bun.write(ignorePath, protectiveIgnore);
+        await writeProjectAiIgnore(
+          ignorePath,
+          protectiveIgnore,
+          existingIgnore,
+          args.beforeProjectIgnoreCommit,
+          projectRoot
+        );
       }
     }
   }
@@ -3915,7 +4039,7 @@ export async function templatesCommand(
           forwarded.push(flag, value);
         }
       }
-      for (const flag of ["--apply", "--json"]) {
+      for (const flag of ["--apply", "--dry-run", "--json"]) {
         if (args.includes(flag)) {
           forwarded.push(flag);
         }
