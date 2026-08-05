@@ -7,6 +7,7 @@ const path = require("node:path");
 const runtime = require("./fclt-runtime.cjs");
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.FCLT_MCP_TIMEOUT_MS || 60_000);
+const ACTIVITY_ACTION_DECIDE_CAPABILITY = "activity-action-decide-v1";
 const ACTIVITY_ACTION_RESOLVE_CAPABILITY = "activity-action-resolve-v1";
 const AUDIT_READ_ONLY_CAPABILITY = "audit-read-only-v1";
 const CONTENT_LENGTH_RE = /Content-Length:\s*(\d+)/i;
@@ -183,9 +184,55 @@ const tools = [
   {
     name: "fclt_registry",
     description:
-      "Search and verify remote capability, preview installs and updates, run typed source reconciliation reviews, or resolve one opaque activity action locator without mutation. Registry mutation remains withheld.",
+      "Search and verify remote capability, run typed source reconciliation reviews, resolve one opaque activity action locator, or record one revision-bound signal decision. Canonical and external mutation remains withheld.",
     inputSchema: {
       oneOf: [
+        {
+          type: "object",
+          properties: {
+            action: { const: "activity_decide" },
+            locator: {
+              type: "string",
+              pattern: "^fclt-act-v[0-9]+\\.[a-f0-9]{64}\\.[a-f0-9]{64}$",
+            },
+            decision: {
+              type: "string",
+              enum: ["accept", "redirect", "reject", "defer"],
+            },
+            expectedRevision: { type: "integer", minimum: 1 },
+            actor: {
+              type: "string",
+              pattern: "^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$",
+            },
+            approvalReference: { type: "string", minLength: 1, maxLength: 500 },
+            note: { type: "string", minLength: 1, maxLength: 1000 },
+            redirectTarget: { type: "string", minLength: 1, maxLength: 500 },
+            approve: { const: true },
+          },
+          required: [
+            "action",
+            "locator",
+            "decision",
+            "expectedRevision",
+            "actor",
+            "approve",
+          ],
+          allOf: [
+            {
+              oneOf: [
+                {
+                  required: ["approvalReference"],
+                  not: { required: ["note"] },
+                },
+                {
+                  required: ["note"],
+                  not: { required: ["approvalReference"] },
+                },
+              ],
+            },
+          ],
+          additionalProperties: false,
+        },
         {
           type: "object",
           properties: {
@@ -470,6 +517,22 @@ function validateToolArguments(name, args) {
       throw new Error(`${name} requires ${required}`);
     }
   }
+  for (const constraint of schema.allOf || []) {
+    if (Array.isArray(constraint.oneOf)) {
+      const matches = constraint.oneOf.filter((branch) => {
+        const hasRequired = (branch.required || []).every((key) => key in args);
+        const violatesNot = branch.not?.required
+          ? branch.not.required.every((key) => key in args)
+          : false;
+        return hasRequired && !violatesNot;
+      });
+      if (matches.length !== 1) {
+        throw new Error(
+          `${name} arguments do not match exactly one allowed shape`
+        );
+      }
+    }
+  }
   for (const [key, value] of Object.entries(args)) {
     const property = properties[key];
     if (property.const !== undefined && value !== property.const) {
@@ -483,12 +546,29 @@ function validateToolArguments(name, args) {
         ? Array.isArray(value)
         : property.type === "object"
           ? isPlainObject(value)
-          : typeof value === property.type;
+          : property.type === "integer"
+            ? Number.isSafeInteger(value)
+            : typeof value === property.type;
     if (!validType) {
       throw new Error(`${name}.${key} must be ${property.type}`);
     }
     if (property.enum && !property.enum.includes(value)) {
       throw new Error(`${name}.${key} is not an allowed value`);
+    }
+    if (
+      typeof value === "string" &&
+      ((property.minLength !== undefined &&
+        value.length < property.minLength) ||
+        (property.maxLength !== undefined && value.length > property.maxLength))
+    ) {
+      throw new Error(`${name}.${key} has an invalid length`);
+    }
+    if (
+      typeof value === "number" &&
+      property.minimum !== undefined &&
+      value < property.minimum
+    ) {
+      throw new Error(`${name}.${key} is below the minimum`);
     }
     if (property.pattern && !new RegExp(property.pattern).test(value)) {
       throw new Error(`${name}.${key} has an invalid format`);
@@ -883,6 +963,52 @@ function requireOnlyRegistryFields(args, fields) {
 }
 
 function registryCommand(args) {
+  if (args.action === "activity_decide") {
+    const expectedFields = new Set([
+      "action",
+      "locator",
+      "decision",
+      "expectedRevision",
+      "actor",
+      "approvalReference",
+      "note",
+      "redirectTarget",
+      "approve",
+    ]);
+    const unexpected = Object.keys(args).filter(
+      (key) => !expectedFields.has(key)
+    );
+    if (unexpected.length > 0) {
+      throw new Error(
+        `activity_decide received unsupported fields: ${unexpected.join(", ")}`
+      );
+    }
+    if (args.approve !== true) {
+      throw new Error("activity_decide requires approve=true");
+    }
+    if (!Number.isSafeInteger(args.expectedRevision)) {
+      throw new Error(
+        "activity_decide requires expectedRevision as an integer"
+      );
+    }
+    return [
+      "ai",
+      "loop",
+      "decide",
+      requireString("locator", args.locator),
+      "--decision",
+      requireString("decision", args.decision),
+      "--expected-revision",
+      String(args.expectedRevision),
+      "--actor",
+      requireString("actor", args.actor),
+      ...stringFlag("--approval-ref", args.approvalReference),
+      ...stringFlag("--note", args.note),
+      ...stringFlag("--redirect-target", args.redirectTarget),
+      "--approve",
+      "--json",
+    ];
+  }
   if (args.action === "activity_resolve") {
     const unexpected = Object.keys(args).filter(
       (key) => key !== "action" && key !== "locator"
@@ -1208,6 +1334,7 @@ function operationMetadata(name, args, command) {
         ? `evolve_${args.action || "list"}`
         : args.action || name;
   const reviewActions = new Set([
+    "activity_decide",
     "writeback_add",
     "writeback_link",
     "writeback_disposition",
@@ -1241,6 +1368,7 @@ function operationMetadata(name, args, command) {
       args.item ||
       args.source ||
       args.tool ||
+      args.locator ||
       null,
     preview,
   };
@@ -1307,6 +1435,29 @@ async function runFclt(args, cwd, operation) {
           error: "missing_runtime_capability",
           message:
             "The selected fclt runtime does not advertise audit-read-only-v1; typed audit fails closed.",
+          runtime: discovery,
+        },
+        null,
+        2
+      ),
+    };
+  }
+
+  if (
+    operation.action === "activity_decide" &&
+    !discovery.selected.capabilities?.includes(
+      ACTIVITY_ACTION_DECIDE_CAPABILITY
+    )
+  ) {
+    return {
+      code: 1,
+      text: JSON.stringify(
+        {
+          schemaVersion: 1,
+          operation,
+          error: "missing_runtime_capability",
+          message:
+            "The selected fclt runtime does not advertise activity-action-decide-v1; typed activity decisions fail closed.",
           runtime: discovery,
         },
         null,

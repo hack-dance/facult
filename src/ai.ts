@@ -2810,7 +2810,7 @@ Usage:
   fclt ai writeback <add|list|show|link|disposition|dismiss|promote> [args...]
   fclt ai evolve <assess|propose|list|show|draft|review|accept|reject|supersede|apply|verify> [args...]
   fclt ai review <init|status|reconcile> [args...]
-  fclt ai loop <enable|disable|status|report|activity|history|resolve|run> [args...]
+  fclt ai loop <enable|disable|status|report|activity|history|resolve|decide|run> [args...]
 `;
 }
 
@@ -2824,6 +2824,7 @@ Usage:
   fclt ai loop report [--json]
   fclt ai loop activity [--all|--global|--project] [--json]
   fclt ai loop resolve <activity-action-locator> [--json]
+  fclt ai loop decide <activity-action-locator> --decision <accept|redirect|reject|defer> --expected-revision <n> --actor <id> (--approval-ref <ref>|--note <text>) [--redirect-target <target>] --approve [--json]
   fclt ai loop history [--all|--global|--project] [--since <date>] [--until <date>] [--item <id>] [--scope-id <opaque-id>] [--event <type>] [--limit <1-200>] [--cursor <cursor>] [--json]
   fclt ai loop run [--since <date>] [--until <date>] [--source <configured-id>] [--dry-run] [--scheduled] [--json]
 
@@ -2984,6 +2985,100 @@ async function loopCommand(argv: string[]) {
       commandArgs.includes("--json")
         ? JSON.stringify(result, null, 2)
         : renderActivityActionResolution(result)
+    );
+    if (result.status === "rejected") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (sub === "decide") {
+    if (parsed.rootArg || parsed.scope !== "merged") {
+      throw new Error(
+        "Activity decision recording does not accept caller-supplied root or scope authority"
+      );
+    }
+    const valueFlags = new Set([
+      "--decision",
+      "--expected-revision",
+      "--actor",
+      "--approval-ref",
+      "--note",
+      "--redirect-target",
+    ]);
+    const values = new Map<string, string>();
+    const booleans = new Set<string>();
+    const positional: string[] = [];
+    for (let index = 0; index < commandArgs.length; index += 1) {
+      const argument = commandArgs[index];
+      if (!argument) {
+        continue;
+      }
+      if (argument === "--json" || argument === "--approve") {
+        if (booleans.has(argument)) {
+          throw new Error(`loop decide received duplicate ${argument}`);
+        }
+        booleans.add(argument);
+        continue;
+      }
+      const equalsIndex = argument.indexOf("=");
+      const flag = equalsIndex > 0 ? argument.slice(0, equalsIndex) : argument;
+      if (valueFlags.has(flag)) {
+        if (values.has(flag)) {
+          throw new Error(`loop decide received duplicate ${flag}`);
+        }
+        const value =
+          equalsIndex > 0
+            ? argument.slice(equalsIndex + 1)
+            : commandArgs[++index];
+        if (!value) {
+          throw new Error(`${flag} requires a value`);
+        }
+        values.set(flag, value);
+        continue;
+      }
+      if (argument.startsWith("-")) {
+        throw new Error(`loop decide received unsupported option ${argument}`);
+      }
+      positional.push(argument);
+    }
+    if (positional.length !== 1) {
+      throw new Error(
+        "loop decide accepts exactly one opaque locator and closed decision fields"
+      );
+    }
+    const decision = values.get("--decision");
+    const expectedRevision = Number(values.get("--expected-revision"));
+    const actor = values.get("--actor");
+    if (
+      !(
+        decision &&
+        ["accept", "redirect", "reject", "defer"].includes(decision) &&
+        Number.isSafeInteger(expectedRevision) &&
+        actor
+      )
+    ) {
+      throw new Error(
+        "loop decide requires --decision, --expected-revision, and --actor"
+      );
+    }
+    const { decideActivityAction, renderActivityDecisionResult } = await import(
+      "./activity-action"
+    );
+    const result = await decideActivityAction({
+      homeDir: process.env.HOME ?? "",
+      locator: positional[0]!,
+      decision: decision as "accept" | "redirect" | "reject" | "defer",
+      expectedRevision,
+      actor,
+      approvalReference: values.get("--approval-ref"),
+      note: values.get("--note"),
+      redirectTarget: values.get("--redirect-target"),
+      approve: booleans.has("--approve"),
+    });
+    console.log(
+      booleans.has("--json")
+        ? JSON.stringify(result, null, 2)
+        : renderActivityDecisionResult(result)
     );
     if (result.status === "rejected") {
       process.exitCode = 1;

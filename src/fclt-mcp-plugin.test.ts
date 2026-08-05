@@ -109,7 +109,7 @@ function compatibleStubScript(): string {
   return [
     `#!${process.execPath}`,
     "if (process.argv[2] === 'protocol') {",
-    "  console.log(JSON.stringify({schemaVersion:1,packageVersion:'9.9.9',protocol:{version:1,minimumPluginVersion:1,maximumPluginVersion:1},runtime:{platform:process.platform,architecture:process.arch,executable:process.argv[1]},capabilities:['activity-action-resolve-v1','audit-read-only-v1']}));",
+    "  console.log(JSON.stringify({schemaVersion:1,packageVersion:'9.9.9',protocol:{version:1,minimumPluginVersion:1,maximumPluginVersion:1},runtime:{platform:process.platform,architecture:process.arch,executable:process.argv[1]},capabilities:['activity-action-decide-v1','activity-action-resolve-v1','audit-read-only-v1']}));",
     "} else {",
     "  console.log(JSON.stringify({ cwd: process.cwd(), argv: process.argv.slice(2) }));",
     "}",
@@ -506,6 +506,56 @@ describe("bundled fclt MCP plugin", () => {
       child.stdin.write(
         frame({
           jsonrpc: "2.0",
+          id: 312,
+          method: "tools/call",
+          params: {
+            name: "fclt_registry",
+            arguments: {
+              action: "activity_decide",
+              locator: ACTION_LOCATOR,
+              decision: "accept",
+              expectedRevision: 3,
+              actor: "operator-1",
+              approvalReference: "linear-comment:approval-1",
+              approve: true,
+            },
+          },
+        })
+      );
+      const decideResponse = (await readFrame(child.stdout)) as {
+        result?: { content?: { text?: string }[]; isError?: boolean };
+      };
+      expect(toolPayload(decideResponse)).toMatchObject({
+        operation: {
+          action: "activity_decide",
+          preview: false,
+          risk: "review_producing",
+        },
+        result: {
+          stdout: {
+            argv: [
+              "ai",
+              "loop",
+              "decide",
+              ACTION_LOCATOR,
+              "--decision",
+              "accept",
+              "--expected-revision",
+              "3",
+              "--actor",
+              "operator-1",
+              "--approval-ref",
+              "linear-comment:approval-1",
+              "--approve",
+              "--json",
+            ],
+          },
+        },
+      });
+
+      child.stdin.write(
+        frame({
+          jsonrpc: "2.0",
           id: 32,
           method: "tools/call",
           params: {
@@ -829,6 +879,10 @@ describe("bundled fclt MCP plugin", () => {
                 additionalProperties?: boolean;
                 properties?: {
                   action?: { const?: string; enum?: string[] };
+                  actor?: { pattern?: string };
+                  approve?: { const?: boolean };
+                  decision?: { enum?: string[] };
+                  expectedRevision?: { minimum?: number; type?: string };
                   locator?: { pattern?: string };
                   sourceIds?: { items?: { pattern?: string } };
                 };
@@ -839,6 +893,9 @@ describe("bundled fclt MCP plugin", () => {
         | undefined;
       const resolverSchema = registry?.inputSchema?.oneOf?.find(
         (branch) => branch.properties?.action?.const === "activity_resolve"
+      );
+      const decisionSchema = registry?.inputSchema?.oneOf?.find(
+        (branch) => branch.properties?.action?.const === "activity_decide"
       );
       const registrySchema = registry?.inputSchema?.oneOf?.find((branch) =>
         branch.properties?.action?.enum?.includes("reconcile")
@@ -855,6 +912,29 @@ describe("bundled fclt MCP plugin", () => {
       expect(Object.keys(resolverSchema?.properties ?? {}).sort()).toEqual([
         "action",
         "locator",
+      ]);
+      expect(decisionSchema).toMatchObject({
+        additionalProperties: false,
+        required: [
+          "action",
+          "locator",
+          "decision",
+          "expectedRevision",
+          "actor",
+          "approve",
+        ],
+        properties: {
+          action: { const: "activity_decide" },
+          approve: { const: true },
+          expectedRevision: { type: "integer", minimum: 1 },
+        },
+      });
+      expect(decisionSchema?.properties?.actor?.pattern).toBeDefined();
+      expect(decisionSchema?.properties?.decision?.enum).toEqual([
+        "accept",
+        "redirect",
+        "reject",
+        "defer",
       ]);
       expect(
         registrySchema?.properties?.sourceIds?.items?.pattern
@@ -1026,6 +1106,53 @@ describe("bundled fclt MCP plugin", () => {
             arguments: {
               action: "activity_resolve",
               locator: ACTION_LOCATOR,
+            },
+          },
+        })
+      );
+      const response = (await readFrame(child.stdout)) as {
+        result?: { content?: { text?: string }[]; isError?: boolean };
+      };
+      expect(response.result?.isError).toBe(true);
+      const payload = toolPayload(response) as unknown as { error: string };
+      expect(payload.error).toBe("missing_runtime_capability");
+      expect(await Bun.file(invoked).exists()).toBe(false);
+    } finally {
+      child.kill();
+    }
+  });
+
+  it("fails typed activity decisions closed for runtimes without the decision capability", async () => {
+    const base = await mkdtemp(join(tmpdir(), "facult-mcp-legacy-decision-"));
+    const stub = join(base, "fclt-legacy.cjs");
+    const invoked = join(base, "invoked.txt");
+    await Bun.write(stub, legacyProtocolStubScript("2.29.2"));
+    await chmod(stub, 0o755);
+    const child = spawnConfiguredMcp({
+      env: {
+        FCLT_BIN: stub,
+        FCLT_LEGACY_INVOKED: invoked,
+        HOME: base,
+        PWD: base,
+      },
+      pluginRoot: facultBuiltinCodexPluginRoot(),
+    });
+    try {
+      child.stdin.write(
+        frame({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "fclt_registry",
+            arguments: {
+              action: "activity_decide",
+              locator: ACTION_LOCATOR,
+              decision: "accept",
+              expectedRevision: 3,
+              actor: "operator-1",
+              approvalReference: "linear-comment:approval-1",
+              approve: true,
             },
           },
         })
@@ -1333,6 +1460,31 @@ describe("bundled fclt MCP plugin", () => {
       expect(missingLocator.error?.message).toContain(
         "fclt_registry requires locator"
       );
+
+      child.stdin.write(
+        frame({
+          jsonrpc: "2.0",
+          id: 42,
+          method: "tools/call",
+          params: {
+            name: "fclt_registry",
+            arguments: {
+              action: "activity_decide",
+              locator: ACTION_LOCATOR,
+              decision: "accept",
+              expectedRevision: 3,
+              actor: "operator-1",
+              approvalReference: "linear-comment:approval-1",
+              approve: true,
+              root: "/tmp/unsafe",
+            },
+          },
+        })
+      );
+      const unsafeDecision = (await readFrame(child.stdout)) as {
+        error?: { message?: string };
+      };
+      expect(unsafeDecision.error?.message).toMatch(CLOSED_FIELD_ERROR_RE);
     } finally {
       child.kill();
     }
@@ -1674,6 +1826,10 @@ describe("Codex plugin capability matrix", () => {
       (capability) =>
         capability.id === "evolution_loop.activity_action_resolution"
     );
+    const activityDecision = matrix.capabilities.find(
+      (capability) =>
+        capability.id === "evolution_loop.activity_decision_lifecycle"
+    );
 
     expect(new Set(ids).size).toBe(ids.length);
     expect(matrix.generatedFrom.packageVersion).toBe(packageJson.version);
@@ -1719,6 +1875,14 @@ describe("Codex plugin capability matrix", () => {
         disposition: "exposed",
         tool: "fclt_registry",
         action: "activity_resolve",
+      },
+    });
+    expect(activityDecision).toMatchObject({
+      risk: "review_producing",
+      mcp: {
+        disposition: "exposed",
+        tool: "fclt_registry",
+        action: "activity_decide",
       },
     });
   });

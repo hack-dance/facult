@@ -764,6 +764,18 @@ export function facultAiEvolutionLoopAuditPath(
   );
 }
 
+export function facultAiEvolutionLoopDecisionJournalPath(
+  home: string = defaultHomeDir(),
+  rootDir?: string
+): string {
+  return join(
+    facultAiRuntimeScopeDir(home, rootDir),
+    "evolution",
+    "loop",
+    "decisions.jsonl"
+  );
+}
+
 export function facultAiEvolutionLoopReportDir(
   home: string = defaultHomeDir(),
   rootDir?: string

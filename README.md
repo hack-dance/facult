@@ -209,6 +209,8 @@ fclt ai loop activity --project
 fclt ai loop activity --project --json
 fclt ai loop activity --all --json
 fclt ai loop resolve <activity-action-locator> --json
+fclt ai loop decide <activity-action-locator> --decision accept \
+  --expected-revision <n> --actor <id> --approval-ref <ref> --approve --json
 fclt ai loop history --project --since 2026-01-01T00:00:00Z --json
 ```
 
@@ -219,6 +221,10 @@ report so later writeback edits cannot rewrite history.
 Aggregate actionable items may carry an opaque locator. Resolution revalidates
 the exact current scope and lifecycle revision and returns a plain-language
 plan without guessing a root or performing a mutation.
+For signal-family items, `loop decide` records one explicitly approved,
+revision-bound `accept`, `redirect`, `reject`, or `defer` receipt. It writes
+only machine-local decision history; canonical capability, Git, trackers,
+proposals, tasks, and external systems remain unchanged.
 
 Use `loop history` for a bounded multi-run timeline. It returns append-only
 event lineage, opaque cross-scope identities, cursor pagination, and explicit

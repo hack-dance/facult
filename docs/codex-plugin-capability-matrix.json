@@ -772,9 +772,26 @@
       "risk": "read_only",
       "scope": "verified machine-local Global or project runtime identity selected only by the locator",
       "preview": "revalidates the latest activity run, queue revision, current resource lifecycle, project/runtime identity, and allowed action class before returning a plain-language plan",
-      "apply": "withheld; version 1 exposes no locator-bound mutation because existing lifecycle commands do not accept the expected locator binding revision",
+      "apply": "resolution remains read-only; signal-family decisions use the separate activity_decide contract with explicit approval and expected revision",
       "rollback": "not_applicable; resolution performs zero canonical, tool-home, project, workflow, or external mutation",
       "verification": "no-write snapshots, duplicate-id and duplicate-worktree isolation, cross-scope replay refusal, moved-root and missing-state refusal, stale lifecycle/run rejection, incompatible-version rejection, raw-field exclusion, and published typed-tool discovery"
+    },
+    {
+      "id": "evolution_loop.activity_decision_lifecycle",
+      "cli": "ai loop decide <activity-action-locator> --decision <accept|redirect|reject|defer> --expected-revision <n> --actor <id> (--approval-ref <ref>|--note <text>) --approve --json",
+      "cliAvailability": "available",
+      "mcp": {
+        "disposition": "exposed",
+        "tool": "fclt_registry",
+        "action": "activity_decide",
+        "reason": "the closed router accepts one issued locator, one decision, the exact expected queue revision, explicit approval, a bounded actor, and exactly one portable approval source"
+      },
+      "risk": "review_producing",
+      "scope": "verified machine-local Global or project runtime identity selected only by the locator",
+      "preview": "use activity_resolve and the current activity item before deciding; the decision command revalidates all bindings under the evolution-loop lock",
+      "apply": "atomically appends one machine-local signal decision receipt; canonical capability, Git, trackers, tasks, proposals, and external systems are unchanged",
+      "rollback": "append-only history is retained; a later decision requires a genuinely newer signal revision and cannot rewrite prior approval evidence",
+      "verification": "accept, redirect, reject, and defer receipts; stale and replay refusal; malformed history and unsafe input refusal; duplicate identity, moved-root, cross-scope, and non-signal refusal; bounded accepted work-unit output; no canonical or external mutation"
     },
     {
       "id": "autosync.mutation",

@@ -29,6 +29,7 @@ describe("CLI/plugin protocol report", () => {
     expect(report.runtime.architecture).toBe(process.arch);
     expect(report.runtime.executable).toBe(process.execPath);
     expect(report.capabilities).toContain("plugin-runtime-handshake-v1");
+    expect(report.capabilities).toContain("activity-action-decide-v1");
     expect(report.capabilities).toContain("activity-action-resolve-v1");
     expect(report.capabilities).toContain("audit-read-only-v1");
   });

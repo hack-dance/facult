@@ -233,11 +233,15 @@ describe("CLI output contracts", () => {
         version: number;
         contextRoot: string;
         canonical: { globalRoot: string };
+        runtime: { evolutionLoopDecisionJournalPath: string };
         review: { writebackDir: string; evolutionDir: string };
       };
       expect(parsed.version).toBe(1);
       expect(parsed.contextRoot).toBe(join(dir, ".ai"));
       expect(parsed.canonical.globalRoot).toBe(join(dir, ".ai"));
+      expect(parsed.runtime.evolutionLoopDecisionJournalPath).toContain(
+        join("evolution", "loop", "decisions.jsonl")
+      );
       expect(parsed.review.writebackDir).toBe(
         join(dir, ".ai", "writebacks", "global")
       );

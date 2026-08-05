@@ -1665,6 +1665,20 @@ async function withLoopLock<T>(args: {
   }
 }
 
+export async function withEvolutionLoopMutationLock<T>(args: {
+  homeDir: string;
+  rootDir: string;
+  now?: Date;
+  fn: () => Promise<T>;
+}): Promise<T> {
+  return await withLoopLock({
+    path: facultAiEvolutionLoopLockPath(args.homeDir, args.rootDir),
+    leaseMinutes: DEFAULT_LEASE_MINUTES,
+    now: args.now ?? new Date(),
+    fn: args.fn,
+  });
+}
+
 async function evolutionLoopStatusScoped(args: {
   homeDir: string;
   rootDir: string;
