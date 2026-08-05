@@ -35,7 +35,8 @@ The plugin exposes:
 - `fclt_sync`: managed-state inspection and dry-run sync preview
 - `fclt_registry`: source search/verification, strict-trust install/update preview,
   bounded reconciliation status/review through a closed scope/window/source-id schema,
-  and read-only resolution of one opaque activity action locator
+  read-only resolution of one opaque activity action locator, and atomic
+  recording of one revision-bound signal-family decision
 - `fclt_audit`: structured, redacted, non-interactive security audit with zero report or index writes
 - `fclt_automation`: read-only autosync status plus scheduled evolution-loop status and preview
 - `fclt_status`
@@ -52,6 +53,13 @@ not expose arbitrary argv or shell passthrough. Canonical apply, live adoption,
 trust-policy mutation, destructive migration, and background-service mutation
 remain deliberately withheld until their CLI APIs provide transaction-safe
 preview, precondition, verification, and rollback contracts.
+
+`fclt_registry` action `activity_decide` is a narrow review-producing
+exception to the otherwise read-only registry surface. It requires one issued
+locator, `accept|redirect|reject|defer`, the exact expected queue revision, a
+bounded actor, exactly one approval reference or note, and `approve: true`.
+It records only a machine-local receipt. It cannot select a root, mutate
+canonical capability or external systems, apply proposals, or spawn tasks.
 
 The evolution-loop actions exposed through `fclt_automation` are
 `loop_status`, `loop_activity`, and `loop_preview`. `loop_activity` defaults to

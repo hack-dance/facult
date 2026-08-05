@@ -18,7 +18,7 @@ Start with [Writeback and evolution](./writeback-evolution.md) for the product's
 - [Built-in pack](./built-in-pack.md): the packaged operating-model layer for writeback and evolution.
 - [Built-in pack upgrades](./pack-upgrades.md): non-destructive refresh behavior for existing `.ai` roots.
 - [Codex plugin](./codex-plugin.md): installable Codex skills and MCP tools for fclt workflows.
-- [Activity action locators](./activity-action-locators.md): resolve one aggregate activity item to a verified current target without guessing roots or performing mutation.
+- [Activity action locators](./activity-action-locators.md): resolve one aggregate activity item without guessing roots, then atomically record an explicitly approved signal-family decision without canonical or external mutation.
 - [Managed mode](./managed-mode.md): when to let `fclt` write tool files, and how adoption works.
 - [Security and trust](./security-trust.md): source trust, audit, secrets, and commit hygiene.
 - [Automations](./automations.md): recurring Codex loops for learning review, evolution review, and tool-call audit.

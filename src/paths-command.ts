@@ -11,6 +11,7 @@ import {
   facultAiDraftDir,
   facultAiEvolutionLoopAuditPath,
   facultAiEvolutionLoopConfigPath,
+  facultAiEvolutionLoopDecisionJournalPath,
   facultAiEvolutionLoopReportDir,
   facultAiEvolutionLoopStatePath,
   facultAiEvolutionReviewDir,
@@ -72,6 +73,7 @@ export interface FacultPaths {
     draftDir: string;
     reconciliationStatePath: string;
     evolutionLoopConfigPath: string;
+    evolutionLoopDecisionJournalPath: string;
     evolutionLoopStatePath: string;
     evolutionLoopAuditPath: string;
     evolutionLoopReportDir: string;
@@ -181,6 +183,8 @@ async function buildPathsInScope(opts?: PathsOptions): Promise<FacultPaths> {
         homeDir,
         contextRoot
       ),
+      evolutionLoopDecisionJournalPath:
+        facultAiEvolutionLoopDecisionJournalPath(homeDir, contextRoot),
       evolutionLoopStatePath: facultAiEvolutionLoopStatePath(
         homeDir,
         contextRoot
@@ -255,6 +259,10 @@ function printPaths(paths: FacultPaths) {
             ["draft dir", paths.runtime.draftDir],
             ["reconciliation state", paths.runtime.reconciliationStatePath],
             ["evolution loop config", paths.runtime.evolutionLoopConfigPath],
+            [
+              "evolution decision journal",
+              paths.runtime.evolutionLoopDecisionJournalPath,
+            ],
             ["evolution loop state", paths.runtime.evolutionLoopStatePath],
             ["evolution loop audit", paths.runtime.evolutionLoopAuditPath],
             ["evolution loop reports", paths.runtime.evolutionLoopReportDir],

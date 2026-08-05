@@ -52,6 +52,11 @@ fclt ai evolve apply EV-00001
 fclt ai writeback link WB-00001 --issue TEAM-123
 fclt ai writeback disposition WB-00001 --type task --target TEAM-123
 fclt ai evolve verify EV-00001 --effectiveness improved --evidence test:post-apply
+fclt ai loop activity --json
+fclt ai loop resolve <activity-action-locator> --json
+fclt ai loop decide <activity-action-locator> --decision accept \
+  --expected-revision <queue-revision> --actor <actor-id> \
+  --approval-ref <source-approval-ref> --approve --json
 ```
 
 For an explicitly enabled scheduled loop, use:
@@ -68,6 +73,14 @@ as a noise-control view. Scheduler registration alone is not proof of a run;
 check observed execution health. The loop may prepare writebacks and proposals,
 but canonical apply remains plan-only and external task mutation remains a
 separate approved integration.
+
+For a signal-family activity item, resolve its opaque locator before recording
+an operator decision. Record `accept`, `redirect`, `reject`, or `defer` only
+with explicit source approval and the exact current queue revision. The receipt
+is durable handoff evidence, not implementation authority: accepted work still
+belongs in the external task/orchestration system, and fclt must not edit Git,
+trackers, canonical capability, or spawn work on the receipt's behalf. Refresh
+activity after any stale, replayed, moved-root, or duplicate-identity refusal.
 
 The writeback queue alone cannot prove an empty window. Run configured source
 reconciliation first and preserve its coverage, exclusions, correlations,

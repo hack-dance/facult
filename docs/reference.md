@@ -164,6 +164,7 @@ fclt ai loop disable [--dry-run] [--json]
 fclt ai loop status [--json]
 fclt ai loop activity [--all|--global|--project] [--json]
 fclt ai loop resolve <activity-action-locator> [--json]
+fclt ai loop decide <activity-action-locator> --decision <accept|redirect|reject|defer> --expected-revision <n> --actor <id> (--approval-ref <ref>|--note <text>) [--redirect-target <target>] --approve [--json]
 fclt ai loop history [--all|--global|--project] [--since <date>] [--until <date>] [--item <id>] [--scope-id <opaque-id>] [--event <type>] [--limit <1-200>] [--cursor <cursor>] [--json]
 fclt ai loop run [--since <date>] [--until <date>] [--source <id>] [--dry-run] [--scheduled] [--json]
 ```
@@ -204,6 +205,15 @@ resource lifecycle, allowed action class, or project/runtime identity changed.
 Older or non-actionable items without a locator remain handoff-only. See
 [Activity action locators](./activity-action-locators.md) for versioning and
 error semantics.
+
+For a current signal-family item, `loop decide` atomically records an explicit
+`accept`, `redirect`, `reject`, or `defer` receipt in machine-local history. It
+accepts no root or scope flag and requires the exact expected queue revision,
+explicit approval, a bounded actor, and exactly one approval reference or
+note. The command revalidates the locator under the loop lock, refuses stale or
+replayed bindings, and performs no canonical, Git, tracker, proposal-apply, or
+task-spawn mutation. Accepted JSON preserves bounded work-unit context for a
+separate orchestrator.
 
 `loop history` is the bounded version 1 multi-run timeline and lineage
 contract. It stores immutable per-run event segments in machine-local runtime

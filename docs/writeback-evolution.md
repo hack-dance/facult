@@ -264,6 +264,13 @@ Actionable items may include an opaque `actionLocator`. Resolve it with
 `fclt ai loop resolve <locator> --json` to obtain a read-only plan for the
 verified current scope and resource. Missing locators remain handoff-only;
 consumers must never infer roots from scope labels or internal ids.
+After resolving a current signal family, record an explicitly approved
+decision with `fclt ai loop decide <locator> --decision
+<accept|redirect|reject|defer> --expected-revision <n> --actor <id>
+(--approval-ref <ref>|--note <text>) --approve --json`. This appends one
+revisioned machine-local receipt and does not implement the decision. Accepted
+output carries bounded target, evidence, linked-work, expected-outcome,
+verification, and next-action fields for an external work-unit orchestrator.
 Each item also identifies its global or project context, typed capability
 targets such as an instruction, skill, prompt, or automation, the reason for
 the decision, and bounded HTTP(S) evidence links when the source supplied one.
@@ -288,6 +295,13 @@ older run. Unchanged queue items are suppressed from change counts, while stale
 or unavailable sources remain visible. A complete empty run means configured
 coverage was checked; degraded or failed empty runs never claim that nothing is
 pending.
+
+Coverage completeness and source cursor freshness remain independent. A
+complete review can still report one or more stale cursors, and each stale
+cursor remains visible as its own coverage activity item. Current-source
+terminal work or exact default-branch containment resolves a previously open
+family; an explicit hold/defer remains unresolved and is never materialized as
+implementation.
 
 ## Evolution
 

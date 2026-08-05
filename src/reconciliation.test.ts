@@ -1555,6 +1555,95 @@ describe("source reconciliation", () => {
     expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
   });
 
+  it("reconciles the approved landed families while preserving the explicit hold", async () => {
+    const fixture = await makeFixture();
+    const exportPath = join(fixture.projectRoot, "approved-statuses.json");
+    const acceptedFamilyIds = [
+      "SF-16812faa55aab6e1",
+      "SF-9674c0d7f55bf507",
+      "SF-195578a83ef94eaf",
+      "SF-73c1628e618c15ed",
+    ];
+    const heldFamilyId = "SF-6dcf56dd1c6dd06e";
+    const allFamilyIds = [...acceptedFamilyIds, heldFamilyId];
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "approved-statuses",
+            type: "evidence-export",
+            path: "approved-statuses.json",
+          },
+        ],
+      })
+    );
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport(
+          allFamilyIds.map((familyId, index) => ({
+            id: `status-${index + 1}`,
+            kind: "status-change",
+            observedAt: "2026-07-05T00:00:00.000Z",
+            refs: [`WORK-${index + 1}`],
+            status: familyId === heldFamilyId ? "hold" : "done",
+            terminal: familyId !== heldFamilyId,
+          }))
+        )
+      )
+    );
+    await Bun.write(
+      facultAiReconciliationStatePath(fixture.homeDir, fixture.rootDir),
+      `${JSON.stringify(
+        {
+          version: 1,
+          sources: {},
+          evidence: {},
+          decisions: {},
+          families: Object.fromEntries(
+            allFamilyIds.map((familyId, index) => [
+              familyId,
+              {
+                firstSeenAt: "2026-07-03T00:00:00.000Z",
+                lastSeenAt: "2026-07-04T00:00:00.000Z",
+                subjectKeys: [`issue:WORK-${index + 1}`],
+                evidenceKeys: [`evidence:${familyId}`],
+                reviewIds: ["RR-approved"],
+                signalIds: [`RS-${index + 1}`],
+              },
+            ])
+          ),
+          resolutionProofs: {},
+          linkedWorkStatuses: {},
+          reviews: {},
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+
+    expect(review.resolvedSignalFamilies).toEqual(acceptedFamilyIds.sort());
+    expect(review.resolvedSignalFamilies).not.toContain(heldFamilyId);
+    expect(review.coverageComplete).toBe(true);
+    expect(
+      review.signals.find((signal) => signal.issueRefs.includes("WORK-5"))
+    ).toMatchObject({ unresolved: true });
+    expect(
+      review.signals
+        .filter((signal) => signal.issueRefs[0] !== "WORK-5")
+        .every((signal) => signal.unresolved === false)
+    ).toBe(true);
+  });
+
   it("orders linked-work observations by instant across timezone offsets", async () => {
     const fixture = await makeFixture();
     const exportPath = join(fixture.projectRoot, "issues.json");
@@ -2245,6 +2334,89 @@ describe("source reconciliation", () => {
       alertSourceIds: ["git"],
     });
     expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  });
+
+  it("reports six stale Git cursors independently from aggregate coverage", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "review.md"),
+      "Approved cursor repair baseline.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: cursor baseline"],
+      date: "2026-07-23T18:12:45-04:00",
+    });
+    const sourceIds = Array.from(
+      { length: 6 },
+      (_, index) => `git-cursor-${index + 1}`
+    );
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: sourceIds.map((id) => ({
+          id,
+          type: "git",
+          paths: ["docs"],
+          defaultBranch: "main",
+          freshnessThresholdHours: 168,
+        })),
+      })
+    );
+    await reconcileSources({
+      ...fixture,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-23T18:15:00-04:00",
+      incremental: true,
+    });
+
+    await Bun.write(join(fixture.projectRoot, "outside.txt"), "new activity\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "outside.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: newer activity"],
+      date: "2026-07-23T18:28:50-04:00",
+    });
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-27T23:04:10Z",
+      incremental: true,
+      persist: false,
+    });
+
+    expect(review.coverageComplete).toBe(true);
+    expect(review.degraded).toBe(false);
+    expect(review.coverage).toHaveLength(6);
+    expect(
+      review.coverage.every(
+        (entry) => entry.state === "checked" || entry.state === "changed"
+      )
+    ).toBe(true);
+    expect(
+      review.coverage.every((entry) => entry.freshness.state === "stale")
+    ).toBe(true);
+    expect(review.freshness).toMatchObject({
+      state: "stale",
+      staleSourceIds: sourceIds,
+      alertSourceIds: sourceIds,
+    });
   });
 
   it("bounds repository freshness activity to the review window", async () => {
