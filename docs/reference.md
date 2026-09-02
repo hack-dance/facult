@@ -78,6 +78,196 @@ Use these to create or normalize canonical capability in `~/.ai` or
 `project init`; use `operating-model --project` only for an explicit full-pack
 install.
 
+## Hermetic project-tree planning
+
+```bash
+fclt project render-plan --root <repo>/.ai --project-root <repo> \
+  [--manifest project-render.toml] --json
+```
+
+`project render-plan` reads `<repo>/.ai/project-render.toml` and only the canonical
+inputs declared by that manifest. It emits a deterministic, content-addressed
+desired-tree plan containing logical paths, normalized desired bytes, modes,
+and hashes. It does not inspect repository targets, machine-local state,
+`$HOME`, clocks, or the network, and it has no write path.
+
+The version 1 manifest has an exact TOML schema:
+
+```toml
+schema_version = 1
+exclusive_roots = [".agents/skills"]
+
+[[targets]]
+id = "codex-root-agents"
+tool = "codex"
+destination = "AGENTS.md"
+mode = "0644"
+producer = "codex-root-agents-md"
+producer_version = 1
+sources = ["fragments/header.md", "instructions/WORK.md"]
+
+[[targets]]
+id = "codex-review-skill"
+tool = "codex"
+destination = ".agents/skills/review/SKILL.md"
+mode = "0644"
+producer = "codex-skill-md"
+producer_version = 1
+sources = ["skills/review/SKILL.md"]
+```
+
+Source paths are relative to the canonical root. Destinations are relative to
+the project root. `copy-text` requires one source; `concat-text` preserves the
+declared source order and joins normalized UTF-8 text with the declared
+separator. Unknown fields, links, unsafe paths, unsupported versions, duplicate
+IDs, overlapping exclusive roots, and portable destination collisions fail
+closed. Exclusive roots are the only directories where a future check may
+report undeclared files; an empty array claims no directory tree.
+
+Codex producer version 1 fixes each semantic surface to the current project
+destination:
+
+- `codex-root-agents-md` composes one or more canonical instruction inputs into
+  root `AGENTS.md` in declared order.
+- `codex-skill-md` validates a single `SKILL.md` with matching `name` and a
+  non-empty `description`, then writes `.agents/skills/<name>/SKILL.md`.
+  Declare referenced scripts, templates, and other skill resources as explicit
+  `copy-text` targets under the same exclusive skill root.
+- `codex-agent-toml` validates required `name`, `description`, and
+  `developer_instructions` fields and writes `.codex/agents/<name>.toml`.
+  With Codex multi-agent V2 clients that default to a full-history fork, callers
+  selecting an explicit custom role must use `fork_turns = "none"` or a positive
+  bounded history. The fork mode is an invocation concern and is not rendered
+  into the agent TOML.
+- `codex-config-toml` composes valid TOML fragments into the single
+  `.codex/config.toml` target. MCP `env_vars`, `bearer_token_env_var`, and
+  `env_http_headers` remain runtime references. Literal MCP `env` tables,
+  static HTTP headers, user-level provider settings, and plugin enablement are
+  rejected with typed diagnostics instead of being committed to the project.
+
+All Codex recipes require `tool = "codex"` and `producer_version = 1`. The
+compiler does not generate the legacy `.codex/mcp.json`, `.codex/skills`, or a
+project plugin-installation surface.
+
+Claude producer version 1 fixes each semantic surface to the current project
+destination:
+
+- `claude-root-claude-md` emits exactly `@AGENTS.md` with a trailing newline.
+  Its sole canonical input must contain only that import, and the manifest must
+  also declare root `AGENTS.md`. This keeps the canonical project instructions
+  owned once while making Claude's root entry point explicit.
+- `claude-skill-md` validates a single `SKILL.md` with matching `name`, a
+  non-empty `description`, and a body, then writes
+  `.claude/skills/<name>/SKILL.md`. Declare referenced resources separately.
+- `claude-agent-md` validates required YAML `name` and `description` fields, a
+  non-empty body, and the supported project-agent frontmatter subset before
+  writing `.claude/agents/<name>.md`. Agent `mcpServers` may reference declared
+  server names; inline server definitions are rejected.
+- `claude-mcp-json` composes disjoint `mcpServers` fragments into root
+  `.mcp.json`. Stdio, HTTP, SSE, and WebSocket transports are validated. MCP
+  environment and header values must be runtime references such as `${NAME}`
+  or `Bearer ${NAME}`; literal values fail closed.
+- `claude-settings-json` composes disjoint fragments into
+  `.claude/settings.json`. Version 1 supports the instruction-agent selector,
+  MCP allowlists, plugin enablement, GitHub marketplace declarations,
+  co-author attribution, and string-array permission rules. Secret-bearing
+  `env`, hooks, unknown settings, inline marketplace URLs, and overlapping
+  fragment ownership are rejected rather than passed through.
+
+All Claude recipes require `tool = "claude"` and `producer_version = 1`.
+Rendering settings or plugin declarations does not install plugins, contact a
+marketplace, approve an MCP server, or bypass the client's trust boundary.
+
+### Compiler and input-pack lock
+
+Create the committed lock with exact cached compiler artifacts:
+
+```bash
+fclt project lock --root <repo>/.ai --project-root <repo> \
+  --pack-version <pack-version> \
+  --pack-schema-version <schema-version> \
+  --compiler-compatibility ">=2.28.0 <3.0.0" \
+  --compiler-artifact darwin-arm64=/cache/fclt-darwin-arm64 \
+  --compiler-artifact linux-x64=/cache/fclt-linux-x64 \
+  --json
+```
+
+The command writes `.ai/project-render.lock.json` atomically. The stable lock
+contains no timestamp or absolute path. It records the compiler package version,
+one SHA-256 digest per declared platform artifact, render-manifest schema,
+combined canonical input and semantic manifest digest, pack schema/version, and
+compiler compatibility range. Supply every supported platform artifact when
+creating or updating the lock; omitted platforms cannot render it.
+
+When the default lock exists, `project render-plan` and `project render` verify it
+before returning a plan or touching a target. `--require-lock` makes absence an
+error, and `--lock <file-name>` selects a non-default lock in the canonical
+root. Nested lock paths are rejected so lock creation cannot traverse a
+symlinked parent. Verification hashes the running compiled executable itself. A
+source checkout, a package version string, or discovery through `PATH` cannot
+substitute for the locked artifact identity. Input or manifest drift,
+compiler-version skew, incompatible ranges, and artifact mismatch fail before
+render.
+
+For offline use, cache the release binary and its `SHA256SUMS`, keep the
+repository's canonical `.ai` inputs and lock together, and invoke the cached
+binary by exact path. No network, home-directory capability, clock, or live
+target content participates in lock verification or desired-tree compilation.
+Rolling back means restoring the prior canonical inputs and their prior lock as
+one revision.
+
+Planning, checking, and mutation are separate boundaries. Compare declared
+files and exclusive roots without mutation using:
+
+```bash
+fclt project render --root <repo>/.ai --project-root <repo> --check --json
+```
+
+The check exits zero for an exact tree, one for drift, and two for command or
+validation errors. Its bounded result separates missing, changed,
+type-conflict, and unexpected paths. Only declared target paths and
+`exclusive_roots` are read.
+
+Apply a checked manifest with receipt-bound ownership:
+
+```bash
+fclt project render --root <repo>/.ai --project-root <repo> --json
+```
+
+Apply stores its lock, ownership receipt, rollback snapshots, and any active
+transaction under fclt's machine-local project state. It never stores runtime
+state in canonical `.ai` or rendered targets. The first apply refuses existing
+destinations and unexpected files in exclusive roots rather than adopting
+them. Later applies overwrite or remove only files that still match the prior
+ownership receipt. Manifest, input, target, and plan identities are rechecked
+at each target commit. Atomic replacement, a durable pre-mutation transaction,
+and automatic rollback recovery make a repeated apply idempotent after an
+interruption.
+
+Restore the previous receipt-bound target state with:
+
+```bash
+fclt project render --root <repo>/.ai --project-root <repo> --rollback --json
+```
+
+Rollback also uses the transaction/recovery path and refuses externally edited
+owned targets. Receipts are machine-local: copying a repository to a new
+machine does not transfer write authority. Use `--check` there, or perform a
+fresh apply only against empty declared destinations.
+
+## Release integrity and provenance
+
+GitHub releases publish platform binaries, compatibility aliases, install
+scripts, `SHA256SUMS`, and an SPDX JSON SBOM. The shell installer and npm
+launcher download `SHA256SUMS` and verify the selected binary before making it
+executable or moving it into the runtime cache. Homebrew formulas are generated
+from those same release checksums.
+
+The release workflow creates build-provenance attestations for the published
+assets on a GitHub-hosted OIDC runner. npm publishing separately uses registry
+provenance. A cached release binary plus its checksum, the committed canonical
+inputs, and `project-render.lock.json` form the supported offline render bundle.
+
 ## Per-asset deployment planning
 
 ```bash

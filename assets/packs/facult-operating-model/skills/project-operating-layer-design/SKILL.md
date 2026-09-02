@@ -1,6 +1,6 @@
 ---
+name: project-operating-layer-design
 description: Design or improve a repo-local .ai operating layer.
-tags: [facult, project, design]
 ---
 
 # project-operating-layer-design

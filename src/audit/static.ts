@@ -29,6 +29,7 @@ import { parseJsonLenient } from "../util/json";
 import {
   type AuditEvaluation,
   auditedRootsFromScan,
+  auditSnapshotCanonicalPath,
   buildMcpRemediationBindings,
   parseReportRootFlag,
   persistAuditReport,
@@ -796,10 +797,14 @@ export async function evaluateStaticAudit(opts?: {
   await sourceTracker.capture(canonicalMcpRoot);
   await sourceTracker.capture(join(canonicalMcpRoot, "servers.local.json"));
   await sourceTracker.capture(join(canonicalMcpRoot, "mcp.local.json"));
-  const canonicalMcpExists = sourceTracker
-    .snapshot()
-    .evaluatedDirectories.some(
-      (identity) => identity.path === canonicalMcpRoot
+  const capturedCanonicalSnapshot = sourceTracker.snapshot();
+  const capturedCanonicalMcpRoot = auditSnapshotCanonicalPath(
+    capturedCanonicalSnapshot,
+    canonicalMcpRoot
+  );
+  const canonicalMcpExists =
+    capturedCanonicalSnapshot.evaluatedDirectories.some(
+      (identity) => identity.path === capturedCanonicalMcpRoot
     );
   const canonicalMcpExposure = canonicalMcpExists
     ? await sourceTracker.recordGitPathExposure(canonicalMcpRoot)

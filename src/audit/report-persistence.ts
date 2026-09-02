@@ -169,6 +169,23 @@ export function auditFindingIdentity(args: {
   );
 }
 
+export function auditSnapshotCanonicalPath(
+  snapshot: AuditSourceSnapshot,
+  pathValue: string
+): string {
+  const requestedPath = normalize(resolve(pathValue));
+  const present = snapshot.requestedPaths.find(
+    (entry) => entry.requestedPath === requestedPath
+  );
+  if (present) {
+    return present.canonicalPath;
+  }
+  const absent = snapshot.absentPaths.find(
+    (entry) => entry.requestedPath === requestedPath
+  );
+  return absent?.path ?? requestedPath;
+}
+
 const REMEDIATION_BINDING_KEYS = [
   "canonicalRootPath",
   "destinationPath",
@@ -302,6 +319,7 @@ function assertRemediationBindingsMatchReport(args: {
   bindings: readonly AuditMcpRemediationBinding[];
   mode: AuditReportMode;
   report: unknown;
+  sourceSnapshot: AuditSourceSnapshot;
 }): void {
   if (args.bindings.length === 0) {
     return;
@@ -345,7 +363,10 @@ function assertRemediationBindingsMatchReport(args: {
         expected.set(auditFindingIdentity({ finding, result }), {
           envKey: location.envKey,
           serverName: location.serverName,
-          sourcePath: result.path,
+          sourcePath: auditSnapshotCanonicalPath(
+            args.sourceSnapshot,
+            result.path
+          ),
         });
       }
     }
@@ -368,10 +389,20 @@ export function buildMcpRemediationBindings(args: {
   report: { results: AuditItemResult[] };
   sourceSnapshot: AuditSourceSnapshot;
 }): AuditMcpRemediationBinding[] {
-  const canonicalRootPath = normalize(args.canonicalRootPath);
+  const canonicalRootPath = auditSnapshotCanonicalPath(
+    args.sourceSnapshot,
+    args.canonicalRootPath
+  );
   const mcpRoot = join(canonicalRootPath, "mcp");
-  const canonicalDestination = join(mcpRoot, "servers.local.json");
-  const legacyDestination = join(mcpRoot, "mcp.local.json");
+  const requestedMcpRoot = join(normalize(args.canonicalRootPath), "mcp");
+  const canonicalDestination = auditSnapshotCanonicalPath(
+    args.sourceSnapshot,
+    join(requestedMcpRoot, "servers.local.json")
+  );
+  const legacyDestination = auditSnapshotCanonicalPath(
+    args.sourceSnapshot,
+    join(requestedMcpRoot, "mcp.local.json")
+  );
   const existingPaths = new Set(
     args.sourceSnapshot.evaluatedFiles.map((identity) => identity.path)
   );
@@ -398,14 +429,18 @@ export function buildMcpRemediationBindings(args: {
             serverName: result.item,
           })
         : null;
+      const sourcePath = auditSnapshotCanonicalPath(
+        args.sourceSnapshot,
+        result.path
+      );
       if (
         result.type !== "mcp" ||
         finding.ruleId !== "mcp-env-inline-secret" ||
         !location ||
         result.path !== location.configPath ||
-        dirname(result.path) !== mcpRoot ||
+        dirname(sourcePath) !== mcpRoot ||
         !["servers.json", "mcp.json"].includes(basename(result.path)) ||
-        !existingPaths.has(result.path) ||
+        !existingPaths.has(sourcePath) ||
         !isSingleSafeSegment(location.serverName) ||
         !isSingleSafeSegment(location.envKey)
       ) {
@@ -419,7 +454,7 @@ export function buildMcpRemediationBindings(args: {
           findingIdentity: auditFindingIdentity({ finding, result }),
           kind: "mcp-inline-secret" as const,
           serverName: location.serverName,
-          sourcePath: result.path,
+          sourcePath,
         },
       ];
     })
@@ -901,6 +936,7 @@ export async function persistAuditReport(args: {
     bindings: remediationBindings,
     mode: args.mode,
     report: args.report,
+    sourceSnapshot: canonicalSourceSnapshot,
   });
   const receipt: AuditReportReceipt = {
     schemaVersion: 6,
@@ -1080,6 +1116,7 @@ function assertEnvelope(
     bindings: envelope.receipt.remediationBindings,
     mode: envelope.receipt.mode,
     report: envelope.report,
+    sourceSnapshot: envelope.receipt.sourceSnapshot,
   });
 }
 

@@ -1,6 +1,6 @@
 import { closeSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, normalize, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { extractServersObject, isInlineMcpSecretValue } from "../mcp-config";
 import { facultRootDir } from "../paths";
 import { parseJsonLenient } from "../util/json";
@@ -8,6 +8,7 @@ import type { AgentAuditReport } from "./agent";
 import {
   type AuditMcpRemediationBinding,
   auditFindingIdentity,
+  auditSnapshotCanonicalPath,
   loadVerifiedAuditReportEnvelope,
   type VerifiedAuditReportEnvelope,
 } from "./report-persistence";
@@ -15,7 +16,10 @@ import {
   openBoundPrivateSubdirectory,
   replaceBoundPrivateFilePairAt,
 } from "./safe-openat";
-import { validateAuditSourceSnapshot } from "./source-provenance";
+import {
+  type AuditSourceSnapshot,
+  validateAuditSourceSnapshot,
+} from "./source-provenance";
 import type { AuditFinding, AuditItemResult, StaticAuditReport } from "./types";
 
 type AuditFixSource = "static" | "agent" | "combined";
@@ -38,6 +42,20 @@ interface AuditFixArgs {
 interface FindingSelection {
   result: AuditItemResult;
   finding: AuditFinding;
+}
+
+function requestedAuditPath(
+  snapshot: AuditSourceSnapshot,
+  canonicalPath: string
+): string {
+  return (
+    snapshot.requestedPaths.find(
+      (entry) => entry.canonicalPath === canonicalPath
+    )?.requestedPath ??
+    snapshot.absentPaths.find((entry) => entry.path === canonicalPath)
+      ?.requestedPath ??
+    canonicalPath
+  );
 }
 
 function normalizeRuleId(ruleId: string): string {
@@ -632,14 +650,17 @@ export async function runAuditFix(args: {
   });
   const firstBinding = bindings[0]!;
   assertOutsideGitWorktree(firstBinding.destinationPath);
-  const currentRoot = normalize(facultRootDir(args.homeDir ?? homedir()));
+  const snapshot = staticEnvelope.receipt.sourceSnapshot;
+  const currentRoot = auditSnapshotCanonicalPath(
+    snapshot,
+    facultRootDir(args.homeDir ?? homedir())
+  );
   if (currentRoot !== firstBinding.canonicalRootPath) {
     throw new Error(
       "Current audit fix scope does not match the report-authorized canonical root"
     );
   }
 
-  const snapshot = staticEnvelope.receipt.sourceSnapshot;
   const rootIdentity = snapshot.evaluatedDirectories.find(
     (identity) => identity.path === firstBinding.canonicalRootPath
   );
@@ -703,13 +724,13 @@ export async function runAuditFix(args: {
 
   return {
     fixed: bindings.length,
-    localPath: firstBinding.destinationPath,
+    localPath: requestedAuditPath(snapshot, firstBinding.destinationPath),
     matched: selections.length,
     riskyManagedOutputs: [],
     skipped: [],
     source,
     syncedTools: [],
-    trackedPath: firstBinding.sourcePath,
+    trackedPath: requestedAuditPath(snapshot, firstBinding.sourcePath),
   };
 }
 

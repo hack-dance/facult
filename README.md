@@ -608,9 +608,17 @@ fclt consolidate --auto keep-current --from <path>
 fclt index [--force]
 ```
 
-Legacy managed-mode inspection:
+Project planning and legacy managed-mode inspection:
 
 ```bash
+fclt project render-plan --root <repo>/.ai --project-root <repo> --json
+fclt project lock --root <repo>/.ai --project-root <repo> \
+  --pack-version <version> --pack-schema-version <number> \
+  --compiler-compatibility ">=2.28.0 <3.0.0" \
+  --compiler-artifact <platform>-<arch>=<absolute-binary-path> --json
+fclt project render --root <repo>/.ai --project-root <repo> --check --json
+fclt project render --root <repo>/.ai --project-root <repo> --json
+fclt project render --root <repo>/.ai --project-root <repo> --rollback --json
 fclt deploy plan --help
 fclt setup codex-plugin [--dry-run] [--json] [--no-codex-install]
 fclt manage <tool> --dry-run
@@ -618,6 +626,19 @@ fclt sync [tool] --dry-run
 fclt managed
 fclt unmanage <tool> --dry-run
 ```
+
+The hermetic project manifest supports versioned Codex recipes for root
+`AGENTS.md`, `.agents/skills`, `.codex/agents`, and `.codex/config.toml`, plus
+Claude recipes for an import-only root `CLAUDE.md`, `.claude/skills`,
+`.claude/agents`, `.mcp.json`, and `.claude/settings.json`. Runtime MCP
+credential references are allowed; embedded MCP environment values and
+unsupported client settings fail closed. See
+[the project planning reference](./docs/reference.md#hermetic-project-tree-planning).
+When `.ai/project-render.lock.json` is present, planning and rendering also
+verify the exact platform compiler artifact, manifest schema, canonical input
+and semantic manifest digest, pack version, and compiler compatibility range.
+Locked rendering requires a compiled artifact; source-checkout or `PATH`
+identity is insufficient.
 
 Writeback and evolution:
 
@@ -650,6 +671,7 @@ Start with:
 - [Work Units](./docs/work-units.md): general-purpose agent work framing
 - [Composable Capability](./docs/composable-capability.md): refs, snippets, instruction templates, and evolvable units
 - [Project `.ai`](./docs/project-ai.md): repo-owned capability and project sync policy
+- [Project rendering work units](./docs/project-rendering-work-units.md): hermetic compiler, check, apply, adapter, and lock delivery gates
 - [Built-in pack](./docs/built-in-pack.md): packaged work-unit, writeback, and evolution defaults
 - [Built-in pack upgrades](./docs/pack-upgrades.md): non-destructive refresh behavior for existing `.ai` roots
 - [Codex plugin](./docs/codex-plugin.md): installable Codex skills and MCP tools for fclt workflows

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_OWNER="hack-dance"
-REPO_NAME="facult"
+REPO_NAME="fclt"
 CLI_NAME="fclt"
 COMPATIBILITY_NAME="facult"
 
@@ -63,18 +63,23 @@ PRIMARY_ASSET_NAME="${CLI_NAME}-${VERSION}-${PLATFORM}-${ARCH}"
 PRIMARY_ASSET_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/${PRIMARY_ASSET_NAME}"
 COMPATIBILITY_ASSET_NAME="${COMPATIBILITY_NAME}-${VERSION}-${PLATFORM}-${ARCH}"
 COMPATIBILITY_ASSET_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/${COMPATIBILITY_ASSET_NAME}"
+CHECKSUMS_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}/SHA256SUMS"
 
 mkdir -p "$INSTALL_DIR"
 TMP_FILE="$(mktemp "${TMPDIR:-/tmp}/fclt.XXXXXX")"
-trap 'rm -f "$TMP_FILE"' EXIT
+CHECKSUM_FILE="$(mktemp "${TMPDIR:-/tmp}/fclt-checksums.XXXXXX")"
+trap 'rm -f "$TMP_FILE" "$CHECKSUM_FILE"' EXIT
 
 echo "Downloading ${PRIMARY_ASSET_NAME} from ${TAG}..."
 attempt=1
+SELECTED_ASSET_NAME=""
 while true; do
   if curl -fsSL "$PRIMARY_ASSET_URL" -o "$TMP_FILE"; then
+    SELECTED_ASSET_NAME="$PRIMARY_ASSET_NAME"
     break
   fi
   if curl -fsSL "$COMPATIBILITY_ASSET_URL" -o "$TMP_FILE"; then
+    SELECTED_ASSET_NAME="$COMPATIBILITY_ASSET_NAME"
     break
   fi
   if [[ "$attempt" -ge "$DOWNLOAD_RETRIES" ]]; then
@@ -84,6 +89,42 @@ while true; do
   sleep "$DOWNLOAD_RETRY_DELAY_SECONDS"
   attempt=$((attempt + 1))
 done
+
+echo "Downloading checksums from ${TAG}..."
+attempt=1
+while ! curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; do
+  if [[ "$attempt" -ge "$DOWNLOAD_RETRIES" ]]; then
+    echo "Failed to download ${CHECKSUMS_URL} after ${DOWNLOAD_RETRIES} attempts." >&2
+    exit 1
+  fi
+  sleep "$DOWNLOAD_RETRY_DELAY_SECONDS"
+  attempt=$((attempt + 1))
+done
+
+EXPECTED_SHA256="$(awk -v asset="$SELECTED_ASSET_NAME" '$2 == asset { print $1 }' "$CHECKSUM_FILE")"
+case "$EXPECTED_SHA256" in
+  ""|*[!0-9A-Fa-f]*)
+    echo "SHA256SUMS does not contain one valid digest for ${SELECTED_ASSET_NAME}." >&2
+    exit 1
+    ;;
+esac
+if [[ "${#EXPECTED_SHA256}" -ne 64 ]]; then
+  echo "SHA256SUMS contains an invalid digest for ${SELECTED_ASSET_NAME}." >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(sha256sum "$TMP_FILE" | awk '{ print $1 }')"
+else
+  ACTUAL_SHA256="$(shasum -a 256 "$TMP_FILE" | awk '{ print $1 }')"
+fi
+EXPECTED_SHA256="$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')"
+ACTUAL_SHA256="$(printf '%s' "$ACTUAL_SHA256" | tr '[:upper:]' '[:lower:]')"
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+  echo "Checksum verification failed for ${SELECTED_ASSET_NAME}." >&2
+  exit 1
+fi
+echo "Verified ${SELECTED_ASSET_NAME} (${ACTUAL_SHA256})."
+
 chmod +x "$TMP_FILE"
 mv "$TMP_FILE" "${INSTALL_DIR}/${CLI_NAME}"
 cp "${INSTALL_DIR}/${CLI_NAME}" "${INSTALL_DIR}/${COMPATIBILITY_NAME}"

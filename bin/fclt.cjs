@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const https = require("node:https");
@@ -18,6 +19,8 @@ const DOWNLOAD_RETRY_DELAY_MS = 5000;
 const ACTIVE_RUNTIME_WAIT_MS = 10_000;
 const ACTIVE_RUNTIME_WAIT_INTERVAL_MS = 100;
 const STALE_RUNTIME_TEMP_MS = 10 * 60 * 1000;
+const NEWLINE_RE = /\r?\n/;
+const SHA256_LINE_RE = /^([a-f0-9]{64})\s+(.+)$/i;
 
 function isHelpLikeArgs(args) {
   return (
@@ -114,13 +117,24 @@ async function main() {
       const tag = `v${version}`;
       const assetName = `${PACKAGE_NAME}-${version}-${resolved.platform}-${resolved.arch}${resolved.ext}`;
       const url = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/${assetName}`;
+      const checksumsUrl = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/SHA256SUMS`;
       const tmpPath = `${binaryPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const checksumsPath = `${tmpPath}.sha256sums`;
 
       try {
         await fsp.mkdir(installDir, { recursive: true });
         await downloadWithRetry(url, tmpPath, {
           attempts: DOWNLOAD_RETRIES,
           delayMs: DOWNLOAD_RETRY_DELAY_MS,
+        });
+        await downloadWithRetry(checksumsUrl, checksumsPath, {
+          attempts: DOWNLOAD_RETRIES,
+          delayMs: DOWNLOAD_RETRY_DELAY_MS,
+        });
+        await verifyDownloadedRuntime({
+          assetName,
+          checksumsPath,
+          runtimePath: tmpPath,
         });
         if (resolved.platform !== "windows") {
           await fsp.chmod(tmpPath, 0o755);
@@ -151,6 +165,8 @@ async function main() {
           ].join("\n")
         );
         process.exit(1);
+      } finally {
+        await safeUnlink(checksumsPath);
       }
     }
   }
@@ -357,6 +373,44 @@ async function downloadWithRetry(url, destinationPath, options) {
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+function expectedChecksum(checksumsText, assetName) {
+  const matches = [];
+  for (const rawLine of checksumsText.split(NEWLINE_RE)) {
+    const match = SHA256_LINE_RE.exec(rawLine.trim());
+    if (match && match[2] === assetName) {
+      matches.push(match[1].toLowerCase());
+    }
+  }
+  if (matches.length !== 1) {
+    throw new Error(
+      `SHA256SUMS must contain exactly one digest for ${assetName}`
+    );
+  }
+  return matches[0];
+}
+
+async function sha256File(filePath) {
+  const hasher = crypto.createHash("sha256");
+  const stream = fs.createReadStream(filePath);
+  for await (const chunk of stream) {
+    hasher.update(chunk);
+  }
+  return hasher.digest("hex");
+}
+
+async function verifyDownloadedRuntime({
+  assetName,
+  checksumsPath,
+  runtimePath,
+}) {
+  const checksumsText = await fsp.readFile(checksumsPath, "utf8");
+  const expected = expectedChecksum(checksumsText, assetName);
+  const actual = await sha256File(runtimePath);
+  if (actual !== expected) {
+    throw new Error(`Checksum verification failed for ${assetName}`);
+  }
+}
+
 async function fileExists(filePath) {
   try {
     await fsp.access(filePath, fs.constants.F_OK);
@@ -459,8 +513,13 @@ async function bestEffortWriteInstallState(state) {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  console.error(message);
-  process.exit(1);
-});
+module.exports = { expectedChecksum, sha256File, verifyDownloadedRuntime };
+
+if (require.main === module) {
+  main().catch((error) => {
+    const message =
+      error instanceof Error ? error.message : String(error ?? "");
+    console.error(message);
+    process.exit(1);
+  });
+}

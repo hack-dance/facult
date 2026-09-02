@@ -6243,6 +6243,9 @@ Usage:
   fclt project ignore --project-root PATH [--dry-run] [--json]
   fclt project inactive --project-root PATH [--dry-run] [--json]
   fclt project remove --project-root PATH [--dry-run] [--json]
+  fclt project render-plan --root PATH --project-root PATH [--json]
+  fclt project render --root PATH --project-root PATH [--check|--rollback] [--json]
+  fclt project lock --root PATH --project-root PATH [lock options] [--json]
 
 Init prints an exact plan and performs no writes by default. Apply requires the
 SHA from that plan. Existing guidance is referenced only when explicitly
@@ -6310,6 +6313,12 @@ export async function projectCommand(
   argv: string[],
   context: ProjectCommandContext = {}
 ): Promise<void> {
+  if (["lock", "render", "render-plan"].includes(argv[0] ?? "")) {
+    await import("./project-render").then(({ projectRenderCommand }) =>
+      projectRenderCommand(argv)
+    );
+    return;
+  }
   if (
     argv.length === 0 ||
     argv.includes("--help") ||

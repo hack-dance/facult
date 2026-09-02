@@ -89,6 +89,265 @@ if (status.packageVersion !== version) {
   );
 }
 
+async function verifyProjectRenderer(): Promise<void> {
+  const expectedProjectTargets = 9;
+  const projectRenderRoot = join(tempHome, "project-render-proof");
+  const projectRenderCanonicalRoot = join(projectRenderRoot, ".ai");
+  for (const directory of [
+    ["agents", "reviewer"],
+    ["mcp"],
+    ["skills", "review"],
+    ["tools", "claude"],
+    ["tools", "codex"],
+  ]) {
+    await mkdir(join(projectRenderCanonicalRoot, ...directory), {
+      recursive: true,
+    });
+  }
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "project-render.toml"),
+    `schema_version = 1
+exclusive_roots = [".agents/skills", ".claude/agents", ".claude/skills", ".codex/agents"]
+
+[[targets]]
+id = "root-agents"
+tool = "codex"
+destination = "AGENTS.md"
+mode = "0644"
+producer = "codex-root-agents-md"
+producer_version = 1
+sources = ["AGENTS.project.md"]
+
+[[targets]]
+id = "review-skill"
+tool = "codex"
+destination = ".agents/skills/review/SKILL.md"
+mode = "0644"
+producer = "codex-skill-md"
+producer_version = 1
+sources = ["skills/review/SKILL.md"]
+
+[[targets]]
+id = "reviewer-agent"
+tool = "codex"
+destination = ".codex/agents/reviewer.toml"
+mode = "0644"
+producer = "codex-agent-toml"
+producer_version = 1
+sources = ["agents/reviewer/agent.toml"]
+
+[[targets]]
+id = "codex-config"
+tool = "codex"
+destination = ".codex/config.toml"
+mode = "0644"
+producer = "codex-config-toml"
+producer_version = 1
+sources = ["tools/codex/config.toml"]
+
+[[targets]]
+id = "claude-root"
+tool = "claude"
+destination = "CLAUDE.md"
+mode = "0644"
+producer = "claude-root-claude-md"
+producer_version = 1
+sources = ["tools/claude/CLAUDE.md"]
+
+[[targets]]
+id = "claude-review-skill"
+tool = "claude"
+destination = ".claude/skills/review/SKILL.md"
+mode = "0644"
+producer = "claude-skill-md"
+producer_version = 1
+sources = ["skills/review/SKILL.md"]
+
+[[targets]]
+id = "claude-reviewer-agent"
+tool = "claude"
+destination = ".claude/agents/reviewer.md"
+mode = "0644"
+producer = "claude-agent-md"
+producer_version = 1
+sources = ["agents/reviewer/claude.md"]
+
+[[targets]]
+id = "claude-mcp"
+tool = "claude"
+destination = ".mcp.json"
+mode = "0644"
+producer = "claude-mcp-json"
+producer_version = 1
+sources = ["mcp/claude.json"]
+
+[[targets]]
+id = "claude-settings"
+tool = "claude"
+destination = ".claude/settings.json"
+mode = "0644"
+producer = "claude-settings-json"
+producer_version = 1
+sources = ["tools/claude/settings.json"]
+`
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "AGENTS.project.md"),
+    "# Compiled project agents\n"
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "skills", "review", "SKILL.md"),
+    "---\nname: review\ndescription: Review compiled output.\n---\n\n# Compiled review\n"
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "agents", "reviewer", "agent.toml"),
+    'name = "reviewer"\ndescription = "Review compiled output."\ndeveloper_instructions = "Return evidence."\n'
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "agents", "reviewer", "claude.md"),
+    "---\nname: reviewer\ndescription: Review compiled output.\ntools: Read, Grep, Glob\n---\n\nReturn evidence.\n"
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "tools", "codex", "config.toml"),
+    '[mcp_servers.docs]\nurl = "https://developers.openai.com/mcp"\nbearer_token_env_var = "DOCS_TOKEN"\n'
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "tools", "claude", "CLAUDE.md"),
+    "@AGENTS.md\n"
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "mcp", "claude.json"),
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: Claude expands this literal at runtime.
+    '{"mcpServers":{"docs":{"type":"http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer ${DOCS_TOKEN}"}}}}\n'
+  );
+  await Bun.write(
+    join(projectRenderCanonicalRoot, "tools", "claude", "settings.json"),
+    '{"permissions":{"deny":["Read(./.env)"]}}\n'
+  );
+  const projectRenderArgs = [
+    "--root",
+    projectRenderCanonicalRoot,
+    "--project-root",
+    projectRenderRoot,
+    "--json",
+  ];
+  const compilerPlatform = `${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`;
+  const lockResult = JSON.parse(
+    await run([
+      "project",
+      "lock",
+      ...projectRenderArgs,
+      "--pack-version",
+      "compiled-proof-1.0.0",
+      "--pack-schema-version",
+      "1",
+      "--compiler-compatibility",
+      `>=${version} <3.0.0`,
+      "--compiler-artifact",
+      `${compilerPlatform}=${binaryPath}`,
+    ])
+  ) as { lock?: { compiler?: { version?: string } }; path?: string };
+  if (
+    lockResult.path !== "project-render.lock.json" ||
+    lockResult.lock?.compiler?.version !== version
+  ) {
+    throw new Error("Compiled project lock did not bind compiler identity");
+  }
+  const projectRenderPlanText = await run([
+    "project",
+    "render-plan",
+    ...projectRenderArgs,
+  ]);
+  const projectRenderPlan = JSON.parse(projectRenderPlanText) as {
+    compiler?: { version?: string };
+    lock?: {
+      compilerArtifact?: { platform?: string };
+      pack?: { version?: string };
+    };
+    planId?: string;
+    targets?: Array<{
+      content?: { data?: string; encoding?: string };
+      destination?: string;
+      mode?: string;
+    }>;
+  };
+  if (
+    projectRenderPlan.compiler?.version !== version ||
+    projectRenderPlan.lock?.compilerArtifact?.platform !== compilerPlatform ||
+    projectRenderPlan.lock?.pack?.version !== "compiled-proof-1.0.0" ||
+    !projectRenderPlan.planId?.startsWith("sha256:") ||
+    projectRenderPlanText.includes(projectRenderRoot) ||
+    projectRenderPlan.targets?.length !== expectedProjectTargets
+  ) {
+    throw new Error(
+      "Compiled project planner did not emit hermetic version-bound output"
+    );
+  }
+  const driftCheck = JSON.parse(
+    await runBlocked(["project", "render", "--check", ...projectRenderArgs])
+  ) as { clean?: boolean; summary?: { missing?: number } };
+  if (
+    driftCheck.clean !== false ||
+    driftCheck.summary?.missing !== expectedProjectTargets
+  ) {
+    throw new Error("Compiled project check did not report missing outputs");
+  }
+  for (const target of projectRenderPlan.targets) {
+    if (
+      !target.destination ||
+      target.content?.encoding !== "base64" ||
+      !target.content.data ||
+      !target.mode
+    ) {
+      throw new Error("Compiled project plan target is incomplete");
+    }
+  }
+  const apply = JSON.parse(
+    await run(["project", "render", ...projectRenderArgs])
+  ) as { changed?: boolean; written?: number };
+  if (apply.changed !== true || apply.written !== expectedProjectTargets) {
+    throw new Error(
+      "Compiled project render did not transactionally apply outputs"
+    );
+  }
+  const cleanCheck = JSON.parse(
+    await run(["project", "render", "--check", ...projectRenderArgs])
+  ) as { clean?: boolean; summary?: { matching?: number } };
+  if (
+    cleanCheck.clean !== true ||
+    cleanCheck.summary?.matching !== expectedProjectTargets
+  ) {
+    throw new Error("Compiled project check did not verify exact outputs");
+  }
+  const rollback = JSON.parse(
+    await run(["project", "render", "--rollback", ...projectRenderArgs])
+  ) as { planId?: string | null; restored?: number };
+  if (
+    rollback.planId !== null ||
+    rollback.restored !== expectedProjectTargets
+  ) {
+    throw new Error(
+      "Compiled project render did not roll back its first apply"
+    );
+  }
+  const rollbackCheck = JSON.parse(
+    await runBlocked(["project", "render", "--check", ...projectRenderArgs])
+  ) as { clean?: boolean; summary?: { missing?: number } };
+  if (
+    rollbackCheck.clean !== false ||
+    rollbackCheck.summary?.missing !== expectedProjectTargets
+  ) {
+    throw new Error(
+      "Compiled project rollback did not restore the absent tree"
+    );
+  }
+  await run(["project", "render", ...projectRenderArgs]);
+}
+
+if (process.platform !== "win32") {
+  await verifyProjectRenderer();
+}
+
 const auditSource = join(tempHome, "audit-source");
 const auditSkill = join(auditSource, "skills", "compiled-audit", "SKILL.md");
 const auditReportRoot = await mkdtemp(
