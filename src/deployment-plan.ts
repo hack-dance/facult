@@ -780,6 +780,15 @@ async function readRegularFileOrNull(
   }
 }
 
+/** Read one bounded regular file without following links or accepting an unstable snapshot. */
+export async function readStableRegularFile(args: {
+  label: string;
+  path: string;
+  root: string;
+}): Promise<Uint8Array | null> {
+  return await readRegularFileOrNull(args);
+}
+
 /** Deterministic seam for descriptor replacement and symlink-race tests. */
 export async function readStableRegularFileForTest(args: {
   afterOpen: () => Promise<void>;

@@ -715,6 +715,33 @@ export function writeExclusiveAt(args: {
   }
 }
 
+/** Hold a non-blocking process-scoped advisory lock until the returned release function runs. */
+export function acquireExclusiveAdvisoryLock(
+  fileDescriptor: number
+): () => void {
+  if (!auditReportPersistenceSupported()) {
+    throw new Error(
+      `Advisory file locking is unavailable on ${process.platform}`
+    );
+  }
+  const libc = openSystemLibc(platformConfiguration(), {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  if (libc.symbols.flock(fileDescriptor, 6) !== 0) {
+    libc.close();
+    throw new Error("Another project render mutation is already running.");
+  }
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    libc.symbols.flock(fileDescriptor, 8);
+    libc.close();
+  };
+}
+
 function sameFileIdentity(left: Stats, right: Stats): boolean {
   return (
     right.isFile() &&

@@ -184,7 +184,12 @@ jobs:
           if-no-files-found: error
 
   publish-assets:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Keep provenance generation on a GitHub-hosted runner with an isolated OIDC identity.
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     needs: [semantic-release, build-assets]
     if: needs.semantic-release.outputs.released == 'true'
     steps:
@@ -200,17 +205,38 @@ jobs:
           merge-multiple: true
           path: dist/release-assets
 
-      - name: Add install script + checksums
+      - name: Add install scripts
         shell: bash
         run: |
           set -euo pipefail
           cp scripts/install.sh dist/release-assets/fclt-install.sh
           cp scripts/install.sh dist/release-assets/facult-install.sh
           chmod +x dist/release-assets/fclt-install.sh dist/release-assets/facult-install.sh
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist/release-assets
+          format: spdx-json
+          output-file: dist/release-assets/fclt-${{ needs.semantic-release.outputs.version }}.spdx.json
+          upload-artifact: false
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
           (
             cd dist/release-assets
             sha256sum * > SHA256SUMS
           )
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/release-assets/fclt-*
+            dist/release-assets/facult-*
+            dist/release-assets/SHA256SUMS
 
       - name: Upload assets to release
         uses: softprops/action-gh-release@v2

@@ -29,6 +29,8 @@ This roadmap tracks remaining product direction for `fclt`.
   `PATH`.
 - Default containment for deprecated whole-tool managed mutation, while preserving inventory and
   dry-run planning for legacy installations.
+- Hermetic project planning, read-only checks, receipt-bound transactional apply/rollback, exact
+  Codex and Claude adapters, compiler/input-pack locks, and release supply-chain verification.
 
 ## Current Priorities
 
@@ -47,11 +49,9 @@ This roadmap tracks remaining product direction for `fclt`.
    - Keep vendor integrations export-based and optional rather than adding credentials to core.
    - Make renamed-source and unavailable-source recovery easier to understand.
 
-4. Extend immutable per-asset deployment planning beyond the first Codex instruction/snippet slice.
-   - Keep planning read-only and exact-bound while adapters are added.
+4. Extend immutable per-asset deployment planning beyond the completed project-tree compiler.
    - Add an explicit destination ownership migration/transfer contract before allowing asset or
      adapter claims to move.
-   - Build an apply executor only after transaction, approval, receipt, and recovery contracts exist.
    - Keep deprecated broad managed mutation contained.
 
 5. Improve project onboarding.

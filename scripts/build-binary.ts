@@ -26,6 +26,8 @@ const build = Bun.spawnSync({
     "--compile",
     "--define",
     `FCLT_COMPILED_VERSION=${JSON.stringify(version)}`,
+    "--define",
+    "FCLT_COMPILED_RUNTIME=true",
     "--outfile",
     binaryBasePath,
   ],
