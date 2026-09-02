@@ -636,8 +636,9 @@ unsupported client settings fail closed. See
 [the project planning reference](./docs/reference.md#hermetic-project-tree-planning).
 When `.ai/project-render.lock.json` is present, planning and rendering also
 verify the exact platform compiler artifact, manifest schema, canonical input
-pack digest, pack version, and compiler compatibility range. Locked rendering
-requires a compiled artifact; source-checkout or `PATH` identity is insufficient.
+and semantic manifest digest, pack version, and compiler compatibility range.
+Locked rendering requires a compiled artifact; source-checkout or `PATH`
+identity is insufficient.
 
 Writeback and evolution:
 

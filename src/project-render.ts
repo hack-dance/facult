@@ -10,7 +10,10 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { caseFold } from "unicode-case-folding";
 import { readDirectoryEntriesAt } from "./audit/safe-openat";
-import { readStableRegularFile } from "./deployment-plan";
+import {
+  MAX_STABLE_REGULAR_FILE_BYTES,
+  readStableRegularFile,
+} from "./deployment-plan";
 import {
   type ClaudeProjectRenderProducer,
   renderClaudeProjectTarget,
@@ -440,6 +443,18 @@ function assertUniqueTargets(targets: ProjectRenderManifestTargetV1[]): void {
     }
     destinations.set(key, target.destination);
   }
+  for (const [key, destination] of destinations) {
+    const segments = key.split("/");
+    for (let length = 1; length < segments.length; length += 1) {
+      const ancestor = destinations.get(segments.slice(0, length).join("/"));
+      if (!ancestor) {
+        continue;
+      }
+      throw new Error(
+        `Overlapping project render destinations: ${ancestor} and ${destination}.`
+      );
+    }
+  }
 }
 
 function assertClaudeInstructionContract(
@@ -698,6 +713,11 @@ export async function buildProjectRenderPlan(
         throw new Error(`Project render target has no content: ${target.id}.`);
       }
       const content = Buffer.from(contentText, "utf8");
+      if (content.byteLength > MAX_STABLE_REGULAR_FILE_BYTES) {
+        throw new Error(
+          `Project render target exceeds the ${MAX_STABLE_REGULAR_FILE_BYTES}-byte file limit: ${target.destination}.`
+        );
+      }
       totalTargetBytes += content.byteLength;
       if (totalTargetBytes > MAX_TOTAL_TARGET_BYTES) {
         throw new Error(
@@ -1384,8 +1404,10 @@ identity. Use --require-lock to fail when it is absent.
       const { applyProjectRender } = await import("./project-render-apply");
       const result = await applyProjectRender({
         canonicalRoot,
+        lock: parsed.lock,
         manifest: parsed.manifest,
         projectRoot,
+        requireLock: parsed.requireLock,
       });
       if (parsed.json) {
         console.log(JSON.stringify(result, null, 2));

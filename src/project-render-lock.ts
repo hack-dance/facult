@@ -11,7 +11,7 @@ const LOCK_SCHEMA_VERSION = 1 as const;
 const MAX_LOCK_BYTES = 256 * 1024;
 const MAX_COMPILER_ARTIFACT_BYTES = 512 * 1024 * 1024;
 const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
-const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const PACK_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,126}$/;
 const ARTIFACT_KEY_RE = /^(?:darwin|linux|windows)-(?:arm64|x64)$/;
 const SAFE_RELATIVE_PATH_RE = /^[A-Za-z0-9._/-]+$/;
@@ -48,6 +48,7 @@ export interface ProjectRenderLockBindingV1 {
 interface LockableProjectRenderPlan {
   compiler: { name: "fclt"; version: string };
   hashes: { inputs: string };
+  manifest: { hash: string };
   schemaVersion: 1;
 }
 
@@ -97,6 +98,22 @@ function stableJson(value: unknown): string {
 
 function sha256(value: string | Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function packDigest(plan: LockableProjectRenderPlan): string {
+  return sha256(
+    stableJson({ inputs: plan.hashes.inputs, manifest: plan.manifest.hash })
+  );
+}
+
+function validateLockPath(value: string): string {
+  const lockPath = validateRelativePath(value);
+  if (lockPath.includes("/")) {
+    throw new Error(
+      "Project render lock must be a single file name in the canonical root."
+    );
+  }
+  return lockPath;
 }
 
 function validateHash(value: unknown, label: string): string {
@@ -421,7 +438,7 @@ export async function verifyProjectRenderLock(args: {
   plan: LockableProjectRenderPlan;
   required?: boolean;
 }): Promise<ProjectRenderLockBindingV1 | null> {
-  const lockPath = validateRelativePath(args.lock ?? DEFAULT_LOCK_NAME);
+  const lockPath = validateLockPath(args.lock ?? DEFAULT_LOCK_NAME);
   const loaded = await readLock({
     canonicalRoot: args.canonicalRoot,
     lockPath,
@@ -451,7 +468,7 @@ export async function verifyProjectRenderLock(args: {
       "Project render compiler is outside the locked pack compatibility range."
     );
   }
-  if (lock.pack.digest !== args.plan.hashes.inputs) {
+  if (lock.pack.digest !== packDigest(args.plan)) {
     throw new Error(
       "Project render canonical inputs do not match the locked pack digest."
     );
@@ -537,13 +554,13 @@ export async function createProjectRenderLock(args: {
     manifestSchemaVersion: args.plan.schemaVersion,
     pack: {
       compilerCompatibility: args.compilerCompatibility,
-      digest: args.plan.hashes.inputs,
+      digest: packDigest(args.plan),
       schemaVersion: packSchemaVersion,
       version: args.packVersion,
     },
     schemaVersion: 1,
   };
-  const lockPath = validateRelativePath(args.lock ?? DEFAULT_LOCK_NAME);
+  const lockPath = validateLockPath(args.lock ?? DEFAULT_LOCK_NAME);
   const destination = join(resolve(args.canonicalRoot), lockPath);
   const temporary = join(dirname(destination), `.${randomUUID()}.tmp`);
   const descriptor = await open(

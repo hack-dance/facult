@@ -195,17 +195,19 @@ fclt project lock --root <repo>/.ai --project-root <repo> \
 The command writes `.ai/project-render.lock.json` atomically. The stable lock
 contains no timestamp or absolute path. It records the compiler package version,
 one SHA-256 digest per declared platform artifact, render-manifest schema,
-canonical input-pack digest, pack schema/version, and compiler compatibility
-range. Supply every supported platform artifact when creating or updating the
-lock; omitted platforms cannot render it.
+combined canonical input and semantic manifest digest, pack schema/version, and
+compiler compatibility range. Supply every supported platform artifact when
+creating or updating the lock; omitted platforms cannot render it.
 
 When the default lock exists, `project render-plan` and `project render` verify it
 before returning a plan or touching a target. `--require-lock` makes absence an
-error, and `--lock <relative-path>` selects a non-default lock. Verification
-hashes the running compiled executable itself. A source checkout, a package
-version string, or discovery through `PATH` cannot substitute for the locked
-artifact identity. Pack drift, compiler-version skew, incompatible ranges, and
-artifact mismatch fail before render.
+error, and `--lock <file-name>` selects a non-default lock in the canonical
+root. Nested lock paths are rejected so lock creation cannot traverse a
+symlinked parent. Verification hashes the running compiled executable itself. A
+source checkout, a package version string, or discovery through `PATH` cannot
+substitute for the locked artifact identity. Input or manifest drift,
+compiler-version skew, incompatible ranges, and artifact mismatch fail before
+render.
 
 For offline use, cache the release binary and its `SHA256SUMS`, keep the
 repository's canonical `.ai` inputs and lock together, and invoke the cached

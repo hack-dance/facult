@@ -7,14 +7,17 @@ import {
   readdir,
   readFile,
   rename,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { buildProjectRenderPlan } from "./project-render";
 import {
   applyProjectRender,
   rollbackProjectRender,
 } from "./project-render-apply";
+import { createProjectRenderLock } from "./project-render-lock";
 
 const MANIFEST = `schema_version = 1
 exclusive_roots = [".agents/skills"]
@@ -182,6 +185,89 @@ sources = ["AGENTS.project.md"]
       ).catch(() => null)
     ).toBeNull();
     expect(await readFile(unrelated, "utf8")).toBe("keep\n");
+  });
+
+  it("commits ownership cleanup when a stale owned target is already absent", async () => {
+    const fixture = await createFixture();
+    await applyProjectRender(applyOptions(fixture));
+    await unlink(
+      join(fixture.projectRoot, ".agents", "skills", "review", "SKILL.md")
+    );
+    await writeFile(
+      join(fixture.canonicalRoot, "project-render.toml"),
+      `schema_version = 1
+exclusive_roots = []
+
+[[targets]]
+id = "root-agents"
+tool = "codex"
+destination = "AGENTS.md"
+mode = "0644"
+producer = "copy-text"
+producer_version = 1
+sources = ["AGENTS.project.md"]
+`
+    );
+
+    const cleanup = await applyProjectRender(applyOptions(fixture));
+    expect(cleanup).toMatchObject({
+      changed: true,
+      removed: 0,
+      written: 0,
+    });
+    const receipt = JSON.parse(
+      await readFile(join(fixture.stateRoot, "receipt.json"), "utf8")
+    ) as { ownership: { targets: Array<{ path: string }> } };
+    expect(receipt.ownership.targets.map((target) => target.path)).toEqual([
+      "AGENTS.md",
+    ]);
+    expect(await applyProjectRender(applyOptions(fixture))).toMatchObject({
+      changed: false,
+    });
+  });
+
+  it("preserves custom required lock policy throughout apply revalidation", async () => {
+    const fixture = await createFixture();
+    const artifactPath = join(fixture.projectRoot, "fclt-artifact");
+    await writeFile(artifactPath, "compiled-fclt-artifact-v1\n");
+    const unlockedPlan = await buildProjectRenderPlan({
+      canonicalRoot: fixture.canonicalRoot,
+      projectRoot: fixture.projectRoot,
+      skipLockVerification: true,
+    });
+    await createProjectRenderLock({
+      canonicalRoot: fixture.canonicalRoot,
+      compilerArtifacts: { "darwin-arm64": artifactPath },
+      compilerCompatibility: ">=2.28.0 <3.0.0",
+      lock: "custom.lock.json",
+      packSchemaVersion: 1,
+      packVersion: "test-pack",
+      plan: unlockedPlan,
+    });
+    const options = {
+      ...applyOptions(fixture),
+      compilerArtifactPath: artifactPath,
+      compilerArtifactPlatform: "darwin-arm64",
+      lock: "custom.lock.json",
+      requireLock: true,
+    };
+
+    await expect(
+      applyProjectRender({
+        ...options,
+        hooks: {
+          beforeOperation: async ({ index }) => {
+            if (index === 0) {
+              await unlink(join(fixture.canonicalRoot, "custom.lock.json"));
+            }
+          },
+        },
+      })
+    ).rejects.toThrow("lock does not exist: custom.lock.json");
+    expect(await stateEntries(fixture)).toEqual([
+      "mutation.lock",
+      "transaction.json",
+    ]);
   });
 
   it("refuses unexpected unowned files inside exclusive roots", async () => {

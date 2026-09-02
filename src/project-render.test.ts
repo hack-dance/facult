@@ -342,6 +342,19 @@ id = "codex-root-agents"
         projectRoot: collisionFixture.projectRoot,
       })
     ).rejects.toThrow("Portable project render destination collision");
+
+    const overlapFixture = await createFixture({
+      manifest: MANIFEST.replace(
+        'destination = ".agents/skills/review/SKILL.md"',
+        'destination = "AGENTS.md/child"'
+      ),
+    });
+    await expect(
+      buildProjectRenderPlan({
+        canonicalRoot: overlapFixture.canonicalRoot,
+        projectRoot: overlapFixture.projectRoot,
+      })
+    ).rejects.toThrow("Overlapping project render destinations");
   });
 
   it("rejects symlinked canonical inputs", async () => {
@@ -428,5 +441,40 @@ ${targets}`,
         projectRoot: fixture.projectRoot,
       })
     ).rejects.toThrow("outputs exceed the 67108864-byte aggregate limit");
+  });
+
+  it("bounds each desired target to the stable target read limit", async () => {
+    const fixture = await createFixture({
+      manifest: `schema_version = 1
+exclusive_roots = []
+
+[[targets]]
+id = "large-target"
+tool = "codex"
+destination = "AGENTS.md"
+mode = "0644"
+producer = "concat-text"
+producer_version = 1
+separator = ""
+sources = ["fragments/header.md", "instructions/WORK.md"]
+`,
+    });
+    await Promise.all([
+      Bun.write(
+        join(fixture.canonicalRoot, "fragments", "header.md"),
+        "a".repeat(9 * 1024 * 1024)
+      ),
+      Bun.write(
+        join(fixture.canonicalRoot, "instructions", "WORK.md"),
+        "b".repeat(9 * 1024 * 1024)
+      ),
+    ]);
+
+    await expect(
+      buildProjectRenderPlan({
+        canonicalRoot: fixture.canonicalRoot,
+        projectRoot: fixture.projectRoot,
+      })
+    ).rejects.toThrow("target exceeds the 16777216-byte file limit");
   });
 });

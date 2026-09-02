@@ -323,7 +323,7 @@ real-client, or consumer-image proof.
   fixes the required ordering and permissions; npm provenance and Homebrew
   checksum consumption remain independently enforced.
 - Final repository verification passed: `./scripts/test-safe.sh` completed with
-  875 tests, 3,913 assertions, and zero failures; `bun run check`, `bun run
+  1,062 tests, 4,859 assertions, and zero failures; `bun run check`, `bun run
   type-check`, `git diff --check`, `bun run build`, `bun run build:verify`, `bun
   run pack:dry-run`, and `bun run bootstrap:verify` also passed.
 - The full-suite run exposed and verified a macOS lexical-versus-physical path

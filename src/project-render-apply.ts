@@ -115,10 +115,14 @@ export interface ProjectRenderApplyHooks {
 
 export interface ApplyProjectRenderOptions {
   canonicalRoot: string;
+  compilerArtifactPath?: string;
+  compilerArtifactPlatform?: string;
   homeDir?: string;
   hooks?: ProjectRenderApplyHooks;
+  lock?: string;
   manifest?: string;
   projectRoot: string;
+  requireLock?: boolean;
   stateRoot?: string;
 }
 
@@ -685,8 +689,12 @@ async function assertPlanUnchanged(
 ): Promise<void> {
   const current = await buildProjectRenderPlan({
     canonicalRoot: options.canonicalRoot,
+    compilerArtifactPath: options.compilerArtifactPath,
+    compilerArtifactPlatform: options.compilerArtifactPlatform,
+    lock: options.lock,
     manifest: options.manifest,
     projectRoot: options.projectRoot,
+    requireLock: options.requireLock,
   });
   if (current.planId !== expectedPlanId) {
     throw new Error("Project render manifest or inputs changed during apply.");
@@ -951,8 +959,12 @@ export async function applyProjectRender(
     });
     const plan = await buildProjectRenderPlan({
       canonicalRoot: options.canonicalRoot,
+      compilerArtifactPath: options.compilerArtifactPath,
+      compilerArtifactPlatform: options.compilerArtifactPlatform,
+      lock: options.lock,
       manifest: options.manifest,
       projectRoot: options.projectRoot,
+      requireLock: options.requireLock,
     });
     const receiptText = await readOptionalState(paths.receipt);
     const receipt = receiptText ? parseReceipt(receiptText) : null;
@@ -962,7 +974,11 @@ export async function applyProjectRender(
       );
     }
     const operations = await buildOperations({ options, plan, receipt });
-    if (operations.length === 0) {
+    const ownershipAfter = ownershipFromPlan({ plan, projectId: identity });
+    if (
+      operations.length === 0 &&
+      stableJson(receipt?.ownership ?? null) === stableJson(ownershipAfter)
+    ) {
       return Object.freeze({
         changed: false,
         planId: plan.planId,
@@ -972,7 +988,23 @@ export async function applyProjectRender(
         written: 0,
       });
     }
-    const ownershipAfter = ownershipFromPlan({ plan, projectId: identity });
+    if (operations.length === 0) {
+      await options.hooks?.beforeReceiptCommit?.();
+      await assertPlanUnchanged(options, plan.planId);
+      await atomicStateWrite(paths.receipt, {
+        ownership: ownershipAfter,
+        rollback: { operations: [], ownership: null },
+        schemaVersion: RECEIPT_SCHEMA_VERSION,
+      } satisfies ProjectRenderReceiptV1);
+      return Object.freeze({
+        changed: true,
+        planId: plan.planId,
+        recovered,
+        removed: 0,
+        schemaVersion: RESULT_SCHEMA_VERSION,
+        written: 0,
+      });
+    }
     const transactionBody = {
       operations,
       ownershipAfter,

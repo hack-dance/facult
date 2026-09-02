@@ -9,6 +9,7 @@ import {
 } from "./project-render-lock";
 
 const TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T/;
+const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
 
 interface LockFixture {
   artifactPath: string;
@@ -87,7 +88,8 @@ describe("project render compiler and pack lock", () => {
     expect(plan.lock?.path).toBe(".ai/project-render.lock.json");
     expect(plan.lock?.compilerArtifact.platform).toBe("darwin-arm64");
     expect(plan.lock?.pack.version).toBe("hack-pack-1.0.0");
-    expect(plan.lock?.pack.digest).toBe(plan.hashes.inputs);
+    expect(plan.lock?.pack.digest).toMatch(SHA256_RE);
+    expect(plan.lock?.pack.digest).not.toBe(plan.hashes.inputs);
     expect(JSON.stringify(plan.lock)).not.toContain(left.projectRoot);
     expect(JSON.stringify(plan.lock)).not.toMatch(TIMESTAMP_RE);
   });
@@ -124,6 +126,56 @@ describe("project render compiler and pack lock", () => {
         projectRoot: fixture.projectRoot,
       })
     ).rejects.toThrow("requires an exact compiled fclt artifact");
+  });
+
+  it("binds the lock to manifest semantics as well as canonical input bytes", async () => {
+    const fixture = await createFixture();
+    await writeLock({ fixture, packVersion: "hack-pack-1.0.0" });
+    const manifestPath = join(fixture.canonicalRoot, "project-render.toml");
+    const manifest = await Bun.file(manifestPath).text();
+    await Bun.write(
+      manifestPath,
+      manifest.replace(
+        'destination = "AGENTS.md"',
+        'destination = "GUIDANCE.md"'
+      )
+    );
+
+    await expect(
+      buildProjectRenderPlan({
+        canonicalRoot: fixture.canonicalRoot,
+        compilerArtifactPath: fixture.artifactPath,
+        compilerArtifactPlatform: "darwin-arm64",
+        projectRoot: fixture.projectRoot,
+      })
+    ).rejects.toThrow("canonical inputs do not match");
+  });
+
+  it("rejects prerelease compiler versions and nested custom lock paths", async () => {
+    expect(() =>
+      compilerVersionSatisfiesRange({
+        range: ">=2.28.0 <3.0.0",
+        version: "2.29.2-beta.1",
+      })
+    ).toThrow("semantic package version");
+
+    const fixture = await createFixture();
+    const plan = await buildProjectRenderPlan({
+      canonicalRoot: fixture.canonicalRoot,
+      projectRoot: fixture.projectRoot,
+      skipLockVerification: true,
+    });
+    await expect(
+      createProjectRenderLock({
+        canonicalRoot: fixture.canonicalRoot,
+        compilerArtifacts: { "darwin-arm64": fixture.artifactPath },
+        compilerCompatibility: ">=2.28.0 <3.0.0",
+        lock: "locks/project-render.json",
+        packSchemaVersion: 1,
+        packVersion: "hack-pack-1.0.0",
+        plan,
+      })
+    ).rejects.toThrow("single file name in the canonical root");
   });
 
   it("detects compiler-version skew before render", async () => {

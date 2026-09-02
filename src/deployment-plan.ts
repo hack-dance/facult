@@ -40,7 +40,7 @@ const PACKAGE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const DESTINATION_IDENTITY_PREFIX = "physical-path-v3:";
 const DESTINATION_COLLISION_KEY_PREFIX =
   "case-folded-path-v2:unicode-case-folding@1.1.1:";
-const MAX_PLANNING_FILE_BYTES = 16 * 1024 * 1024;
+export const MAX_STABLE_REGULAR_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_DEPLOYMENT_STATE_RECORD_BYTES = 256 * 1024;
 const MAX_DEPLOYMENT_STATE_TOTAL_BYTES = 4 * 1024 * 1024;
 const MAX_DEPLOYMENT_STATE_RECORDS = 128;
@@ -512,7 +512,7 @@ function readDirectoryEntriesFromDescriptor(args: {
 function assertStableRegularFileStat(
   stat: BigIntStats,
   label: string,
-  maxBytes = MAX_PLANNING_FILE_BYTES
+  maxBytes = MAX_STABLE_REGULAR_FILE_BYTES
 ): number {
   if (!stat.isFile() || stat.ino <= 0n || stat.dev < 0n) {
     throw new Error(
