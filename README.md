@@ -611,7 +611,7 @@ fclt index [--force]
 Project planning and legacy managed-mode inspection:
 
 ```bash
-fclt project plan --root <repo>/.ai --project-root <repo> --json
+fclt project render-plan --root <repo>/.ai --project-root <repo> --json
 fclt project lock --root <repo>/.ai --project-root <repo> \
   --pack-version <version> --pack-schema-version <number> \
   --compiler-compatibility ">=2.28.0 <3.0.0" \

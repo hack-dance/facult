@@ -81,11 +81,11 @@ install.
 ## Hermetic project-tree planning
 
 ```bash
-fclt project plan --root <repo>/.ai --project-root <repo> \
+fclt project render-plan --root <repo>/.ai --project-root <repo> \
   [--manifest project-render.toml] --json
 ```
 
-`project plan` reads `<repo>/.ai/project-render.toml` and only the canonical
+`project render-plan` reads `<repo>/.ai/project-render.toml` and only the canonical
 inputs declared by that manifest. It emits a deterministic, content-addressed
 desired-tree plan containing logical paths, normalized desired bytes, modes,
 and hashes. It does not inspect repository targets, machine-local state,
@@ -199,7 +199,7 @@ canonical input-pack digest, pack schema/version, and compiler compatibility
 range. Supply every supported platform artifact when creating or updating the
 lock; omitted platforms cannot render it.
 
-When the default lock exists, `project plan` and `project render` verify it
+When the default lock exists, `project render-plan` and `project render` verify it
 before returning a plan or touching a target. `--require-lock` makes absence an
 error, and `--lock <relative-path>` selects a non-default lock. Verification
 hashes the running compiled executable itself. A source checkout, a package

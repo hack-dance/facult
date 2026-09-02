@@ -1245,12 +1245,12 @@ function requireOption(value: string | undefined, flag: string): string {
   return value;
 }
 
-export async function projectCommand(argv: string[]): Promise<void> {
+export async function projectRenderCommand(argv: string[]): Promise<void> {
   if (argv.includes("--help") || argv.includes("-h") || argv[0] === "help") {
     console.log(`fclt project - compile, check, and apply a hermetic desired project tree
 
 Usage:
-  fclt project plan --root <repo>/.ai --project-root <repo> [--manifest project-render.toml] [--json]
+  fclt project render-plan --root <repo>/.ai --project-root <repo> [--manifest project-render.toml] [--json]
   fclt project lock --root <repo>/.ai --project-root <repo> --pack-version <version> --pack-schema-version <number> --compiler-compatibility <range> --compiler-artifact <platform>-<arch>=<absolute-path> [--json]
   fclt project render --root <repo>/.ai --project-root <repo> --check [--manifest project-render.toml] [--json]
   fclt project render --root <repo>/.ai --project-root <repo> [--manifest project-render.toml] [--json]
@@ -1266,8 +1266,14 @@ identity. Use --require-lock to fail when it is absent.
     return;
   }
   try {
-    if (argv[0] !== "lock" && argv[0] !== "plan" && argv[0] !== "render") {
-      throw new Error("project requires the subcommand: lock, plan, or render");
+    if (
+      argv[0] !== "lock" &&
+      argv[0] !== "render-plan" &&
+      argv[0] !== "render"
+    ) {
+      throw new Error(
+        "project rendering requires the subcommand: lock, render-plan, or render"
+      );
     }
     if (argv[0] === "lock") {
       const lockArgs = parseProjectLockArgs(argv.slice(1));
@@ -1307,8 +1313,10 @@ identity. Use --require-lock to fail when it is absent.
       return;
     }
     const parsed = parseProjectPlanArgs(argv.slice(1));
-    if (argv[0] === "plan" && (parsed.check || parsed.rollback)) {
-      throw new Error("project plan does not accept --check or --rollback.");
+    if (argv[0] === "render-plan" && (parsed.check || parsed.rollback)) {
+      throw new Error(
+        "project render-plan does not accept --check or --rollback."
+      );
     }
     if (parsed.check && parsed.rollback) {
       throw new Error(

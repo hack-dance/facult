@@ -130,7 +130,7 @@ async function runCli(args: {
       "run",
       join(import.meta.dir, "index.ts"),
       "project",
-      "plan",
+      "render-plan",
       "--root",
       args.fixture.canonicalRoot,
       "--project-root",

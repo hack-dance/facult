@@ -28,7 +28,7 @@ machine-local state, `$HOME`, clocks, or the network.
 
 Acceptance:
 
-- `fclt project plan --root <repo>/.ai --project-root <repo> --json` reads
+- `fclt project render-plan --root <repo>/.ai --project-root <repo> --json` reads
   `<repo>/.ai/project-render.toml` by default.
 - The manifest has an exact versioned schema. Unknown fields, unsupported
   producer versions, unsafe paths, missing inputs, symlinks, duplicate target
@@ -305,7 +305,7 @@ real-client, or consumer-image proof.
   creation requires explicit absolute artifact paths rather than `PATH`
   discovery.
 - Lock verification tests cover deterministic bytes across different roots,
-  deliberate 2.28.0/2.29.2 identity skew, pack and artifact drift, source-mode
+  deliberate source/lock compiler identity skew, pack and artifact drift, source-mode
   rejection, compatibility bounds, and offline rollback to a prior input/lock
   pair. The compiled-binary verifier creates and consumes a real lock before its
   nine-target transactional render/check/rollback/reapply smoke.

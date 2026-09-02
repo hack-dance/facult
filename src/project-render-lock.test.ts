@@ -136,8 +136,14 @@ describe("project render compiler and pack lock", () => {
       compiler: { version: string };
       pack: { compilerCompatibility: string };
     };
-    lock.compiler.version = "2.29.2";
-    lock.pack.compilerCompatibility = ">=2.29.0 <3.0.0";
+    const [major, minor, patch] = lock.compiler.version
+      .split(".")
+      .map((value) => Number(value));
+    if (major === undefined || minor === undefined || patch === undefined) {
+      throw new Error("Expected a semantic compiler version in the fixture");
+    }
+    lock.compiler.version = `${major}.${minor}.${patch + 1}`;
+    lock.pack.compilerCompatibility = `>=${major}.${minor}.0 <${major}.${minor + 1}.0`;
     await Bun.write(
       join(fixture.canonicalRoot, "project-render.lock.json"),
       `${JSON.stringify(lock)}\n`

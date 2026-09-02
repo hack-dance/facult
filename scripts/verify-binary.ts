@@ -255,7 +255,7 @@ sources = ["tools/claude/settings.json"]
   }
   const projectRenderPlanText = await run([
     "project",
-    "plan",
+    "render-plan",
     ...projectRenderArgs,
   ]);
   const projectRenderPlan = JSON.parse(projectRenderPlanText) as {

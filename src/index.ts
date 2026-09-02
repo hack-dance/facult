@@ -145,10 +145,6 @@ function printHelp() {
               ["manage/sync", "Preview deprecated broad managed-mode output"],
               ["deploy plan", "Build one immutable per-asset deployment plan"],
               [
-                "project plan/render",
-                "Compile, check, apply, or roll back a hermetic project tree",
-              ],
-              [
                 "setup",
                 "Install narrow agent integrations without full managed mode",
               ],
@@ -1371,11 +1367,6 @@ async function main(argv: string[]) {
     case "deploy":
       await import("./deployment-plan").then(({ deployCommand }) =>
         deployCommand(rest)
-      );
-      return;
-    case "project":
-      await import("./project-render").then(({ projectCommand }) =>
-        projectCommand(rest)
       );
       return;
     case "unmanage":
