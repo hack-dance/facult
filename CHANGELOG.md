@@ -1,3 +1,9 @@
+## [2.30.0](https://github.com/hack-dance/fclt/compare/v2.29.2...v2.30.0) (2026-09-02)
+
+### Features
+
+* add hermetic project renderer and release locks ([90250d7](https://github.com/hack-dance/fclt/commit/90250d7a10c1cb12246149b8e4c9f4b673b2be24))
+
 ## [2.29.2](https://github.com/hack-dance/fclt/compare/v2.29.1...v2.29.2) (2026-07-29)
 
 ### Bug Fixes
