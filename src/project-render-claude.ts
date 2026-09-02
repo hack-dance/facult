@@ -12,6 +12,7 @@ const PORTABLE_MCP_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SECRET_VALUE_RE =
   /(?:\bsk-[A-Za-z0-9_-]{10,}|\bghp_[A-Za-z0-9]{10,}|\bgithub_pat_[A-Za-z0-9_]{10,})/;
+const CLAUDE_MODEL_ID_RE = /^claude-[a-z0-9][a-z0-9.-]*$/;
 
 const CLAUDE_AGENT_FIELDS = new Set([
   "background",
@@ -52,6 +53,36 @@ const CLAUDE_SETTINGS_FIELDS = new Set([
   "includeCoAuthoredBy",
   "permissions",
 ]);
+const CLAUDE_AGENT_MODELS = new Set([
+  "fable",
+  "haiku",
+  "inherit",
+  "opus",
+  "sonnet",
+]);
+const CLAUDE_PERMISSION_MODES = new Set([
+  "acceptEdits",
+  "auto",
+  "bypassPermissions",
+  "default",
+  "dontAsk",
+  "manual",
+  "plan",
+]);
+const CLAUDE_MEMORY_SCOPES = new Set(["local", "project", "user"]);
+const CLAUDE_EFFORT_LEVELS = new Set(["high", "low", "max", "medium", "xhigh"]);
+const CLAUDE_ISOLATION_MODES = new Set(["worktree"]);
+const CLAUDE_AGENT_COLORS = new Set([
+  "blue",
+  "cyan",
+  "green",
+  "orange",
+  "pink",
+  "purple",
+  "red",
+  "yellow",
+]);
+const CLAUDE_CACHE_TTLS = new Set(["1h", "5m"]);
 
 export type ClaudeProjectRenderProducer =
   | "claude-agent-md"
@@ -196,6 +227,115 @@ function assertNonEmptyDescription(value: unknown, label: string): void {
   }
 }
 
+function assertOptionalStringList(value: unknown, label: string): void {
+  if (value === undefined) {
+    return;
+  }
+  const values = Array.isArray(value) ? value : [value];
+  if (
+    values.length === 0 ||
+    values.some((entry) => typeof entry !== "string" || !entry.trim())
+  ) {
+    invalid(`${label} must be a non-empty string or list of strings.`);
+  }
+}
+
+function assertOptionalEnum(
+  value: unknown,
+  allowed: ReadonlySet<string>,
+  label: string
+): void {
+  if (
+    value !== undefined &&
+    (typeof value !== "string" || !allowed.has(value))
+  ) {
+    invalid(`${label} has an unsupported value.`);
+  }
+}
+
+function assertOptionalExperimental(value: unknown): void {
+  if (value === undefined) {
+    return;
+  }
+  if (!(isPlainObject(value) && hasExactKeys(value, ["cacheTtl"]))) {
+    invalid(
+      "Claude agent experimental must contain only cacheTtl set to 5m or 1h."
+    );
+  }
+  assertOptionalEnum(
+    value.cacheTtl,
+    CLAUDE_CACHE_TTLS,
+    "Claude agent experimental cacheTtl"
+  );
+}
+
+function validateClaudeAgentFrontmatter(
+  frontmatter: Record<string, unknown>
+): void {
+  assertOptionalStringList(frontmatter.tools, "Claude agent tools");
+  assertOptionalStringList(
+    frontmatter.disallowedTools,
+    "Claude agent disallowedTools"
+  );
+  assertOptionalStringList(frontmatter.skills, "Claude agent skills");
+  if (
+    frontmatter.model !== undefined &&
+    (typeof frontmatter.model !== "string" ||
+      !(
+        CLAUDE_AGENT_MODELS.has(frontmatter.model) ||
+        CLAUDE_MODEL_ID_RE.test(frontmatter.model)
+      ))
+  ) {
+    invalid("Claude agent model has an unsupported value.");
+  }
+  assertOptionalEnum(
+    frontmatter.permissionMode,
+    CLAUDE_PERMISSION_MODES,
+    "Claude agent permissionMode"
+  );
+  if (
+    frontmatter.maxTurns !== undefined &&
+    (!Number.isSafeInteger(frontmatter.maxTurns) ||
+      Number(frontmatter.maxTurns) < 1)
+  ) {
+    invalid("Claude agent maxTurns must be a positive integer.");
+  }
+  assertOptionalEnum(
+    frontmatter.memory,
+    CLAUDE_MEMORY_SCOPES,
+    "Claude agent memory"
+  );
+  if (
+    frontmatter.background !== undefined &&
+    typeof frontmatter.background !== "boolean"
+  ) {
+    invalid("Claude agent background must be a boolean.");
+  }
+  assertOptionalEnum(
+    frontmatter.effort,
+    CLAUDE_EFFORT_LEVELS,
+    "Claude agent effort"
+  );
+  assertOptionalEnum(
+    frontmatter.isolation,
+    CLAUDE_ISOLATION_MODES,
+    "Claude agent isolation"
+  );
+  assertOptionalEnum(
+    frontmatter.color,
+    CLAUDE_AGENT_COLORS,
+    "Claude agent color"
+  );
+  if (
+    frontmatter.initialPrompt !== undefined &&
+    (typeof frontmatter.initialPrompt !== "string" ||
+      !frontmatter.initialPrompt.trim())
+  ) {
+    invalid("Claude agent initialPrompt must be a non-empty string.");
+  }
+  assertOptionalExperimental(frontmatter.experimental);
+}
+
 function sortValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sortValue);
@@ -281,6 +421,7 @@ function validateClaudeAgent(text: string, destination: string): void {
     frontmatter.description,
     "Claude agent description"
   );
+  validateClaudeAgentFrontmatter(frontmatter);
   if (!body.trim()) {
     invalid("Claude agent body must not be empty.");
   }

@@ -7,6 +7,7 @@ import {
   readdir,
   readFile,
   rename,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -226,6 +227,42 @@ sources = ["AGENTS.project.md"]
     });
   });
 
+  it("rolls back a receipt-only ownership transition with unchanged target bytes", async () => {
+    const fixture = await createFixture();
+    const initial = await applyProjectRender(applyOptions(fixture));
+    await writeFile(
+      join(fixture.canonicalRoot, "AGENTS.same.md"),
+      "# Agents\n"
+    );
+    const manifestPath = join(fixture.canonicalRoot, "project-render.toml");
+    const manifest = await readFile(manifestPath, "utf8");
+    await writeFile(
+      manifestPath,
+      manifest.replace(
+        'sources = ["AGENTS.project.md"]',
+        'sources = ["AGENTS.same.md"]'
+      )
+    );
+
+    const refactor = await applyProjectRender(applyOptions(fixture));
+    expect(refactor).toMatchObject({
+      changed: true,
+      removed: 0,
+      written: 0,
+    });
+    expect(refactor.planId).not.toBe(initial.planId);
+
+    const rollback = await rollbackProjectRender(applyOptions(fixture));
+    expect(rollback).toEqual({
+      planId: initial.planId,
+      restored: 0,
+      schemaVersion: 1,
+    });
+    expect(await readFile(join(fixture.projectRoot, "AGENTS.md"), "utf8")).toBe(
+      "# Agents\n"
+    );
+  });
+
   it("preserves custom required lock policy throughout apply revalidation", async () => {
     const fixture = await createFixture();
     const artifactPath = join(fixture.projectRoot, "fclt-artifact");
@@ -432,6 +469,57 @@ sources = ["AGENTS.project.md"]
         },
       })
     ).rejects.toThrow("target parent changed before commit");
+  });
+
+  it("binds target removal to the verified parent descriptor", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const fixture = await createFixture();
+    await applyProjectRender(applyOptions(fixture));
+    await writeFile(
+      join(fixture.canonicalRoot, "project-render.toml"),
+      `schema_version = 1
+exclusive_roots = []
+
+[[targets]]
+id = "root-agents"
+tool = "codex"
+destination = "AGENTS.md"
+mode = "0644"
+producer = "copy-text"
+producer_version = 1
+sources = ["AGENTS.project.md"]
+`
+    );
+    const reviewParent = join(
+      fixture.projectRoot,
+      ".agents",
+      "skills",
+      "review"
+    );
+    const parkedParent = `${reviewParent}-parked`;
+    const outsideParent = await mkdtemp(
+      join(tmpdir(), "fclt-project-remove-outside-")
+    );
+    const outsideTarget = join(outsideParent, "SKILL.md");
+    await writeFile(outsideTarget, "# Review\n");
+
+    await expect(
+      applyProjectRender({
+        ...applyOptions(fixture),
+        hooks: {
+          beforeTargetCommit: async () => {
+            await rename(reviewParent, parkedParent);
+            await symlink(outsideParent, reviewParent, "dir");
+          },
+        },
+      })
+    ).rejects.toThrow("Bound canonical directory changed before unlink");
+    expect(await readFile(outsideTarget, "utf8")).toBe("# Review\n");
+    expect(await readFile(join(parkedParent, "SKILL.md"), "utf8")).toBe(
+      "# Review\n"
+    );
   });
 
   it("rejects concurrent mutations with a non-stale advisory lock", async () => {

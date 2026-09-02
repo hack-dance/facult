@@ -339,6 +339,41 @@ Review.
     }
   });
 
+  it("validates every supported Claude agent frontmatter value", () => {
+    for (const field of [
+      "tools: {}",
+      "disallowedTools: false",
+      "model: unknown",
+      "permissionMode: unrestricted",
+      "maxTurns: many",
+      "skills: {}",
+      "memory: shared",
+      "background: []",
+      "effort: extreme",
+      "isolation: checkout",
+      "color: ultraviolet",
+      "initialPrompt: []",
+      "experimental: []",
+    ]) {
+      expect(() =>
+        renderClaudeProjectTarget({
+          destination: ".claude/agents/reviewer.md",
+          producer: "claude-agent-md",
+          sourceTexts: [
+            `---
+name: reviewer
+description: Review changes.
+${field}
+---
+Review.
+`,
+          ],
+          tool: "claude",
+        })
+      ).toThrow(ClaudeProjectRenderDiagnosticError);
+    }
+  });
+
   it("rejects duplicate JSON fragment ownership", () => {
     expect(() =>
       renderClaudeProjectTarget({

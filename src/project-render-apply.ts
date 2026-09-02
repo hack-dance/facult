@@ -20,8 +20,14 @@ import {
   relative,
   resolve,
 } from "node:path";
-import { acquireExclusiveAdvisoryLock } from "./audit/safe-openat";
-import { readStableRegularFile } from "./deployment-plan";
+import {
+  acquireExclusiveAdvisoryLock,
+  unlinkVerifiedFileAt,
+} from "./audit/safe-openat";
+import {
+  MAX_STABLE_REGULAR_FILE_BYTES,
+  readStableRegularFile,
+} from "./deployment-plan";
 import { facultMachineStateDir } from "./paths";
 import {
   buildProjectRenderPlan,
@@ -555,15 +561,6 @@ async function atomicRemove(args: {
     path: args.path,
     projectRoot: args.projectRoot,
   });
-  await args.beforeCommit?.();
-  const currentParent = await assertSafeParent({
-    create: false,
-    path: args.path,
-    projectRoot: args.projectRoot,
-  });
-  if (currentParent.dev !== parent.dev || currentParent.ino !== parent.ino) {
-    throw new Error("Project render target parent changed before removal.");
-  }
   const current = await readSnapshot({
     path: args.path,
     projectRoot: args.projectRoot,
@@ -573,8 +570,18 @@ async function atomicRemove(args: {
       `Project render target changed before removal: ${relative(args.projectRoot, args.path).replace(/\\/g, "/")}.`
     );
   }
-  await unlink(args.path);
-  await syncDirectory(parent.path);
+  const [directoryPath, safeRoot] = await Promise.all([
+    realpath(parent.path),
+    realpath(args.projectRoot),
+  ]);
+  await unlinkVerifiedFileAt({
+    beforeCommit: args.beforeCommit,
+    directoryPath,
+    expectedSha256: args.expected.hash.slice("sha256:".length),
+    fileName: basename(args.path),
+    maxBytes: MAX_STABLE_REGULAR_FILE_BYTES,
+    safeRoot,
+  });
 }
 
 async function atomicStateWrite(path: string, value: unknown): Promise<void> {
@@ -989,11 +996,17 @@ export async function applyProjectRender(
       });
     }
     if (operations.length === 0) {
+      const reversibleOwnership =
+        receipt &&
+        stableJson(receipt.ownership.targets) ===
+          stableJson(ownershipAfter.targets)
+          ? receipt.ownership
+          : null;
       await options.hooks?.beforeReceiptCommit?.();
       await assertPlanUnchanged(options, plan.planId);
       await atomicStateWrite(paths.receipt, {
         ownership: ownershipAfter,
-        rollback: { operations: [], ownership: null },
+        rollback: { operations: [], ownership: reversibleOwnership },
         schemaVersion: RECEIPT_SCHEMA_VERSION,
       } satisfies ProjectRenderReceiptV1);
       return Object.freeze({
@@ -1107,13 +1120,26 @@ export async function rollbackProjectRender(
         before: operation.after,
         path: operation.path,
       }));
-    if (operations.length === 0) {
+    if (operations.length === 0 && !receipt.rollback.ownership) {
       throw new Error(
         "Project render receipt does not contain a rollback transition."
       );
     }
     const ownershipAfter =
       receipt.rollback.ownership ?? emptyOwnership(identity);
+    if (operations.length === 0) {
+      await options.hooks?.beforeReceiptCommit?.();
+      await atomicStateWrite(paths.receipt, {
+        ownership: ownershipAfter,
+        rollback: { operations: [], ownership: receipt.ownership },
+        schemaVersion: RECEIPT_SCHEMA_VERSION,
+      } satisfies ProjectRenderReceiptV1);
+      return Object.freeze({
+        planId: ownershipAfter.planId,
+        restored: 0,
+        schemaVersion: RESULT_SCHEMA_VERSION,
+      });
+    }
     const transactionBody = {
       operations,
       ownershipAfter,
