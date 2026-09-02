@@ -17,9 +17,11 @@ import {
   openSync,
   readSync,
   realpathSync,
+  renameSync,
   type Stats,
+  unlinkSync,
 } from "node:fs";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 const DIRECTORY_ENTRY_TYPES = {
   blockDevice: 6,
@@ -532,6 +534,1138 @@ export function openReadOnlyAt(args: {
     }
     return fd;
   } finally {
+    libc.close();
+  }
+}
+
+interface VerifiedFileUnlinkOptions {
+  /** @internal Adversarial test hook; production callers must not set this. */
+  afterQuarantine?: () => Promise<void>;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  beforeCommit?: () => Promise<void>;
+  directoryPath: string;
+  expectedSha256: string;
+  fileName: string;
+  maxBytes: number;
+  /** @internal Platform branch override for cross-platform regression tests. */
+  platform?: NodeJS.Platform;
+  safeRoot?: string;
+}
+
+interface VerifiedFileReplaceOptions {
+  /** @internal Adversarial test hook; production callers must not set this. */
+  beforeCommit?: () => Promise<void>;
+  /** @internal Adversarial test hook; production callers must not set this. */
+  beforeExchange?: () => Promise<void>;
+  contents: string;
+  directoryPath: string;
+  expected: {
+    contents: string;
+    identity?: {
+      dev: number;
+      ino: number;
+    };
+    mode: number;
+  } | null;
+  fileName: string;
+  maxBytes: number;
+  mode: number;
+  /** @internal Platform branch override for cross-platform regression tests. */
+  platform?: NodeJS.Platform;
+  safeRoot?: string;
+}
+
+interface PathBoundFileSnapshot {
+  metadata: Stats;
+  sha256: string;
+}
+
+interface BoundSafeRoot {
+  metadata: Stats;
+  path: string;
+  platform: NodeJS.Platform;
+}
+
+function lstatIfPresent(pathValue: string): Stats | null {
+  try {
+    return lstatSync(pathValue);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function pathBoundFileSnapshot(args: {
+  label: string;
+  maxBytes: number;
+  path: string;
+}): PathBoundFileSnapshot {
+  const pathMetadata = lstatSync(args.path);
+  if (
+    pathMetadata.isSymbolicLink() ||
+    !pathMetadata.isFile() ||
+    pathMetadata.nlink !== 1 ||
+    !Number.isSafeInteger(pathMetadata.size) ||
+    pathMetadata.size < 0 ||
+    pathMetadata.size > args.maxBytes
+  ) {
+    throw new Error(`${args.label} is unsafe`);
+  }
+  const fd = openSync(
+    args.path,
+    constants.O_RDONLY + (constants.O_NOFOLLOW ?? 0)
+  );
+  try {
+    const before = fstatSync(fd);
+    if (!sameObjectIdentity(pathMetadata, before)) {
+      throw new Error(`${args.label} mapping changed before read`);
+    }
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (count <= 0) {
+        throw new Error(`${args.label} changed while reading`);
+      }
+      offset += count;
+    }
+    const after = fstatSync(fd);
+    const rebound = lstatSync(args.path);
+    if (
+      !sameFileIdentity(before, after) ||
+      rebound.isSymbolicLink() ||
+      !sameObjectIdentity(rebound, after)
+    ) {
+      throw new Error(`${args.label} changed while reading`);
+    }
+    return {
+      metadata: before,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function windowsPathKey(pathValue: string): string {
+  return normalize(pathValue).toLowerCase();
+}
+
+function platformPathKey(pathValue: string, platform: NodeJS.Platform): string {
+  return platform === "win32"
+    ? windowsPathKey(pathValue)
+    : normalize(pathValue);
+}
+
+function captureSafeRootBoundary(args: {
+  directoryPath: string;
+  platform: NodeJS.Platform;
+  safeRoot?: string;
+}): BoundSafeRoot | null {
+  if (!args.safeRoot) {
+    return null;
+  }
+  const safeRoot = resolve(args.safeRoot);
+  if (
+    !isAbsolute(args.safeRoot) ||
+    normalize(args.safeRoot) !== args.safeRoot
+  ) {
+    throw new Error("Verified canonical unlink safe root is unsupported");
+  }
+  const rel = relative(safeRoot, args.directoryPath);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error("Verified canonical unlink escapes its safe root");
+  }
+  const metadata = lstatSync(safeRoot);
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isDirectory() ||
+    platformPathKey(realpathSync(safeRoot), args.platform) !==
+      platformPathKey(safeRoot, args.platform)
+  ) {
+    throw new Error("Verified canonical unlink safe root is unsafe");
+  }
+  return {
+    metadata,
+    path: safeRoot,
+    platform: args.platform,
+  };
+}
+
+function assertSafeRootBoundary(
+  boundary: BoundSafeRoot | null,
+  directoryPath: string
+): void {
+  if (!boundary) {
+    return;
+  }
+  const current = lstatSync(boundary.path);
+  const rel = relative(boundary.path, directoryPath);
+  if (
+    current.isSymbolicLink() ||
+    !current.isDirectory() ||
+    !sameObjectIdentity(current, boundary.metadata) ||
+    platformPathKey(realpathSync(boundary.path), boundary.platform) !==
+      platformPathKey(boundary.path, boundary.platform) ||
+    rel === ".." ||
+    rel.startsWith(`..${sep}`) ||
+    isAbsolute(rel)
+  ) {
+    throw new Error("Verified canonical unlink safe root changed");
+  }
+}
+
+async function unlinkVerifiedFileOnWindows(
+  args: VerifiedFileUnlinkOptions,
+  safeRootBoundary: BoundSafeRoot | null
+): Promise<void> {
+  const targetPath = join(args.directoryPath, args.fileName);
+  const quarantinePath = join(
+    args.directoryPath,
+    `.${args.fileName}.${randomUUID()}.rollback`
+  );
+  const directoryIdentity = lstatSync(args.directoryPath);
+  let quarantineActive = false;
+  const assertDirectoryMapping = (): void => {
+    assertSafeRootBoundary(safeRootBoundary, args.directoryPath);
+    const current = lstatSync(args.directoryPath);
+    if (
+      directoryIdentity.isSymbolicLink() ||
+      !directoryIdentity.isDirectory() ||
+      current.isSymbolicLink() ||
+      !sameObjectIdentity(current, directoryIdentity) ||
+      windowsPathKey(realpathSync(args.directoryPath)) !==
+        windowsPathKey(args.directoryPath)
+    ) {
+      throw new Error("Bound canonical directory changed before unlink");
+    }
+  };
+  const verifyExpected = (
+    snapshot: PathBoundFileSnapshot,
+    expectedMetadata?: Stats
+  ): void => {
+    if (
+      snapshot.sha256 !== args.expectedSha256 ||
+      (expectedMetadata &&
+        !sameObjectIdentity(snapshot.metadata, expectedMetadata))
+    ) {
+      throw new Error(
+        "Bound canonical file no longer matches its rollback receipt"
+      );
+    }
+  };
+  const renameWithoutOverwrite = (
+    source: string,
+    destination: string
+  ): void => {
+    if (lstatIfPresent(destination)) {
+      throw new Error("Canonical quarantine destination appeared");
+    }
+    renameSync(source, destination);
+  };
+  const compensateQuarantine = (quarantinedMetadata: Stats): void => {
+    const canonicalMetadata = lstatIfPresent(targetPath);
+    let preservedPath: string | null = null;
+    if (canonicalMetadata) {
+      preservedPath = join(
+        args.directoryPath,
+        `.${args.fileName}.${randomUUID()}.preserved`
+      );
+      renameWithoutOverwrite(targetPath, preservedPath);
+    }
+    try {
+      renameWithoutOverwrite(quarantinePath, targetPath);
+    } catch (error) {
+      if (
+        preservedPath &&
+        !lstatIfPresent(targetPath) &&
+        lstatIfPresent(preservedPath)
+      ) {
+        renameWithoutOverwrite(preservedPath, targetPath);
+      }
+      throw error;
+    }
+    const restored = pathBoundFileSnapshot({
+      label: "Compensated canonical file",
+      maxBytes: args.maxBytes,
+      path: targetPath,
+    });
+    if (!sameObjectIdentity(restored.metadata, quarantinedMetadata)) {
+      throw new Error("Canonical quarantine compensation changed identity");
+    }
+    if (canonicalMetadata && preservedPath) {
+      const preserved = pathBoundFileSnapshot({
+        label: "Reappeared canonical file",
+        maxBytes: args.maxBytes,
+        path: preservedPath,
+      });
+      if (!sameObjectIdentity(preserved.metadata, canonicalMetadata)) {
+        throw new Error(
+          "Reappeared canonical file changed during compensation"
+        );
+      }
+    }
+    quarantineActive = false;
+  };
+
+  try {
+    assertDirectoryMapping();
+    const initial = pathBoundFileSnapshot({
+      label: "Bound canonical file",
+      maxBytes: args.maxBytes,
+      path: targetPath,
+    });
+    verifyExpected(initial);
+    const current = pathBoundFileSnapshot({
+      label: "Bound canonical file",
+      maxBytes: args.maxBytes,
+      path: targetPath,
+    });
+    verifyExpected(current, initial.metadata);
+    await args.beforeCommit?.();
+    assertDirectoryMapping();
+    renameWithoutOverwrite(targetPath, quarantinePath);
+    quarantineActive = true;
+    const quarantined = pathBoundFileSnapshot({
+      label: "Quarantined canonical file",
+      maxBytes: args.maxBytes,
+      path: quarantinePath,
+    });
+    try {
+      verifyExpected(quarantined, current.metadata);
+    } catch (error) {
+      compensateQuarantine(quarantined.metadata);
+      throw new Error("Canonical target changed at quarantine boundary", {
+        cause: error,
+      });
+    }
+    await args.afterQuarantine?.();
+    if (lstatIfPresent(targetPath)) {
+      compensateQuarantine(quarantined.metadata);
+      throw new Error("Canonical target reappeared during path-bound removal");
+    }
+    assertDirectoryMapping();
+    const finalQuarantine = pathBoundFileSnapshot({
+      label: "Quarantined canonical file",
+      maxBytes: args.maxBytes,
+      path: quarantinePath,
+    });
+    verifyExpected(finalQuarantine, current.metadata);
+    unlinkSync(quarantinePath);
+    quarantineActive = false;
+  } catch (error) {
+    if (quarantineActive) {
+      try {
+        const quarantined = pathBoundFileSnapshot({
+          label: "Quarantined canonical file",
+          maxBytes: args.maxBytes,
+          path: quarantinePath,
+        });
+        compensateQuarantine(quarantined.metadata);
+      } catch (compensationError) {
+        throw new AggregateError(
+          [error, compensationError],
+          "Canonical quarantine removal failed and compensation was incomplete"
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+export async function unlinkVerifiedFileAt(
+  args: VerifiedFileUnlinkOptions
+): Promise<void> {
+  const platform = args.platform ?? process.platform;
+  if (
+    !isAbsolute(args.directoryPath) ||
+    normalize(args.directoryPath) !== args.directoryPath ||
+    !args.fileName ||
+    args.fileName === "." ||
+    args.fileName === ".." ||
+    args.fileName.includes("/") ||
+    args.fileName.includes("\\")
+  ) {
+    throw new Error("Verified canonical unlink is unsupported");
+  }
+  const safeRootBoundary = captureSafeRootBoundary({
+    directoryPath: args.directoryPath,
+    platform,
+    safeRoot: args.safeRoot,
+  });
+  if (platform === "win32") {
+    await unlinkVerifiedFileOnWindows(args, safeRootBoundary);
+    return;
+  }
+  if (!auditReportPersistenceSupported(platform)) {
+    throw new Error("Descriptor-relative verified unlink is unsupported");
+  }
+  const configuration = platformConfiguration();
+  const definitions: Record<string, FFIFunction> = {
+    fsync: { args: [FFIType.i32], returns: FFIType.i32 },
+    openat: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    unlinkat: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32],
+      returns: FFIType.i32,
+    },
+  };
+  if (process.platform === "darwin") {
+    definitions.renameatx_np = {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+      returns: FFIType.i32,
+    };
+    definitions.__error = { args: [], returns: FFIType.ptr };
+  } else {
+    definitions.renameat2 = {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+      returns: FFIType.i32,
+    };
+    definitions.__errno_location = { args: [], returns: FFIType.ptr };
+  }
+  const libc = openSystemLibc(configuration, definitions);
+  const symbols = libc.symbols as unknown as PrivateFileMutationSymbols;
+  const errnoPointer =
+    process.platform === "darwin"
+      ? symbols.__error!()
+      : symbols.__errno_location!();
+  const errno = new DataView(toArrayBuffer(errnoPointer!, 0, 4));
+  const directoryFlags =
+    constants.O_RDONLY +
+    (constants.O_DIRECTORY ?? 0) +
+    (constants.O_NOFOLLOW ?? 0) +
+    (constants.O_NONBLOCK ?? 0) +
+    ((constants as typeof constants & { O_CLOEXEC?: number }).O_CLOEXEC ?? 0);
+  const name = Buffer.from(`${args.fileName}\0`);
+  const quarantineName = Buffer.from(
+    `.${args.fileName}.${randomUUID()}.rollback\0`
+  );
+  let directoryFd = -1;
+  let fileFd = -1;
+  let quarantineActive = false;
+  const assertDirectoryMapping = (expected: Stats): void => {
+    assertSafeRootBoundary(safeRootBoundary, args.directoryPath);
+    const descriptorMetadata = fstatSync(directoryFd);
+    const pathMetadata = lstatSync(args.directoryPath);
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isDirectory() ||
+      !sameObjectIdentity(descriptorMetadata, expected) ||
+      !sameObjectIdentity(pathMetadata, expected) ||
+      realpathSync(args.directoryPath) !== args.directoryPath
+    ) {
+      throw new Error("Bound canonical directory changed before unlink");
+    }
+  };
+  const openExisting = (entryName: Buffer): number | null => {
+    errno.setInt32(0, 0, true);
+    const fd = symbols.openat(
+      directoryFd,
+      ptr(entryName),
+      safeExistingOpenFlags(),
+      0
+    );
+    if (fd >= 0) {
+      return fd;
+    }
+    if (errno.getInt32(0, true) === 2) {
+      return null;
+    }
+    throw new Error("Descriptor-relative canonical open failed closed");
+  };
+  const readSnapshot = (
+    entryName: Buffer,
+    label: string
+  ): { fd: number; metadata: Stats; sha256: string } => {
+    const fd = openExisting(entryName);
+    if (fd === null) {
+      throw new Error(`${label} disappeared`);
+    }
+    try {
+      const before = fstatSync(fd);
+      if (
+        !before.isFile() ||
+        before.nlink !== 1 ||
+        !Number.isSafeInteger(before.size) ||
+        before.size < 0 ||
+        before.size > args.maxBytes
+      ) {
+        throw new Error(`${label} is unsafe`);
+      }
+      const bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(
+          fd,
+          bytes,
+          offset,
+          bytes.length - offset,
+          offset
+        );
+        if (count <= 0) {
+          throw new Error(`${label} changed while reading`);
+        }
+        offset += count;
+      }
+      const after = fstatSync(fd);
+      if (!sameFileIdentity(before, after)) {
+        throw new Error(`${label} changed while reading`);
+      }
+      return {
+        fd,
+        metadata: before,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
+  };
+  const verifyExpected = (
+    snapshot: { metadata: Stats; sha256: string },
+    expectedMetadata?: Stats
+  ): void => {
+    if (
+      snapshot.sha256 !== args.expectedSha256 ||
+      (expectedMetadata &&
+        !sameObjectIdentity(snapshot.metadata, expectedMetadata))
+    ) {
+      throw new Error(
+        "Bound canonical file no longer matches its rollback receipt"
+      );
+    }
+  };
+  const renameNoReplace = (source: Buffer, destination: Buffer): void => {
+    const result =
+      process.platform === "darwin"
+        ? symbols.renameatx_np!(
+            directoryFd,
+            ptr(source),
+            directoryFd,
+            ptr(destination),
+            4
+          )
+        : symbols.renameat2!(
+            directoryFd,
+            ptr(source),
+            directoryFd,
+            ptr(destination),
+            1
+          );
+    if (result !== 0) {
+      throw new Error("Canonical quarantine rename failed closed");
+    }
+  };
+  const exchange = (left: Buffer, right: Buffer): void => {
+    const result =
+      process.platform === "darwin"
+        ? symbols.renameatx_np!(
+            directoryFd,
+            ptr(left),
+            directoryFd,
+            ptr(right),
+            2
+          )
+        : symbols.renameat2!(
+            directoryFd,
+            ptr(left),
+            directoryFd,
+            ptr(right),
+            2
+          );
+    if (result !== 0) {
+      throw new Error("Canonical quarantine compensation failed closed");
+    }
+  };
+  const compensateQuarantine = (quarantinedMetadata: Stats): void => {
+    const canonicalFd = openExisting(name);
+    if (canonicalFd === null) {
+      renameNoReplace(quarantineName, name);
+    } else {
+      const canonicalMetadata = fstatSync(canonicalFd);
+      closeSync(canonicalFd);
+      exchange(quarantineName, name);
+      const preserved = readSnapshot(
+        quarantineName,
+        "Reappeared canonical file"
+      );
+      try {
+        if (!sameObjectIdentity(preserved.metadata, canonicalMetadata)) {
+          throw new Error(
+            "Reappeared canonical file changed during compensation"
+          );
+        }
+      } finally {
+        closeSync(preserved.fd);
+      }
+    }
+    const restored = readSnapshot(name, "Compensated canonical file");
+    try {
+      if (!sameObjectIdentity(restored.metadata, quarantinedMetadata)) {
+        throw new Error("Canonical quarantine compensation changed identity");
+      }
+    } finally {
+      closeSync(restored.fd);
+    }
+    quarantineActive = false;
+    symbols.fsync(directoryFd);
+  };
+
+  try {
+    directoryFd = openSync(args.directoryPath, directoryFlags);
+    const directoryIdentity = fstatSync(directoryFd);
+    assertDirectoryMapping(directoryIdentity);
+    const initial = readSnapshot(name, "Bound canonical file");
+    verifyExpected(initial);
+    closeSync(initial.fd);
+
+    assertDirectoryMapping(directoryIdentity);
+    const current = readSnapshot(name, "Bound canonical file");
+    verifyExpected(current, initial.metadata);
+    fileFd = current.fd;
+    await args.beforeCommit?.();
+    assertDirectoryMapping(directoryIdentity);
+
+    renameNoReplace(name, quarantineName);
+    quarantineActive = true;
+    const quarantined = readSnapshot(
+      quarantineName,
+      "Quarantined canonical file"
+    );
+    try {
+      verifyExpected(quarantined, current.metadata);
+    } catch (error) {
+      closeSync(quarantined.fd);
+      compensateQuarantine(quarantined.metadata);
+      throw new Error("Canonical target changed at quarantine boundary", {
+        cause: error,
+      });
+    }
+    closeSync(quarantined.fd);
+    await args.afterQuarantine?.();
+    const reappearedFd = openExisting(name);
+    if (reappearedFd !== null) {
+      closeSync(reappearedFd);
+      compensateQuarantine(quarantined.metadata);
+      throw new Error(
+        "Canonical target reappeared during descriptor-relative removal"
+      );
+    }
+    assertDirectoryMapping(directoryIdentity);
+    const finalQuarantine = readSnapshot(
+      quarantineName,
+      "Quarantined canonical file"
+    );
+    try {
+      verifyExpected(finalQuarantine, current.metadata);
+    } finally {
+      closeSync(finalQuarantine.fd);
+    }
+    if (symbols.unlinkat(directoryFd, ptr(quarantineName), 0) !== 0) {
+      throw new Error("Descriptor-relative quarantine unlink failed closed");
+    }
+    quarantineActive = false;
+    symbols.fsync(directoryFd);
+  } catch (error) {
+    if (quarantineActive) {
+      try {
+        const quarantined = readSnapshot(
+          quarantineName,
+          "Quarantined canonical file"
+        );
+        closeSync(quarantined.fd);
+        compensateQuarantine(quarantined.metadata);
+      } catch (compensationError) {
+        throw new AggregateError(
+          [error, compensationError],
+          "Canonical quarantine removal failed and compensation was incomplete"
+        );
+      }
+    }
+    throw error;
+  } finally {
+    if (fileFd >= 0) {
+      closeSync(fileFd);
+    }
+    if (directoryFd >= 0) {
+      closeSync(directoryFd);
+    }
+    libc.close();
+  }
+}
+
+function replaceVerifiedFileOnWindows(
+  args: VerifiedFileReplaceOptions,
+  safeRootBoundary: BoundSafeRoot | null
+): void {
+  const targetPath = join(args.directoryPath, args.fileName);
+  const directoryIdentity = lstatSync(args.directoryPath);
+  const existing = lstatIfPresent(targetPath);
+  const assertDirectoryMapping = (): void => {
+    assertSafeRootBoundary(safeRootBoundary, args.directoryPath);
+    const current = lstatSync(args.directoryPath);
+    if (
+      directoryIdentity.isSymbolicLink() ||
+      !directoryIdentity.isDirectory() ||
+      current.isSymbolicLink() ||
+      !sameObjectIdentity(current, directoryIdentity) ||
+      windowsPathKey(realpathSync(args.directoryPath)) !==
+        windowsPathKey(args.directoryPath)
+    ) {
+      throw new Error(
+        "Bound canonical directory changed before conditional replace"
+      );
+    }
+  };
+
+  assertDirectoryMapping();
+  if (existing === null) {
+    if (args.expected !== null) {
+      throw new Error("Bound canonical file disappeared before commit");
+    }
+    throw new Error("Verified canonical creation is unsupported on win32");
+  }
+  if (args.expected === null) {
+    throw new Error("Canonical target appeared before the no-replace commit");
+  }
+  const snapshot = pathBoundFileSnapshot({
+    label: "Bound canonical file",
+    maxBytes: args.maxBytes,
+    path: targetPath,
+  });
+  const expectedIdentity = args.expected.identity;
+  if (
+    snapshot.sha256 !==
+      createHash("sha256").update(args.expected.contents).digest("hex") ||
+    permissionBits(snapshot.metadata.mode) !== args.expected.mode ||
+    (expectedIdentity &&
+      (snapshot.metadata.dev !== expectedIdentity.dev ||
+        snapshot.metadata.ino !== expectedIdentity.ino))
+  ) {
+    throw new Error("Bound canonical file changed before commit");
+  }
+  if (
+    args.contents === args.expected.contents &&
+    args.mode === args.expected.mode
+  ) {
+    return;
+  }
+  throw new Error(
+    "Verified replacement of an existing canonical file is unsupported on win32"
+  );
+}
+
+export async function replaceVerifiedFileAt(
+  args: VerifiedFileReplaceOptions
+): Promise<void> {
+  const platform = args.platform ?? process.platform;
+  if (
+    !isAbsolute(args.directoryPath) ||
+    normalize(args.directoryPath) !== args.directoryPath ||
+    !args.fileName ||
+    args.fileName === "." ||
+    args.fileName === ".." ||
+    args.fileName.includes("/") ||
+    args.fileName.includes("\\") ||
+    !Number.isSafeInteger(args.maxBytes) ||
+    args.maxBytes < 0 ||
+    !Number.isSafeInteger(args.mode) ||
+    args.mode < 0 ||
+    args.mode > 0o777 ||
+    (args.expected !== null &&
+      (!Number.isSafeInteger(args.expected.mode) ||
+        args.expected.mode < 0 ||
+        args.expected.mode > 0o777)) ||
+    (args.expected?.identity !== undefined &&
+      (!Number.isSafeInteger(args.expected.identity.dev) ||
+        args.expected.identity.dev < 0 ||
+        !Number.isSafeInteger(args.expected.identity.ino) ||
+        args.expected.identity.ino < 0))
+  ) {
+    throw new Error("Verified canonical replacement is unsupported");
+  }
+  const safeRootBoundary = captureSafeRootBoundary({
+    directoryPath: args.directoryPath,
+    platform,
+    safeRoot: args.safeRoot,
+  });
+  if (platform === "win32") {
+    replaceVerifiedFileOnWindows(args, safeRootBoundary);
+    return;
+  }
+  if (
+    platform !== process.platform ||
+    !auditReportPersistenceSupported(platform)
+  ) {
+    throw new Error(
+      `Descriptor-relative canonical replacement is unsupported on ${platform}`
+    );
+  }
+
+  const configuration = platformConfiguration();
+  const definitions: Record<string, FFIFunction> = {
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+    fchmod: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    fsync: { args: [FFIType.i32], returns: FFIType.i32 },
+    linkat: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    openat: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    read: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.u64],
+      returns: FFIType.i64,
+    },
+    unlinkat: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    write: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.u64],
+      returns: FFIType.i64,
+    },
+  };
+  if (process.platform === "darwin") {
+    definitions.renameatx_np = {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+      returns: FFIType.i32,
+    };
+    definitions.__error = { args: [], returns: FFIType.ptr };
+  } else {
+    definitions.renameat2 = {
+      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+      returns: FFIType.i32,
+    };
+    definitions.__errno_location = { args: [], returns: FFIType.ptr };
+  }
+  const libc = openSystemLibc(configuration, definitions);
+  const symbols = libc.symbols as unknown as PrivateFileMutationSymbols;
+  const errnoPointer =
+    process.platform === "darwin"
+      ? symbols.__error!()
+      : symbols.__errno_location!();
+  const errno = new DataView(toArrayBuffer(errnoPointer!, 0, 4));
+  const directoryFlags =
+    constants.O_RDONLY +
+    (constants.O_DIRECTORY ?? 0) +
+    (constants.O_NOFOLLOW ?? 0) +
+    (constants.O_NONBLOCK ?? 0) +
+    ((constants as typeof constants & { O_CLOEXEC?: number }).O_CLOEXEC ?? 0);
+  const targetName = Buffer.from(`${args.fileName}\0`);
+  const temporaryName = Buffer.from(`.${args.fileName}.${randomUUID()}.tmp\0`);
+  let directoryFd = -1;
+  let existingFd = -1;
+  let temporaryFd = -1;
+  let preserveTemporary = false;
+
+  const openExisting = (name: Buffer): number | null => {
+    errno.setInt32(0, 0, true);
+    const descriptor = symbols.openat(
+      directoryFd,
+      ptr(name),
+      safeExistingOpenFlags(),
+      0
+    );
+    if (descriptor >= 0) {
+      return descriptor;
+    }
+    if (errno.getInt32(0, true) === 2) {
+      return null;
+    }
+    throw new Error("Descriptor-relative canonical open failed closed");
+  };
+  const readSnapshot = (
+    name: Buffer,
+    label: string
+  ): { contents: Buffer; descriptor: number; metadata: Stats } | null => {
+    const descriptor = openExisting(name);
+    if (descriptor === null) {
+      return null;
+    }
+    try {
+      const before = fstatSync(descriptor);
+      if (
+        !before.isFile() ||
+        before.nlink !== 1 ||
+        !Number.isSafeInteger(before.size) ||
+        before.size < 0 ||
+        before.size > args.maxBytes
+      ) {
+        throw new Error(`${label} is unsafe`);
+      }
+      const bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(
+          descriptor,
+          bytes,
+          offset,
+          bytes.length - offset,
+          offset
+        );
+        if (count <= 0) {
+          throw new Error(`${label} changed while reading`);
+        }
+        offset += count;
+      }
+      const after = fstatSync(descriptor);
+      if (!sameFileIdentity(before, after)) {
+        throw new Error(`${label} changed while reading`);
+      }
+      return {
+        contents: bytes,
+        descriptor,
+        metadata: before,
+      };
+    } catch (error) {
+      symbols.close(descriptor);
+      throw error;
+    }
+  };
+  const assertDirectoryMapping = (expected: Stats): void => {
+    assertSafeRootBoundary(safeRootBoundary, args.directoryPath);
+    const descriptorMetadata = fstatSync(directoryFd);
+    const pathMetadata = lstatSync(args.directoryPath);
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isDirectory() ||
+      !sameObjectIdentity(descriptorMetadata, expected) ||
+      !sameObjectIdentity(pathMetadata, expected) ||
+      realpathSync(args.directoryPath) !== args.directoryPath
+    ) {
+      throw new Error(
+        "Bound canonical directory changed before conditional replace"
+      );
+    }
+  };
+  const exchange = (): void => {
+    const result =
+      process.platform === "darwin"
+        ? symbols.renameatx_np!(
+            directoryFd,
+            ptr(temporaryName),
+            directoryFd,
+            ptr(targetName),
+            2
+          )
+        : symbols.renameat2!(
+            directoryFd,
+            ptr(temporaryName),
+            directoryFd,
+            ptr(targetName),
+            2
+          );
+    if (result !== 0) {
+      throw new Error("Canonical conditional exchange failed closed");
+    }
+  };
+
+  try {
+    directoryFd = openSync(args.directoryPath, directoryFlags);
+    const directoryIdentity = fstatSync(directoryFd);
+    assertDirectoryMapping(directoryIdentity);
+    const existing = readSnapshot(targetName, "Bound canonical file");
+    existingFd = existing?.descriptor ?? -1;
+    const bytes = Buffer.from(args.contents);
+    const expectedBytes =
+      args.expected === null ? null : Buffer.from(args.expected.contents);
+    if (bytes.byteLength > args.maxBytes) {
+      throw new Error("Verified canonical replacement exceeds its byte limit");
+    }
+    if (expectedBytes && expectedBytes.byteLength > args.maxBytes) {
+      throw new Error("Verified canonical expectation exceeds its byte limit");
+    }
+    if (existing === null && args.expected !== null) {
+      throw new Error("Bound canonical file disappeared before commit");
+    }
+    if (existing !== null && args.expected === null) {
+      throw new Error("Canonical target appeared before the no-replace commit");
+    }
+    if (existing && args.expected) {
+      const expectedIdentity = args.expected.identity;
+      if (
+        !existing.contents.equals(expectedBytes!) ||
+        permissionBits(existing.metadata.mode) !== args.expected.mode ||
+        (expectedIdentity &&
+          (existing.metadata.dev !== expectedIdentity.dev ||
+            existing.metadata.ino !== expectedIdentity.ino))
+      ) {
+        throw new Error("Bound canonical file changed before commit");
+      }
+      if (bytes.equals(existing.contents) && args.mode === args.expected.mode) {
+        return;
+      }
+    }
+    temporaryFd = symbols.openat(
+      directoryFd,
+      ptr(temporaryName),
+      configuration.createExclusive,
+      args.mode
+    );
+    if (temporaryFd < 0 || symbols.fchmod(temporaryFd, args.mode) !== 0) {
+      throw new Error("Descriptor-relative canonical staging failed closed");
+    }
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = Number(
+        symbols.write(temporaryFd, ptr(bytes, offset), bytes.length - offset)
+      );
+      if (count <= 0) {
+        throw new Error("Could not stage verified canonical replacement");
+      }
+      offset += count;
+    }
+    if (symbols.fsync(temporaryFd) !== 0) {
+      throw new Error("Could not sync verified canonical replacement");
+    }
+    const temporaryMetadata = fstatSync(temporaryFd);
+    if (
+      !temporaryMetadata.isFile() ||
+      temporaryMetadata.nlink !== 1 ||
+      temporaryMetadata.size !== bytes.byteLength ||
+      permissionBits(temporaryMetadata.mode) !== args.mode
+    ) {
+      throw new Error("Verified canonical temporary file is unsafe");
+    }
+
+    await args.beforeCommit?.();
+    assertDirectoryMapping(directoryIdentity);
+    if (existing === null) {
+      await args.beforeExchange?.();
+      assertDirectoryMapping(directoryIdentity);
+      if (
+        symbols.linkat(
+          directoryFd,
+          ptr(temporaryName),
+          directoryFd,
+          ptr(targetName),
+          0
+        ) !== 0
+      ) {
+        throw new Error(
+          "Canonical target appeared at the no-replace commit boundary"
+        );
+      }
+      const committedFd = openExisting(targetName);
+      if (committedFd === null) {
+        throw new Error(
+          "Canonical target disappeared at the no-replace commit boundary"
+        );
+      }
+      const committedMetadata = fstatSync(committedFd);
+      symbols.close(committedFd);
+      if (!sameObjectIdentity(temporaryMetadata, committedMetadata)) {
+        throw new Error(
+          "Canonical target changed at the no-replace commit boundary"
+        );
+      }
+      try {
+        assertDirectoryMapping(directoryIdentity);
+      } catch (error) {
+        const reboundFd = openExisting(targetName);
+        if (reboundFd !== null) {
+          const reboundMetadata = fstatSync(reboundFd);
+          symbols.close(reboundFd);
+          if (sameObjectIdentity(temporaryMetadata, reboundMetadata)) {
+            symbols.unlinkat(directoryFd, ptr(targetName), 0);
+          }
+        }
+        throw error;
+      }
+      symbols.unlinkat(directoryFd, ptr(temporaryName), 0);
+      symbols.fsync(directoryFd);
+      return;
+    }
+    if (!sameFileIdentity(existing.metadata, fstatSync(existingFd))) {
+      throw new Error("Bound canonical file changed before exchange");
+    }
+
+    await args.beforeExchange?.();
+    assertDirectoryMapping(directoryIdentity);
+    exchange();
+    const displaced = readSnapshot(temporaryName, "Displaced canonical file");
+    const displacedMatches =
+      displaced !== null &&
+      sameObjectIdentity(existing.metadata, displaced.metadata) &&
+      existing.metadata.mode === displaced.metadata.mode &&
+      existing.contents.equals(displaced.contents);
+    if (!displacedMatches) {
+      const stagedCurrent = readSnapshot(targetName, "Staged canonical file");
+      const currentTemporaryMetadata = fstatSync(temporaryFd);
+      const canCompensate =
+        displaced !== null &&
+        stagedCurrent !== null &&
+        sameObjectIdentity(currentTemporaryMetadata, stagedCurrent.metadata) &&
+        currentTemporaryMetadata.mode === stagedCurrent.metadata.mode &&
+        stagedCurrent.contents.equals(bytes);
+      if (stagedCurrent) {
+        symbols.close(stagedCurrent.descriptor);
+      }
+      if (displaced) {
+        symbols.close(displaced.descriptor);
+      }
+      if (!canCompensate) {
+        preserveTemporary = true;
+        throw new Error(
+          "Canonical target changed at the conditional commit boundary; displaced data was preserved"
+        );
+      }
+      exchange();
+      throw new Error(
+        "Canonical target changed at the conditional commit boundary"
+      );
+    }
+    try {
+      assertDirectoryMapping(directoryIdentity);
+    } catch (error) {
+      symbols.close(displaced.descriptor);
+      const stagedCurrent = readSnapshot(targetName, "Staged canonical file");
+      const currentTemporaryMetadata = fstatSync(temporaryFd);
+      const canCompensate =
+        stagedCurrent !== null &&
+        sameObjectIdentity(currentTemporaryMetadata, stagedCurrent.metadata) &&
+        currentTemporaryMetadata.mode === stagedCurrent.metadata.mode &&
+        stagedCurrent.contents.equals(bytes);
+      if (stagedCurrent) {
+        symbols.close(stagedCurrent.descriptor);
+      }
+      if (!canCompensate) {
+        preserveTemporary = true;
+        throw new AggregateError(
+          [error],
+          "Canonical parent changed at the conditional commit boundary; displaced data was preserved"
+        );
+      }
+      exchange();
+      throw error;
+    }
+    symbols.close(displaced.descriptor);
+
+    // The exchange is the conditional commit point. Once the displaced file
+    // is proven to be the captured target, later edits to the new canonical
+    // inode are post-commit user activity and must not trigger compensation.
+    symbols.unlinkat(directoryFd, ptr(temporaryName), 0);
+    symbols.fsync(directoryFd);
+  } finally {
+    if (existingFd >= 0) {
+      symbols.close(existingFd);
+    }
+    if (temporaryFd >= 0) {
+      symbols.close(temporaryFd);
+    }
+    if (directoryFd >= 0 && !preserveTemporary) {
+      symbols.unlinkat(directoryFd, ptr(temporaryName), 0);
+    }
+    if (directoryFd >= 0) {
+      closeSync(directoryFd);
+    }
     libc.close();
   }
 }

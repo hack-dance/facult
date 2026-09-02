@@ -1,3 +1,33 @@
+## [2.29.2](https://github.com/hack-dance/fclt/compare/v2.29.1...v2.29.2) (2026-07-29)
+
+### Bug Fixes
+
+* block active destination state writers ([4a079e5](https://github.com/hack-dance/fclt/commit/4a079e51261431e38363740bca3147dd18ecf8c5))
+* close reconciliation authority gaps ([5b90056](https://github.com/hack-dance/fclt/commit/5b9005621de9c0f5eb0fab617a59d6d93ef44fe7))
+* close reconciliation migration races ([33e6b53](https://github.com/hack-dance/fclt/commit/33e6b5383ff7828406ee26884debf65020653625))
+* harden reconciliation recovery state ([654c705](https://github.com/hack-dance/fclt/commit/654c705db2292770ee6ebd6f7e4a94d01eb7fe3d))
+* invalidate stale reconciliation proof ([c7d9464](https://github.com/hack-dance/fclt/commit/c7d94640296aa45e3cdb949e81a2fdd301c8d282))
+* preserve exclusive recovery ordering ([6b5a29f](https://github.com/hack-dance/fclt/commit/6b5a29fc6300b1cac64f601529407bf996443f81))
+* preserve live legacy lock owners ([a95c96e](https://github.com/hack-dance/fclt/commit/a95c96e0bf264f2dab3b077c3a0d10c8aa0a6bc1))
+* prevent stale proof resurrection ([c452df0](https://github.com/hack-dance/fclt/commit/c452df0bc37e96d45dfa984d58489714c6cec3ad))
+* serialize stale recovery and migration guards ([3253a80](https://github.com/hack-dance/fclt/commit/3253a80e940d891b6668d64eae09ff7360c60dcb))
+
+### Performance Improvements
+
+* batch containment rechecks ([fce5cb2](https://github.com/hack-dance/fclt/commit/fce5cb2c05a7b789fff255fc3f6e63964905d8df))
+
+## [2.29.1](https://github.com/hack-dance/fclt/compare/v2.29.0...v2.29.1) (2026-07-29)
+
+### Bug Fixes
+
+* make reconciliation recovery durable ([#74](https://github.com/hack-dance/fclt/issues/74)) ([d7c7feb](https://github.com/hack-dance/fclt/commit/d7c7feb3680080d13a486905a125b4bb3d146a1e))
+
+## [2.29.0](https://github.com/hack-dance/fclt/compare/v2.28.0...v2.29.0) (2026-07-29)
+
+### Features
+
+* add safe guided project onboarding ([#73](https://github.com/hack-dance/fclt/issues/73)) ([7b13e2f](https://github.com/hack-dance/fclt/commit/7b13e2f0487044530cfccbe9dda211f2e7f0aaf1))
+
 ## [2.28.0](https://github.com/hack-dance/fclt/compare/v2.27.2...v2.28.0) (2026-07-15)
 
 ### Features

@@ -19,7 +19,7 @@ export interface ParsedCliContext {
 
 function missingProjectAiRootMessage(pathValue?: string): string {
   const suffix = pathValue ? `: ${pathValue}` : "";
-  return `No project-local .ai root found${suffix}. Run "fclt templates init project-ai" in the repo first, or pass --root <repo>/.ai.`;
+  return `No project-local .ai root found${suffix}. Run "fclt project init" to preview minimal enrollment, then apply the reviewed plan, or pass --root <repo>/.ai.`;
 }
 
 function expandHomePath(pathValue: string, home: string): string {

@@ -375,7 +375,7 @@ describe("bundled fclt MCP plugin", () => {
       expect(defaultResponse.result?.isError).toBe(false);
       expect(toolPayload(defaultResponse).result.stdout).toEqual({
         cwd: await realpath(workspace),
-        argv: ["setup", "--json", "--global-only", "--dry-run"],
+        argv: ["setup", "--json", "--dry-run"],
       });
 
       child.stdin.write(
@@ -401,7 +401,7 @@ describe("bundled fclt MCP plugin", () => {
       expect(disabledResponse.result?.isError).toBe(false);
       expect(toolPayload(disabledResponse).result.stdout).toEqual({
         cwd: await realpath(workspace),
-        argv: ["setup", "--json", "--no-codex-plugin"],
+        argv: ["setup", "--json", "--include-project", "--no-codex-plugin"],
       });
       expect(toolPayload(disabledResponse).operation).toMatchObject({
         preview: false,

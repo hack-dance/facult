@@ -13,6 +13,38 @@ export type SourceCoverageState =
   | "changed"
   | "stale";
 
+export type SourceFreshnessState =
+  | "current"
+  | "stale"
+  | "unknown"
+  | "not_applicable";
+
+export type SourceFreshnessReason =
+  | "cursor_advanced"
+  | "within_threshold"
+  | "threshold_exceeded"
+  | "newer_repository_activity"
+  | "source_unavailable"
+  | "legacy_report"
+  | "no_cursor";
+
+export interface SourceFreshness {
+  state: SourceFreshnessState;
+  reason: SourceFreshnessReason;
+  checkedAt: string;
+  thresholdHours: number;
+  alert: boolean;
+  cursorAt?: string;
+  latestSourceAt?: string;
+}
+
+export interface ReconciliationFreshness {
+  state: "current" | "stale" | "unknown";
+  staleSourceIds: string[];
+  unknownSourceIds: string[];
+  alertSourceIds: string[];
+}
+
 export type SignalClassification =
   | "implementation-only"
   | "capability-source"
@@ -24,6 +56,7 @@ interface BaseSourceConfig {
   id: string;
   type: ReconciliationSourceType;
   enabled?: boolean;
+  freshnessThresholdHours?: number;
 }
 
 export interface WritebackSourceConfig extends BaseSourceConfig {
@@ -36,6 +69,7 @@ export interface GitSourceConfig extends BaseSourceConfig {
   repository?: "project";
   paths?: string[];
   allBranches?: boolean;
+  defaultBranch?: string;
 }
 
 export interface EvidenceExportSourceConfig extends BaseSourceConfig {
@@ -91,6 +125,7 @@ export interface AdapterScanResult {
   records: SourceRecord[];
   watermark?: string;
   cursor?: string;
+  latestSourceAt?: string;
   unavailableReason?: string;
   staleReason?: string;
 }
@@ -122,8 +157,32 @@ export interface SourceCoverage {
   cursorAfter?: string;
   recordsScanned: number;
   signalsDiscovered: number;
+  freshness: SourceFreshness;
   unavailableReason?: string;
   staleReason?: string;
+}
+
+export interface ResolutionProof {
+  sourceId: string;
+  sourceType: ReconciliationSourceType;
+  sourceRecordId: string;
+  observedAt?: string;
+  kind: "linked_work_terminal" | "default_branch_containment";
+  issueRefs: string[];
+  evidenceKey: string;
+  status?: string;
+  provenance: SourceRecord["provenance"];
+}
+
+export interface LinkedWorkStatusObservation {
+  issueRef: string;
+  ordering?: "known" | "unknown";
+  observedAt: string;
+  terminal: boolean;
+  sourceId: string;
+  sourceType: ReconciliationSourceType;
+  sourceRecordId: string;
+  status?: string;
 }
 
 export interface ExtractionDecision {
@@ -180,11 +239,15 @@ export interface ReconciliationReview {
   window: ReconciliationWindow;
   coverageComplete: boolean;
   degraded: boolean;
+  freshness: ReconciliationFreshness;
   emptyReason?: string;
   coverage: SourceCoverage[];
   decisions: ExtractionDecision[];
   evidence: ReconciledEvidence[];
   signals: CorrelatedSignal[];
+  resolutionProofs: ResolutionProof[];
+  linkedWorkStatuses?: LinkedWorkStatusObservation[];
+  resolvedSignalFamilies: string[];
   resolvedEvidenceKeys: string[];
   unresolvedSignals: string[];
   linkedWork: string[];
@@ -204,6 +267,7 @@ export interface ReconciliationState {
       lastCheckedAt: string;
       coverageUntil?: string;
       coverageState: SourceCoverageState;
+      freshnessState?: SourceFreshnessState;
     }
   >;
   evidence: Record<
@@ -212,7 +276,9 @@ export interface ReconciliationState {
       firstSeenAt: string;
       lastSeenAt: string;
       sourceIds: string[];
+      sourceRecordIds?: Record<string, string[]>;
       reviewIds: string[];
+      defaultBranchContainment?: Record<string, string[]>;
     }
   >;
   decisions: Record<
@@ -238,6 +304,16 @@ export interface ReconciliationState {
       signalIds: string[];
     }
   >;
+  resolutionProofs?: Record<
+    string,
+    {
+      firstSeenAt: string;
+      lastSeenAt: string;
+      reviewIds: string[];
+      proof: ResolutionProof;
+    }
+  >;
+  linkedWorkStatuses?: Record<string, LinkedWorkStatusObservation>;
   reviews: Record<
     string,
     {
@@ -246,6 +322,7 @@ export interface ReconciliationState {
       generatedAt: string;
       artifactPath: string;
       coverageComplete?: boolean;
+      freshnessState?: ReconciliationFreshness["state"];
       evidenceKeys: string[];
       signalIds: string[];
       signalFamilyIds?: string[];

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { chmod, mkdir, readdir, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
+  facultAiReconciliationLockPath,
   facultAiReconciliationReviewDir,
   facultAiReconciliationStatePath,
   facultAiWritebackQueuePath,
@@ -148,6 +149,27 @@ async function runFixtureGit(args: {
   }
 }
 
+async function fixtureGitOutput(args: {
+  projectRoot: string;
+  argv: string[];
+}): Promise<string> {
+  const proc = Bun.spawn({
+    cmd: [Bun.which("git") ?? "/usr/bin/git", ...args.argv],
+    cwd: args.projectRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(stderr);
+  }
+  return stdout.trim();
+}
+
 afterEach(async () => {
   process.env.FACULT_ROOT_DIR = originalRootDir;
   process.env.FACULT_ROOT_SCOPE = originalRootScope;
@@ -212,6 +234,18 @@ describe("reconciliation config", () => {
         sources: [{ id: "git", type: "git", allBranches: "true" }],
       })
     ).toThrow("allBranches must be a boolean");
+    expect(() =>
+      parseReconciliationConfig({
+        version: 1,
+        sources: [{ id: "git", type: "git", freshnessThresholdHours: 0 }],
+      })
+    ).toThrow("freshnessThresholdHours");
+    expect(() =>
+      parseReconciliationConfig({
+        version: 1,
+        sources: [{ id: "git", type: "git", defaultBranch: "../main" }],
+      })
+    ).toThrow("defaultBranch");
     expect(() =>
       parseReconciliationConfig({
         version: 1,
@@ -1456,6 +1490,425 @@ describe("source reconciliation", () => {
     expect(review.signals[0]?.disposition).toBe("resolve-watch");
   });
 
+  it("keeps reopened linked work open after the reopen event leaves the window", async () => {
+    const fixture = await makeFixture();
+    const exportPath = join(fixture.projectRoot, "issues.json");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          { id: "issues", type: "evidence-export", path: "issues.json" },
+        ],
+      })
+    );
+    const writeEvents = async (
+      events: Record<string, unknown>[]
+    ): Promise<void> => {
+      await Bun.write(exportPath, JSON.stringify(evidenceExport(events)));
+    };
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+
+    await writeEvents([
+      {
+        id: "open",
+        kind: "status-change",
+        observedAt: "2026-07-05T10:00:00Z",
+        refs: ["HACK-1200"],
+        status: "in_progress",
+      },
+    ]);
+    const opened = await run();
+    const familyId = opened.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a linked-work family");
+    }
+
+    await writeEvents([
+      {
+        id: "done",
+        kind: "status-change",
+        observedAt: "2026-07-06T10:00:00Z",
+        refs: ["HACK-1200"],
+        status: "done",
+      },
+    ]);
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    await writeEvents([
+      {
+        id: "reopened",
+        kind: "status-change",
+        observedAt: "2026-07-07T10:00:00Z",
+        refs: ["HACK-1200"],
+        status: "in_progress",
+      },
+    ]);
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+
+    await writeEvents([]);
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+  });
+
+  it("orders linked-work observations by instant across timezone offsets", async () => {
+    const fixture = await makeFixture();
+    const exportPath = join(fixture.projectRoot, "issues.json");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          { id: "issues", type: "evidence-export", path: "issues.json" },
+        ],
+      })
+    );
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "open",
+            kind: "status-change",
+            observedAt: "2026-07-05T10:00:00Z",
+            refs: ["HACK-1204"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    const opened = await run();
+    const familyId = opened.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a linked-work family");
+    }
+
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "done",
+            kind: "status-change",
+            observedAt: "2026-07-06T15:30:00Z",
+            refs: ["HACK-1204"],
+            status: "done",
+          },
+          {
+            id: "reopened",
+            kind: "status-change",
+            observedAt: "2026-07-06T12:00:00-04:00",
+            refs: ["HACK-1204"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+  });
+
+  it("ignores persisted linked-work status after its source is no longer authoritative", async () => {
+    for (const variant of ["removed", "disabled", "reconfigured"] as const) {
+      const fixture = await makeFixture();
+      const issueRef = `HACK-${
+        { removed: "1206", disabled: "1207", reconfigured: "1208" }[variant]
+      }`;
+      const exportPath = join(fixture.projectRoot, "issues.json");
+      const replacementPath = join(
+        fixture.projectRoot,
+        "replacement-issues.json"
+      );
+      const configPath = join(fixture.rootDir, "reconciliation.json");
+      await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+      const writeConfig = async (sources: Record<string, unknown>[]) => {
+        await Bun.write(configPath, JSON.stringify({ version: 1, sources }));
+      };
+      await writeConfig([
+        { id: "issues", type: "evidence-export", path: "issues.json" },
+      ]);
+      const run = () =>
+        reconcileSources({
+          ...fixture,
+          since: "2026-07-03",
+          until: "2026-07-10",
+        });
+      await Bun.write(
+        exportPath,
+        JSON.stringify(
+          evidenceExport([
+            {
+              id: `open-${variant}`,
+              kind: "status-change",
+              observedAt: "2026-07-05T10:00:00Z",
+              refs: [issueRef],
+              status: "in_progress",
+            },
+          ])
+        )
+      );
+      const opened = await run();
+      const familyId = opened.signals[0]?.familyId;
+      if (!familyId) {
+        throw new Error(`expected a linked-work family for ${variant}`);
+      }
+      await Bun.write(
+        exportPath,
+        JSON.stringify(
+          evidenceExport([
+            {
+              id: `done-${variant}`,
+              kind: "status-change",
+              observedAt: "2026-07-06T10:00:00Z",
+              refs: [issueRef],
+              status: "done",
+            },
+          ])
+        )
+      );
+      expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+      const quietSource = {
+        id: "notes",
+        type: "markdown",
+        paths: ["quiet.md"],
+      };
+      if (variant === "removed") {
+        await writeConfig([quietSource]);
+      } else if (variant === "disabled") {
+        await writeConfig([
+          {
+            id: "issues",
+            type: "evidence-export",
+            path: "issues.json",
+            enabled: false,
+          },
+          quietSource,
+        ]);
+      } else {
+        await Bun.write(replacementPath, JSON.stringify(evidenceExport([])));
+        await writeConfig([
+          {
+            id: "issues",
+            type: "evidence-export",
+            path: "replacement-issues.json",
+          },
+        ]);
+      }
+
+      expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+      const state = JSON.parse(
+        await readFile(
+          facultAiReconciliationStatePath(fixture.homeDir, fixture.rootDir),
+          "utf8"
+        )
+      ) as {
+        linkedWorkStatuses?: Record<string, unknown>;
+      };
+      expect(state.linkedWorkStatuses?.[issueRef]).toBeUndefined();
+
+      const repeated = await run();
+      expect(repeated.resolvedSignalFamilies).not.toContain(familyId);
+      const repeatedState = JSON.parse(
+        await readFile(
+          facultAiReconciliationStatePath(fixture.homeDir, fixture.rootDir),
+          "utf8"
+        )
+      ) as {
+        linkedWorkStatuses?: Record<string, unknown>;
+      };
+      expect(repeatedState.linkedWorkStatuses?.[issueRef]).toBeUndefined();
+    }
+  });
+
+  it("migrates persisted terminal linked-work proof from pre-status state", async () => {
+    const fixture = await makeFixture();
+    const exportPath = join(fixture.projectRoot, "issues.json");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          { id: "issues", type: "evidence-export", path: "issues.json" },
+        ],
+      })
+    );
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "open",
+            kind: "status-change",
+            observedAt: "2026-07-05T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    const opened = await run();
+    const familyId = opened.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a linked-work family");
+    }
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "done",
+            kind: "status-change",
+            observedAt: "2026-07-06T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "done",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    const statePath = facultAiReconciliationStatePath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const legacyState = JSON.parse(await readFile(statePath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    legacyState.linkedWorkStatuses = undefined;
+    await Bun.write(statePath, `${JSON.stringify(legacyState, null, 2)}\n`);
+    await Bun.write(exportPath, JSON.stringify(evidenceExport([])));
+
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+    const migratedState = JSON.parse(await readFile(statePath, "utf8")) as {
+      linkedWorkStatuses?: Record<string, { sourceType?: string }>;
+    };
+    expect(migratedState.linkedWorkStatuses?.["HACK-1202"]).toMatchObject({
+      sourceType: "evidence-export",
+    });
+
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "older-open",
+            kind: "status-change",
+            observedAt: "2026-07-05T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    await Bun.write(
+      exportPath,
+      JSON.stringify(
+        evidenceExport([
+          {
+            id: "done",
+            kind: "status-change",
+            observedAt: "2026-07-06T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "done",
+          },
+          {
+            id: "reopened",
+            kind: "status-change",
+            observedAt: "2026-07-07T10:00:00Z",
+            refs: ["HACK-1202"],
+            status: "in_progress",
+          },
+        ])
+      )
+    );
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+
+    await Bun.write(exportPath, JSON.stringify(evidenceExport([])));
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+    const reopenedState = JSON.parse(await readFile(statePath, "utf8")) as {
+      linkedWorkStatuses?: Record<
+        string,
+        { ordering?: string; terminal?: boolean }
+      >;
+    };
+    expect(reopenedState.linkedWorkStatuses?.["HACK-1202"]).toMatchObject({
+      terminal: false,
+    });
+  });
+
+  it("resolves linked-work families from bounded terminal status readback", async () => {
+    const fixture = await makeFixture();
+    const linkedWork = [
+      ["HACK-812", "done"],
+      ["HACK-924", "completed"],
+      ["HACK-934", "canceled"],
+      ["HACK-939", "obsolete"],
+      ["LNHACK-625", "duplicate"],
+    ] as const;
+    await Bun.write(
+      join(fixture.projectRoot, "issues.json"),
+      JSON.stringify(
+        evidenceExport(
+          linkedWork.map(([issue, status], index) => ({
+            id: `status-${index + 1}`,
+            kind: "status-change",
+            observedAt: `2026-07-05T1${index}:00:00Z`,
+            title: `${issue} is ${status}`,
+            refs: [issue],
+            status,
+          }))
+        )
+      )
+    );
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          { id: "linear-export", type: "evidence-export", path: "issues.json" },
+        ],
+      })
+    );
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+    });
+
+    expect(review.coverageComplete).toBe(true);
+    expect(review.linkedWork).toEqual(linkedWork.map(([issue]) => issue));
+    expect(review.signals).toHaveLength(linkedWork.length);
+    expect(review.signals.every((signal) => !signal.unresolved)).toBe(true);
+    expect(
+      review.signals.every((signal) => signal.disposition === "resolve-watch")
+    ).toBe(true);
+    expect(review.resolutionProofs).toHaveLength(linkedWork.length);
+    expect(review.resolutionProofs.map((proof) => proof.status).sort()).toEqual(
+      linkedWork.map(([, status]) => status).sort()
+    );
+  });
+
   it("targets the project asset for apply-local dispositions", async () => {
     const fixture = await makeFixture();
     const notesDir = join(fixture.projectRoot, "notes");
@@ -1664,6 +2117,697 @@ describe("source reconciliation", () => {
     expect(review.coverage[0]).toMatchObject({
       state: "checked",
       recordsScanned: 0,
+    });
+  });
+
+  it("does not use a develop or feature HEAD as default-branch proof", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=develop"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+      ["commit", "--allow-empty", "--quiet", "-m", "chore: develop base"],
+      ["switch", "--quiet", "-c", "feature"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "git", type: "git" }],
+      })
+    );
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+
+    expect(review.coverageComplete).toBe(false);
+    expect(review.coverage[0]).toMatchObject({
+      state: "unavailable",
+      recordsScanned: 0,
+    });
+    expect(review.coverage[0]?.unavailableReason).toContain(
+      "Git default branch is unavailable"
+    );
+  });
+
+  it("separates complete coverage from a cursor stale after newer repository activity", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "review.md"),
+      "Capability review HACK-939.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: record HACK-939 review"],
+      date: "2026-07-23T18:12:45-04:00",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+            freshnessThresholdHours: 168,
+          },
+        ],
+      })
+    );
+    const first = await reconcileSources({
+      ...fixture,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-23T18:15:00-04:00",
+      incremental: true,
+    });
+    expect(first.coverageComplete).toBe(true);
+    expect(first.freshness.state).toBe("current");
+
+    await Bun.write(join(fixture.projectRoot, "outside.txt"), "new activity\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "outside.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: newer repository activity"],
+      date: "2026-07-23T18:28:50-04:00",
+    });
+    const statePath = facultAiReconciliationStatePath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const stateBefore = await readFile(statePath, "utf8");
+    const preview = await reconcileSources({
+      ...fixture,
+      since: "2026-07-23T00:00:00-04:00",
+      until: "2026-07-27T23:04:10Z",
+      incremental: true,
+      persist: false,
+    });
+
+    expect(preview.coverageComplete).toBe(true);
+    expect(preview.degraded).toBe(false);
+    expect(preview.coverage[0]).toMatchObject({
+      state: "checked",
+      recordsScanned: 0,
+      freshness: {
+        state: "stale",
+        reason: "newer_repository_activity",
+        alert: true,
+        cursorAt: "2026-07-23T18:12:45-04:00",
+        latestSourceAt: "2026-07-23T18:28:50-04:00",
+      },
+    });
+    expect(preview.freshness).toMatchObject({
+      state: "stale",
+      staleSourceIds: ["git"],
+      alertSourceIds: ["git"],
+    });
+    expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  });
+
+  it("bounds repository freshness activity to the review window", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "review.md"),
+      "Capability cursor baseline.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "docs: establish cursor"],
+      date: "2026-01-02T12:00:00.000Z",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+            freshnessThresholdHours: 168,
+          },
+        ],
+      })
+    );
+    await reconcileSources({
+      ...fixture,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-02T23:59:59.999Z",
+      incremental: true,
+    });
+
+    await Bun.write(join(fixture.projectRoot, "jan-4.txt"), "activity\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "jan-4.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "chore: January 4 activity"],
+      date: "2026-01-04T12:00:00.000Z",
+    });
+    await Bun.write(join(fixture.projectRoot, "jan-10.txt"), "later tip\n");
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "jan-10.txt"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "chore: January 10 tip"],
+      date: "2026-01-10T12:00:00.000Z",
+    });
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-01-01T00:00:00.000Z",
+      until: "2026-01-05T23:59:59.999Z",
+      incremental: true,
+      persist: false,
+    });
+
+    expect(review.coverage[0]).toMatchObject({
+      freshness: {
+        state: "stale",
+        reason: "newer_repository_activity",
+        cursorAt: "2026-01-02T12:00:00Z",
+        latestSourceAt: "2026-01-04T12:00:00Z",
+      },
+    });
+  });
+
+  it("checks exact Git evidence against the configured default branch", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+      ["commit", "--allow-empty", "--quiet", "-m", "chore: base"],
+      ["switch", "--quiet", "-c", "implementation"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "setup.md"),
+      "Setup safety implementation for HACK-934.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: complete HACK-934 setup safety"],
+      date: "2026-07-05T12:00:00Z",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            paths: ["docs"],
+            defaultBranch: "main",
+          },
+        ],
+      })
+    );
+    const beforeMerge = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+    expect(beforeMerge.linkedWork).not.toContain("HACK-934");
+
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "main"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["merge", "--ff-only", "implementation"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "implementation"],
+    });
+    const merged = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+
+    expect(merged.linkedWork).toContain("HACK-934");
+    expect(merged.signals[0]).toMatchObject({
+      disposition: "resolve-watch",
+      unresolved: false,
+    });
+    expect(merged.evidence[0]?.provenance).toContainEqual(
+      expect.objectContaining({
+        defaultBranch: "main",
+        onDefaultBranch: true,
+        terminal: true,
+      })
+    );
+  });
+
+  it("revalidates containment after a default-branch rewrite and tolerates a pruned commit", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+      ["commit", "--allow-empty", "--quiet", "-m", "chore: base"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    const base = await fixtureGitOutput({
+      projectRoot: fixture.projectRoot,
+      argv: ["rev-parse", "HEAD"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "-c", "implementation"],
+    });
+    await mkdir(join(fixture.projectRoot, "docs"), { recursive: true });
+    await Bun.write(
+      join(fixture.projectRoot, "docs", "fix.md"),
+      "Capability reconciliation fix for HACK-1201.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "docs"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: complete HACK-1201 capability"],
+      date: "2026-07-05T12:00:00Z",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            allBranches: true,
+            defaultBranch: "main",
+          },
+        ],
+      })
+    );
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+    const pending = await run();
+    const familyId = pending.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a Git evidence family");
+    }
+    expect(pending.resolvedSignalFamilies).not.toContain(familyId);
+
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "main"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["merge", "--ff-only", "implementation"],
+    });
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["reset", "--hard", base],
+    });
+    expect((await run()).resolvedSignalFamilies).not.toContain(familyId);
+
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["branch", "-D", "implementation"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["reflog", "expire", "--expire=now", "--all"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["gc", "--prune=now"],
+    });
+    const afterPrune = await run();
+    expect(afterPrune.coverageComplete).toBe(true);
+    expect(afterPrune.resolvedSignalFamilies).not.toContain(familyId);
+  });
+
+  it("degrades without proof when the configured default branch is unavailable", async () => {
+    const fixture = await makeFixture();
+    for (const argv of [
+      ["init", "--quiet", "--initial-branch=main"],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "Fixture"],
+      ["commit", "--allow-empty", "--quiet", "-m", "chore: base"],
+      ["switch", "--quiet", "-c", "implementation"],
+    ]) {
+      await runFixtureGit({ projectRoot: fixture.projectRoot, argv });
+    }
+    await Bun.write(
+      join(fixture.projectRoot, "fix.md"),
+      "Capability reconciliation fix for HACK-1205.\n"
+    );
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["add", "fix.md"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["commit", "--quiet", "-m", "fix: complete HACK-1205"],
+      date: "2026-07-05T12:00:00Z",
+    });
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            id: "git",
+            type: "git",
+            allBranches: true,
+            defaultBranch: "main",
+          },
+        ],
+      })
+    );
+    const run = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+      });
+    const pending = await run();
+    const familyId = pending.signals[0]?.familyId;
+    if (!familyId) {
+      throw new Error("expected a Git evidence family");
+    }
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "main"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["merge", "--ff-only", "implementation"],
+    });
+    expect((await run()).resolvedSignalFamilies).toContain(familyId);
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["switch", "--quiet", "implementation"],
+    });
+    await runFixtureGit({
+      projectRoot: fixture.projectRoot,
+      argv: ["branch", "-D", "main"],
+    });
+
+    const degraded = await run();
+
+    expect(degraded.coverageComplete).toBe(false);
+    expect(degraded.degraded).toBe(true);
+    expect(degraded.coverage[0]?.state).toBe("unavailable");
+    expect(degraded.resolutionProofs).toEqual([]);
+    expect(degraded.resolvedSignalFamilies).not.toContain(familyId);
+  });
+
+  it("recovers an abandoned reconciliation lock left by a crashed enrollment", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    await mkdir(dirname(lockPath), { recursive: true });
+    await Bun.write(
+      lockPath,
+      `${JSON.stringify({
+        pid: 999_999,
+        token: "abandoned-enrollment",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        processStartedAt: "darwin:abandoned",
+        operation: "project-enrollment-state-migration",
+      })}\n`
+    );
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+    });
+
+    expect(review.coverageComplete).toBe(true);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+  });
+
+  it("recovers an abandoned reconciliation takeover claim", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+    });
+
+    expect(review.coverageComplete).toBe(true);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
+    expect(
+      (await readdir(dirname(lockPath))).some((name) =>
+        name.startsWith(`${basename(takeoverPath)}.stale-`)
+      )
+    ).toBe(true);
+  });
+
+  it("serializes concurrent recovery of the same abandoned takeover claim", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    let inspected = 0;
+    let releaseInspections: (() => void) | undefined;
+    const bothInspected = new Promise<void>((resolve) => {
+      releaseInspections = resolve;
+    });
+    const onStaleClaimInspected = async (): Promise<void> => {
+      inspected += 1;
+      if (inspected === 2) {
+        releaseInspections?.();
+      }
+      await bothInspected;
+    };
+    const attempt = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+        onStaleClaimInspected,
+      });
+    const results = await Promise.allSettled([attempt(), attempt()]);
+
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected")
+    ).toHaveLength(1);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
+  });
+
+  it("serializes contenders after both revalidate the abandoned takeover identity", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(join(fixture.projectRoot, "quiet.md"), "No signal.\n");
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "notes", type: "markdown", paths: ["quiet.md"] }],
+      })
+    );
+    const lockPath = facultAiReconciliationLockPath(
+      fixture.homeDir,
+      fixture.rootDir
+    );
+    const takeoverPath = `${lockPath}.takeover`;
+    await mkdir(dirname(lockPath), { recursive: true });
+    const abandoned = `${JSON.stringify({
+      pid: 999_999,
+      token: "abandoned",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      processStartedAt: "darwin:abandoned",
+    })}\n`;
+    await Bun.write(lockPath, abandoned);
+    await Bun.write(takeoverPath, abandoned);
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockPath, staleAt, staleAt);
+    await utimes(takeoverPath, staleAt, staleAt);
+
+    let revalidated = 0;
+    let releaseRevalidations: (() => void) | undefined;
+    const bothRevalidated = new Promise<void>((resolve) => {
+      releaseRevalidations = resolve;
+    });
+    const onStaleClaimRevalidated = async (): Promise<void> => {
+      revalidated += 1;
+      if (revalidated === 2) {
+        releaseRevalidations?.();
+      }
+      await bothRevalidated;
+    };
+    const attempt = () =>
+      reconcileSources({
+        ...fixture,
+        since: "2026-07-03",
+        until: "2026-07-10",
+        onStaleClaimRevalidated,
+      });
+    const results = await Promise.allSettled([attempt(), attempt()]);
+
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected")
+    ).toHaveLength(1);
+    expect(await Bun.file(lockPath).exists()).toBe(false);
+    expect(await Bun.file(takeoverPath).exists()).toBe(false);
+  });
+
+  it("reports unavailable cursor freshness without changing coverage semantics", async () => {
+    const fixture = await makeFixture();
+    await Bun.write(
+      join(fixture.rootDir, "reconciliation.json"),
+      JSON.stringify({
+        version: 1,
+        sources: [{ id: "missing", type: "markdown", paths: ["missing.md"] }],
+      })
+    );
+    const review = await reconcileSources({
+      ...fixture,
+      since: "2026-07-03",
+      until: "2026-07-10",
+      persist: false,
+    });
+
+    expect(review.coverageComplete).toBe(false);
+    expect(review.coverage[0]).toMatchObject({
+      state: "unavailable",
+      freshness: {
+        state: "unknown",
+        reason: "source_unavailable",
+        alert: false,
+      },
+    });
+    expect(review.freshness).toMatchObject({
+      state: "unknown",
+      unknownSourceIds: ["missing"],
+      alertSourceIds: [],
     });
   });
 

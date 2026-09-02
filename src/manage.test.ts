@@ -156,7 +156,7 @@ async function setupMutatedCodexPlugin(mutation: InstalledPluginMutation) {
     codexBin,
     home,
     installedMutation: mutation,
-    selectedVersion: "0.1.2",
+    selectedVersion: "0.1.3",
   });
   return {
     home,
@@ -3118,7 +3118,7 @@ describe("syncManagedTools", () => {
     await writeCodexPluginStub({
       codexBin,
       home,
-      selectedVersion: "0.1.2",
+      selectedVersion: "0.1.3",
     });
     await writeJson(join(home, ".agents", "plugins", "marketplace.json"), {
       name: "local",
@@ -3162,7 +3162,7 @@ describe("syncManagedTools", () => {
       "cache",
       "local",
       "fclt",
-      "0.1.1"
+      "0.1.2"
     );
     await mkdir(oldCache, { recursive: true });
     await Bun.write(join(oldCache, "selected.txt"), "legacy-wrapper\n");
@@ -3175,15 +3175,15 @@ describe("syncManagedTools", () => {
     await writeCodexPluginStub({
       codexBin,
       home,
-      listedVersion: "0.1.1",
-      selectedVersion: "0.1.2",
+      listedVersion: "0.1.2",
+      selectedVersion: "0.1.3",
     });
 
     const result = await setupCodexPlugin({ homeDir: home, codexBin });
 
     expect(result.codexInstall.status).toBe("failed");
     expect(result.codexInstall.stderr).toContain(
-      "expected fclt@local version 0.1.2 to be installed and enabled"
+      "expected fclt@local version 0.1.3 to be installed and enabled"
     );
     expect(result.codexInstall.verificationCommand).toEqual([
       codexBin,
@@ -3205,14 +3205,14 @@ describe("syncManagedTools", () => {
           "cache",
           "local",
           "fclt",
-          "0.1.2",
+          "0.1.3",
           "selected.txt"
         )
       ).exists()
     ).toBe(false);
   });
 
-  it("verifies the current selected plugin payload with an old cache present", async () => {
+  it("upgrades to plugin 0.1.3 while preserving a cached 0.1.2 payload", async () => {
     const home = await createTempDir();
     const oldCache = join(
       home,
@@ -3221,7 +3221,7 @@ describe("syncManagedTools", () => {
       "cache",
       "local",
       "fclt",
-      "0.1.1"
+      "0.1.2"
     );
     await mkdir(oldCache, { recursive: true });
     await Bun.write(join(oldCache, "selected.txt"), "legacy-wrapper\n");
@@ -3234,7 +3234,7 @@ describe("syncManagedTools", () => {
     await writeCodexPluginStub({
       codexBin,
       home,
-      selectedVersion: "0.1.2",
+      selectedVersion: "0.1.3",
     });
 
     const result = await setupCodexPlugin({ homeDir: home, codexBin });
@@ -3245,7 +3245,7 @@ describe("syncManagedTools", () => {
       "cache",
       "local",
       "fclt",
-      "0.1.2"
+      "0.1.3"
     );
 
     expect(result.codexInstall.status).toBe("succeeded");
@@ -3253,7 +3253,7 @@ describe("syncManagedTools", () => {
       (await Bun.file(
         join(installedPath, ".codex-plugin", "plugin.json")
       ).json()) as { version: string }
-    ).toMatchObject({ version: "0.1.2" });
+    ).toMatchObject({ version: "0.1.3" });
     expect(
       await Bun.file(join(installedPath, "scripts", "fclt-mcp.cjs")).text()
     ).toContain("audit-read-only-v1");
@@ -3274,7 +3274,7 @@ describe("syncManagedTools", () => {
       codexBin,
       home,
       installedMutation: "symlink",
-      selectedVersion: "0.1.2",
+      selectedVersion: "0.1.3",
     });
 
     const result = await setupCodexPlugin({ homeDir: home, codexBin });
@@ -3312,7 +3312,7 @@ describe("syncManagedTools", () => {
       codexBin,
       home,
       installedMutation: "unreadable-subtree",
-      selectedVersion: "0.1.2",
+      selectedVersion: "0.1.3",
     });
 
     const result = await setupCodexPlugin({ homeDir: home, codexBin });
@@ -3333,7 +3333,7 @@ describe("syncManagedTools", () => {
         "cache",
         "local",
         "fclt",
-        "0.1.2",
+        "0.1.3",
         "unexpected-private"
       ),
       0o700

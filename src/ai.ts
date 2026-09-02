@@ -3081,6 +3081,8 @@ async function loopCommand(argv: string[]) {
           : [
               `loop report: ${result.runId}`,
               `status: ${result.status}`,
+              `coverage: ${result.coverageComplete ? "complete" : "degraded"}`,
+              `freshness: ${result.freshness.state}`,
               `queue: ${result.queue.length}`,
               `notifiable: ${result.delta.notifiable.length}`,
               `artifact: ${result.artifactPath}`,
@@ -3720,6 +3722,7 @@ async function reviewCommand(argv: string[]): Promise<void> {
           : [
               `review: ${result.reviewId}`,
               `coverage: ${result.coverageComplete ? "complete" : "degraded"}`,
+              `freshness: ${result.freshness.state}`,
               `signals: ${result.signals.length}`,
               `artifact: ${result.artifactPath}`,
             ].join("\n")

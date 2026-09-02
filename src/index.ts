@@ -152,6 +152,10 @@ function printHelp() {
                 "setup",
                 "Install narrow agent integrations without full managed mode",
               ],
+              [
+                "projects/project",
+                "Discover repositories and preview/apply minimal project enrollment",
+              ],
               ["ai", "Capture writeback and evolve canonical assets"],
             ],
           }),
@@ -1399,6 +1403,16 @@ async function main(argv: string[]) {
       return;
     case "setup":
       await import("./setup").then(({ setupCommand }) => setupCommand(rest));
+      return;
+    case "projects":
+      await import("./projects").then(({ projectsCommand }) =>
+        projectsCommand(rest)
+      );
+      return;
+    case "project":
+      await import("./projects").then(({ projectCommand }) =>
+        projectCommand(rest)
+      );
       return;
     case "autosync":
       await import("./autosync").then(({ autosyncCommand }) =>
